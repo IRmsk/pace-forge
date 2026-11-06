@@ -1,3 +1,8 @@
 /target
 /session.json
 *.log
+# 账号与设备标识（含加密密码、token、device_id）
+accounts.json
+*.session
+pace-forge-device-id*
+*.tmp
