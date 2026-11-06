@@ -194,7 +194,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
 
     // ③ points
     log("[points] 拉取打卡点…");
-    let pt = match points::fetch_points(
+    let pt = match points::fetch_points_cached(
         client,
         p.center_lat,
         p.center_lng,
@@ -249,8 +249,18 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
 
-        let route = crate::track::fence_route::route_in_fence(&fence_ring, p.distance_m)?;
         let must: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
+        let route = crate::track::fence_route::route_in_fence_with(
+            &fence_ring,
+            p.distance_m,
+            &must,
+        )?;
+        log(&format!(
+            "√ [track] 围栏内 {} 顶点，{} 条扫描线，{:.0}m",
+            route.points.len(),
+            route.lines,
+            route.length_m
+        ));
         let sampled = crate::track::fence_route::resample_with_checkpoints(
             &route.points,
             p.sample_step_m,

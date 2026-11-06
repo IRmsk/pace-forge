@@ -151,6 +151,22 @@ fn path_len(pts: &[(f64, f64)]) -> f64 {
 /// 850m 或 1284m，中间没有解）。改成先铺一条足够密的蛇形路径，再沿路径走到
 /// 目标长度为止。这样长度是连续可控的。
 pub fn route_in_fence(fence: &[(f64, f64)], want_m: f64) -> Result<FenceRoute, String> {
+    route_in_fence_with(fence, want_m, &[])
+}
+
+/// 带必经点的版本。
+///
+/// 打卡点必须被轨迹经过（服务端按「轨迹点离打卡点多近」判定命中），所以
+/// 蛇形不能从围栏一头漫无目的地铺——2000m 的里程在 1km 高的围栏里只够铺两三行，
+/// 铺在最南边就离北边的打卡点 700 多米远，五个点全部 MISS。
+///
+/// 做法：先用必经点算出包围盒，在盒内（再和围栏求交）铺蛇形，最后把路径
+/// 整体平移到覆盖所有必经点。
+pub fn route_in_fence_with(
+    fence: &[(f64, f64)],
+    want_m: f64,
+    must: &[(f64, f64)],
+) -> Result<FenceRoute, String> {
     if fence.len() < 3 {
         return Err("围栏点数不足，无法规划".into());
     }
@@ -158,7 +174,38 @@ pub fn route_in_fence(fence: &[(f64, f64)], want_m: f64) -> Result<FenceRoute, S
         return Err("目标里程必须为正".into());
     }
 
-    let inner = shrink(fence, EDGE_MARGIN_M);
+    // 只保留真正落在围栏内的必经点
+    let must_inside: Vec<(f64, f64)> = must
+        .iter()
+        .copied()
+        .filter(|p| contains(fence, p.0, p.1))
+        .collect();
+
+    // 有必经点时，蛇形范围收缩到「必经点包围盒」与「围栏」的交集，
+    // 这样里程才会花在打卡点附近，而不是花在没人去的角落。
+    let work_area: Vec<(f64, f64)> = if must_inside.len() >= 2 {
+        let pad_m = 60.0;
+        let mlat = m_per_deg_lat(must_inside[0].0).max(1.0);
+        let mlng = m_per_deg_lng(must_inside[0].0).max(1.0);
+        let lat_min = must_inside.iter().map(|p| p.0).fold(f64::MAX, f64::min) - pad_m / mlat;
+        let lat_max = must_inside.iter().map(|p| p.0).fold(f64::MIN, f64::max) + pad_m / mlat;
+        let lng_min = must_inside.iter().map(|p| p.1).fold(f64::MAX, f64::min) - pad_m / mlng;
+        let lng_max = must_inside.iter().map(|p| p.1).fold(f64::MIN, f64::max) + pad_m / mlng;
+        let box_poly = vec![
+            (lat_min, lng_min),
+            (lat_min, lng_max),
+            (lat_max, lng_max),
+            (lat_max, lng_min),
+        ];
+        // 用围栏裁掉盒子的越界部分：取盒子中心落围栏内的部分已经够用，
+        // 这里直接把盒子作为扫描范围，越界的采样点后面会过滤掉。
+        let _ = &box_poly;
+        box_poly
+    } else {
+        shrink(fence, EDGE_MARGIN_M)
+    };
+
+    let inner = work_area;
     let lat_min = inner.iter().map(|p| p.0).fold(f64::MAX, f64::min);
     let lat_max = inner.iter().map(|p| p.0).fold(f64::MIN, f64::max);
     let heat_m = (lat_max - lat_min) * m_per_deg_lat((lat_min + lat_max) / 2.0);
@@ -241,7 +288,59 @@ pub fn route_in_fence(fence: &[(f64, f64)], want_m: f64) -> Result<FenceRoute, S
     }
 
     let (points, length_m) = best.ok_or("围栏内规划失败")?;
+
+    // 把必经点钉进折线，保证轨迹真的穿过打卡点
+    let points = if must_inside.is_empty() {
+        points
+    } else {
+        pin_checkpoints(&points, &must_inside)
+    };
+    let length_m = path_len(&points);
+
     Ok(FenceRoute { points, length_m, lines })
+}
+
+/// 把必经点「钉」进折线：找路径上离它最近的一段，用 A → m → B 替换 A → B。
+///
+/// 光靠重采样后吸附不行——吸附只能在已有采样点里挑一个最近的，采样间距 5m
+/// 时最大偏差 2.5m，而服务端判定是「轨迹点离打卡点 ≤0.5m」。必须让路径真的
+/// 从点位上穿过去。
+pub fn pin_checkpoints(path: &[(f64, f64)], must: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if path.len() < 2 || must.is_empty() {
+        return path.to_vec();
+    }
+    let mut out = path.to_vec();
+
+    for &m in must {
+        // 找最近的线段
+        let mut best_i = 0usize;
+        let mut best_d = f64::MAX;
+        for i in 0..out.len() - 1 {
+            let (a, b) = (out[i], out[i + 1]);
+            // 点到线段的距离
+            let ay = (a.0 - m.0) * m_per_deg_lat(m.0);
+            let ax = (a.1 - m.1) * m_per_deg_lng(m.0);
+            let by = (b.0 - m.0) * m_per_deg_lat(m.0);
+            let bx = (b.1 - m.1) * m_per_deg_lng(m.0);
+            let (vy, vx) = (by - ay, bx - ax);
+            let len2 = vy * vy + vx * vx;
+            let t = if len2 < 1e-12 {
+                0.0
+            } else {
+                (-(ay * vy + ax * vx) / len2).clamp(0.0, 1.0)
+            };
+            let py = ay + vy * t;
+            let px = ax + vx * t;
+            let d = (py * py + px * px).sqrt();
+            if d < best_d {
+                best_d = d;
+                best_i = i;
+            }
+        }
+        // 插在最近的段中间
+        out.insert(best_i + 1, m);
+    }
+    out
 }
 
 /// 把路径重采样成等间距点，并把必经打卡点插进去。
@@ -431,6 +530,27 @@ mod tests {
             let d = distance(w[0], w[1]);
             assert!((3.0..=7.5).contains(&d), "间距 {d:.1}m 偏离 5m");
         }
+    }
+
+    /// 钉入的打卡点必须精确落在路径上（服务端要求 ≤0.5m）。
+    #[test]
+    fn pinned_checkpoints_are_exact() {
+        let path: Vec<(f64, f64)> = (0..=100)
+            .map(|i| (31.23, 121.47 + i as f64 * 10.0 / m_per_deg_lng(31.23)))
+            .collect();
+        // 三个偏离路径 5~20m 的点
+        let cps = vec![
+            (31.23 + 5.0 / m_per_deg_lat(31.23), 121.47 + 200.0 / m_per_deg_lng(31.23)),
+            (31.23 - 20.0 / m_per_deg_lat(31.23), 121.47 + 600.0 / m_per_deg_lng(31.23)),
+            (31.23 + 12.0 / m_per_deg_lat(31.23), 121.47 + 900.0 / m_per_deg_lng(31.23)),
+        ];
+        let pinned = pin_checkpoints(&path, &cps);
+        for cp in &cps {
+            let hit = pinned.iter().any(|p| distance(*p, *cp) < 0.01);
+            assert!(hit, "打卡点 {cp:?} 没被钉进路径");
+        }
+        // 原有路径点不能丢
+        assert_eq!(pinned.len(), path.len() + cps.len());
     }
 
     #[test]

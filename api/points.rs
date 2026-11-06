@@ -174,6 +174,46 @@ pub fn bbox(points: &[(f64, f64)]) -> Option<(f64, f64, f64, f64)> {
     Some(b)
 }
 
+/// 进程内点位缓存。
+///
+/// 服务端限流：同一个 runAreaId 5 分钟内最多取 3 次，超了返回 10603。
+/// 规划一次要拉点位，重试一次就撞墙，所以按围栏 id 缓存 5 分钟。
+static CACHE: std::sync::Mutex<Option<(String, std::time::Instant, PointsContext)>> =
+    std::sync::Mutex::new(None);
+
+const CACHE_TTL_SECS: u64 = 300;
+
+/// 带缓存的点位拉取。同一围栏 5 分钟内只打一次接口。
+pub fn fetch_points_cached(
+    client: &super::client::Client,
+    lat: f64,
+    lng: f64,
+    run_area_id: Option<&str>,
+) -> Result<PointsContext, String> {
+    let key = format!("{}:{}", run_area_id.unwrap_or("-"), format!("{lat:.4},{lng:.4}"));
+
+    if let Ok(g) = CACHE.lock() {
+        if let Some(ref entry) = *g {
+            if entry.0 == key && entry.1.elapsed().as_secs() < CACHE_TTL_SECS {
+                return Ok(entry.2.clone());
+            }
+        }
+    }
+
+    let ctx = fetch_points(client, lat, lng, run_area_id)?;
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((key, std::time::Instant::now(), ctx.clone()));
+    }
+    Ok(ctx)
+}
+
+/// 手动清缓存（换围栏时用）。
+pub fn clear_cache() {
+    if let Ok(mut g) = CACHE.lock() {
+        *g = None;
+    }
+}
+
 /// 把点位转成 GCJ-02（OSM 路网对齐用）。
 pub fn to_gcj(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
     points
