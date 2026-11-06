@@ -293,22 +293,34 @@ pub fn route_in_fence_with(
     //
     // 钉点会把折线拐出去再拐回来，长度随之变长（实测 2000m 能涨到 2551m）。
     // 所以先量一次钉点带来的增量，按缺口重新规划，再钉一次。
+    // 钉点的增量取决于点位相对路径的位置，第一次估不准——缩短后重规划，
+    // 路径变了，增量也跟着变。迭代几次取最接近目标的那个。
     let points = if must_inside.is_empty() {
         points
     } else {
-        let probe = pin_checkpoints(&points, &must_inside);
-        let grow = path_len(&probe) - length_m;
-        if grow > want_m * 0.02 {
-            if let Ok(trimmed) =
-                route_in_fence_with(fence, (want_m - grow).max(want_m * 0.5), &[])
-            {
-                pin_checkpoints(&trimmed.points, &must_inside)
+        let mut best_pin: Option<(Vec<(f64, f64)>, f64)> = None;
+        let mut target = want_m;
+        for _ in 0..5 {
+            let base = if (target - want_m).abs() < 1.0 {
+                points.clone()
             } else {
-                probe
+                match route_in_fence_with(fence, target.max(want_m * 0.3), &[]) {
+                    Ok(r) => r.points,
+                    Err(_) => break,
+                }
+            };
+            let pinned = pin_checkpoints(&base, &must_inside);
+            let len = path_len(&pinned);
+            let err = (len - want_m).abs();
+            if best_pin.as_ref().map(|b| err < b.1).unwrap_or(true) {
+                best_pin = Some((pinned, err));
             }
-        } else {
-            probe
+            if err < want_m * 0.03 {
+                break;
+            }
+            target = (target - (len - want_m)).clamp(want_m * 0.3, want_m * 1.5);
         }
+        best_pin.map(|b| b.0).unwrap_or(points)
     };
     let length_m = path_len(&points);
 
