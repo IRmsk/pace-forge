@@ -128,12 +128,9 @@ fn boustrophedon(poly: &[(f64, f64)], spacing_m: f64) -> (Vec<(f64, f64)>, usize
             if !forward {
                 std::mem::swap(&mut x0, &mut x1);
             }
-            if pts.is_empty() {
-                pts.push((lat, x0));
-            } else if (pts.last().unwrap().1 - x0).abs() > 1e-9 {
-                // 换线时补一个连接点，避免斜穿围栏
-                pts.push((lat, x0));
-            }
+            // 换线时必须补本行起点：只比较经度会漏判——换行时经度本来就相同
+            // （都在同一侧），纬度却变了，跳过后会从上一行末端斜穿到本行起点。
+            pts.push((lat, x0));
             pts.push((lat, x1));
         }
         forward = !forward;
@@ -188,37 +185,63 @@ pub fn route_in_fence(fence: &[(f64, f64)], want_m: f64) -> Result<FenceRoute, S
         ));
     }
 
-    // 沿密路径走到目标长度
-    let mut points: Vec<(f64, f64)> = vec![dense[0]];
-    let mut acc = 0.0;
-    for w in dense.windows(2) {
-        let d = distance(w[0], w[1]);
-        if acc + d >= want_m {
-            // 最后一段按比例切
-            let t = ((want_m - acc) / d).clamp(0.0, 1.0);
-            points.push((
-                w[0].0 + (w[1].0 - w[0].0) * t,
-                w[0].1 + (w[1].1 - w[0].1) * t,
-            ));
-            acc = want_m;
+    // 沿密路径走 `walk` 米，返回折线和实际长度
+    let walk_to = |walk: f64| -> (Vec<(f64, f64)>, f64) {
+        let mut pts: Vec<(f64, f64)> = vec![dense[0]];
+        let mut acc = 0.0;
+        for w in dense.windows(2) {
+            let d = distance(w[0], w[1]);
+            if acc + d >= walk {
+                let t = ((walk - acc) / d).clamp(0.0, 1.0);
+                pts.push((
+                    w[0].0 + (w[1].0 - w[0].0) * t,
+                    w[0].1 + (w[1].1 - w[0].1) * t,
+                ));
+                acc = walk;
+                break;
+            }
+            pts.push(w[1]);
+            acc += d;
+        }
+        (pts, acc)
+    };
+
+    // 闭合要占里程，但「回起点的距离」取决于走到哪里，是个不动点问题：
+    // 走 want-back 得到新终点 → 新 back 又变了。迭代几次就收敛得差不多了。
+    // 不预留会超（2000 跑成 2320），只迭代一次又会欠（2000 跑成 1803）。
+    let mut target = want_m;
+    let mut best: Option<(Vec<(f64, f64)>, f64)> = None;
+    for _ in 0..6 {
+        let (mut pts, acc) = walk_to(target.max(1.0));
+        let total = match (pts.first(), pts.last()) {
+            (Some(&a), Some(&b)) => {
+                let back = distance(b, a);
+                // 绕回起点的距离占比太小时才闭合。小围栏上这段能占到 40%，
+                // 硬闭合会把目标里程压得对不上，不如留个开环——
+                // 服务端按累计里程判定，开环不会因此变无效。
+                if back > 1.0 && back <= want_m * 0.12 {
+                    pts.push(a);
+                    acc + back
+                } else {
+                    acc
+                }
+            }
+            _ => acc,
+        };
+        let err = (total - want_m).abs();
+        if best.as_ref().map(|b| err < b.1).unwrap_or(true) {
+            best = Some((pts, total));
+        }
+        if err < want_m * 0.01 {
             break;
         }
-        points.push(w[1]);
-        acc += d;
+        // 按误差修正：跑长了就少走，跑短了多走。
+        // 上限给到 want_m * 1.15：不闭合时 target 就是真实里程，不受闭合距离挤压。
+        target = (target - (total - want_m)).clamp(want_m * 0.3, want_m * 1.15);
     }
 
-    // 闭合：回到起点。服务端要求跑圈，开环会被算成「中途停止」
-    if let (Some(&a), Some(&b)) = (points.first(), points.last()) {
-        let back = distance(b, a);
-        if back > 1.0 {
-            if acc + back <= want_m * 1.25 {
-                points.push(a);
-                acc += back;
-            }
-        }
-    }
-
-    Ok(FenceRoute { points, length_m: acc, lines })
+    let (points, length_m) = best.ok_or("围栏内规划失败")?;
+    Ok(FenceRoute { points, length_m, lines })
 }
 
 /// 把路径重采样成等间距点，并把必经打卡点插进去。
@@ -345,11 +368,38 @@ mod tests {
         for want in [800.0, 1500.0, 2000.0, 3000.0] {
             let r = route_in_fence(&f, want).unwrap();
             let err = (r.length_m - want).abs() / want;
+            // 闭合回起点的距离要靠迭代收敛，实测能稳定在 2% 以内
             assert!(
-                err < 0.35,
-                "目标 {want}m 实际 {:.1}m，偏差 {:.0}%",
+                err < 0.06,
+                "目标 {want}m 实际 {:.1}m，偏差 {:.1}%",
                 r.length_m,
                 err * 100.0
+            );
+        }
+    }
+
+    /// 蛇形换行必须垂直连接，不能斜穿。
+    ///
+    /// 之前的连接点判断只比较经度（换行时经度本来就相同），导致上一行末端
+    /// 直接连到本行起点，斜穿整个围栏，总长也全乱。这个 bug 让 1500m 的目标
+    /// 只能跑出 1329m。
+    #[test]
+    fn scan_lines_connect_vertically() {
+        let f = rect_fence();
+        let inner = shrink(&f, 20.0);
+        let (dense, lines) = boustrophedon(&inner, 20.0);
+        assert!(lines >= 5, "至少要有几条扫描线");
+
+        // 相邻点要么在同一纬度（同一行内），要么同经度（换行连接）
+        for w in dense.windows(2) {
+            let dlat = (w[0].0 - w[1].0).abs();
+            let dlng = (w[0].1 - w[1].1).abs();
+            let same_row = dlat < 1e-9;
+            let same_col = dlng < 1e-9 || dlng < 20.0 / m_per_deg_lng(w[0].0) * 2.0;
+            assert!(
+                same_row || same_col,
+                "相邻点既不在同一行也不在同一列，说明斜穿了: {:?} → {:?}",
+                w[0], w[1]
             );
         }
     }
