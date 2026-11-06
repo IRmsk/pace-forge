@@ -18,7 +18,10 @@ pub struct SpeedBucket {
     pub begin_time: i64,
     #[serde(rename = "endTime")]
     pub end_time: i64,
-    pub flag: i32,
+    /// 整次跑步的起始毫秒戳（每桶都填同一个值）。
+    pub flag: i64,
+    /// 桶 id：提交用 `60000+i`，OBS 用 `(rrid%100000)*1000+endSec`。
+    pub id: i64,
     pub state: i32,
     #[serde(rename = "queueNum")]
     pub queue_num: i32,
@@ -33,7 +36,8 @@ pub struct StepBucket {
     pub begin_time: i64,
     #[serde(rename = "endTime")]
     pub end_time: i64,
-    pub flag: i32,
+    pub flag: i64,
+    pub id: i64,
     #[serde(rename = "maxDiff")]
     pub max_diff: i32,
     #[serde(rename = "minDiff")]
@@ -75,9 +79,10 @@ pub fn speed_buckets(points: &[(f64, f64, i64)], start_ms: i64, total_sec: i64) 
             distance: (dist * 100.0).round() / 100.0,
             begin_time: begin,
             end_time: end,
-            flag: 0,
+            flag: start_ms,
+            id: 0,
             state: 0,
-            queue_num: 1,
+            queue_num: 0,
         });
     }
     out
@@ -136,12 +141,13 @@ pub fn step_buckets(
                 steps_num: steps,
                 begin_time: begin,
                 end_time: begin + 10_000,
-                flag: 0,
+                flag: start_ms,
+                id: 0,
                 max_diff,
                 min_diff,
                 avg_diff,
                 state: 0,
-                queue_num: 1,
+                queue_num: 0,
             }
         })
         .collect()
@@ -235,5 +241,68 @@ mod tests {
         let pts = line_points(0, 5, 10);
         let b = speed_buckets(&pts, 0, 5);
         assert_eq!(b.len(), 1, "不足 10 秒也要有一个桶，不能返回空");
+    }
+}
+
+/// 提交报文用的桶 id：`60000+i`，`queueNum = i`。
+///
+/// 服务端在提交时按这个规则校验；和 OBS 对象里的 id 规则**不同**。
+pub fn apply_submit_ids(speed: &mut [SpeedBucket], steps: &mut [StepBucket]) {
+    for (i, b) in speed.iter_mut().enumerate() {
+        b.id = 60000 + i as i64;
+        b.queue_num = i as i32;
+    }
+    for (i, b) in steps.iter_mut().enumerate() {
+        b.id = 60000 + i as i64;
+        b.queue_num = i as i32;
+    }
+}
+
+/// OBS 对象用的桶 id：`(rrid % 100000) * 1000 + endSec`，`queueNum = 0`。
+///
+/// 依赖提交返回的 `rrid`，所以 OBS 必须在提交**之后**上传。
+pub fn apply_obs_ids(speed: &mut [SpeedBucket], steps: &mut [StepBucket], rrid: i64, start_ms: i64) {
+    let base = (rrid % 100_000) * 1000;
+    for b in speed.iter_mut() {
+        b.id = base + (b.end_time - start_ms) / 1000;
+        b.queue_num = 0;
+    }
+    for b in steps.iter_mut() {
+        b.id = base + (b.end_time - start_ms) / 1000;
+        b.queue_num = 0;
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn submit_and_obs_ids_differ() {
+        let pts: Vec<(f64, f64, i64)> = (0..=60)
+            .map(|i| (30.5 + i as f64 * 1e-5, 104.0, 1_700_000_000_000 + i * 1000))
+            .collect();
+        let start = 1_700_000_000_000i64;
+        let mut sp = speed_buckets(&pts, start, 60);
+        let mut st = step_buckets(start, 60, 200, &[1.0; 6]);
+
+        apply_submit_ids(&mut sp, &mut st);
+        assert_eq!(sp[0].id, 60000);
+        assert_eq!(sp[1].id, 60001);
+        assert_eq!(sp[0].queue_num, 0);
+        assert_eq!(sp[1].queue_num, 1);
+
+        apply_obs_ids(&mut sp, &mut st, 123_456_789, start);
+        // (123456789 % 100000) * 1000 = 56789 * 1000
+        assert_eq!(sp[0].id, 56_789_000 + 10, "首桶 endTime 是 start+10s");
+        assert_eq!(sp[1].id, 56_789_000 + 20);
+        assert_eq!(sp[0].queue_num, 0);
+    }
+
+    #[test]
+    fn flag_is_start_ms() {
+        let pts: Vec<(f64, f64, i64)> = vec![(30.5, 104.0, 1_700_000_000_000), (30.5001, 104.0, 1_700_000_010_000)];
+        let sp = speed_buckets(&pts, 1_700_000_000_000, 10);
+        assert_eq!(sp[0].flag, 1_700_000_000_000);
     }
 }

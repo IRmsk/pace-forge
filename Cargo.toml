@@ -7,12 +7,18 @@ license = "MIT"
 repository = "https://github.com/IRmsk/pace-forge"
 
 [lib]
+name = "pace_forge"
+path = "lib.rs"
 crate-type = ["rlib"]
 
 [features]
 default = ["cli"]
 cli = []
 gui = ["dep:eframe", "dep:egui"]
+
+[[bin]]
+name = "pace-forge"
+path = "main.rs"
 
 [dependencies]
 # --- 协议层 ---

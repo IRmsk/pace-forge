@@ -141,6 +141,10 @@ pub fn build(
     });
     let five_pt_json = serde_json::to_string(&five_envelope).map_err(|e| e.to_string())?;
 
+    // 提交报文的桶 id 规则：60000+i，queueNum=i
+    let mut sb = sb;
+    let mut stb = stb;
+    crate::track::buckets::apply_submit_ids(&mut sb, &mut stb);
     let speed_json_str = serde_json::to_string(&sb).map_err(|e| e.to_string())?;
     let step_json_str = serde_json::to_string(&stb).map_err(|e| e.to_string())?;
 
@@ -230,13 +234,8 @@ pub fn build(
         "validTime": params.total_time_sec,
     });
 
-    let object_key = format!(
-        "runData/{}/{}/{}_{}.txt",
-        params.uid,
-        params.sport_type,
-        params.start_time_ms / 1000,
-        params.uuid
-    );
+    // 真正的 objectKey 要等提交返回 rrid 才能算，这里先给出 detail key 的雏形
+    let object_key = crate::api::obs::detail_key(params.start_time_ms, &params.uuid);
 
     Ok(Submission { save_record, object_key, canonical })
 }
@@ -359,10 +358,24 @@ mod tests {
     fn object_key_shape() {
         let j = vec![0.0; 72];
         let sub = build(&params(), &points(), &[], &j).unwrap();
-        assert_eq!(
-            sub.object_key,
-            "runData/123456/1/1730000000_00000000-0000-4000-8000-000000000001.txt"
-        );
+        // 详情页 key：run_data/{YYYYMMDDHH}/{uuid}.json
+        assert!(sub.object_key.starts_with("run_data/"), "{}", sub.object_key);
+        assert!(sub.object_key.ends_with(".json"), "{}", sub.object_key);
+        assert!(sub.object_key.contains("00000000-0000-4000-8000-000000000001"));
+    }
+
+    #[test]
+    fn submit_buckets_use_60000_ids() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sp: serde_json::Value =
+            serde_json::from_str(sub.save_record["speedPerTenSec"].as_str().unwrap()).unwrap();
+        let arr = sp.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert_eq!(arr[0]["id"], 60000);
+        assert_eq!(arr[0]["queueNum"], 0);
+        assert_eq!(arr[1]["id"], 60001);
+        assert_eq!(arr[1]["queueNum"], 1);
     }
 
     #[test]
@@ -390,7 +403,14 @@ pub fn save_record(client: &Client, body: &Value) -> Result<Value, String> {
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("未知错误");
-        return Err(format!("提交被驳回 error={err}: {msg}"));
+        let hint = match err {
+            11016 => "（不在有效跑步时段，记分跑有固定时段限制，等等再来）",
+            10003 => "（签名错误，检查 device_id 是否被重置）",
+            10121 => "（账号已在其他设备登录，先退出或等 1 小时）",
+            10603 => "（请求过于频繁，被限流）",
+            _ => "",
+        };
+        return Err(format!("提交被驳回 error={err}: {msg}{hint}"));
     }
     Ok(v.get("data").cloned().unwrap_or(Value::Null))
 }

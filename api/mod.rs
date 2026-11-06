@@ -11,6 +11,7 @@ pub mod gt4;
 pub mod gt4image;
 pub mod login;
 pub mod records;
+pub mod semester;
 pub mod session;
 pub mod submit;
 

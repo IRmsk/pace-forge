@@ -285,12 +285,13 @@ fn distribute_steps(
                 steps_num: steps,
                 begin_time: b.begin_time,
                 end_time: b.end_time,
-                flag: 0,
+                flag: b.flag,
+                id: 0,
                 max_diff,
                 min_diff,
                 avg_diff,
                 state: 0,
-                queue_num: 1,
+                queue_num: 0,
             }
         })
         .collect()

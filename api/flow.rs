@@ -102,6 +102,31 @@ pub struct RunOutcome {
 pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, String> {
     let start_ms = crate::crypto::envelope::now_ms() as i64;
 
+    // ⓿ 学期进度：记分跑要先知道还差多少
+    if p.run_mode == 1 {
+        match super::semester::fetch_summary(client) {
+            Ok(sm) => log(&format!("√ [semester] {}", sm.summary())),
+            Err(e) => log(&format!("· [semester] 查询失败（不影响流程）: {e}")),
+        }
+        match super::semester::fetch_goal(client, p.run_mode) {
+            Ok(g) if g.target_dis > 0.0 => {
+                let left = g.remaining_dis(0.0) / 1000.0;
+                log(&format!(
+                    "√ [goal] 学期目标 {:.1}km / {} 次{}",
+                    left,
+                    g.target_count,
+                    if g.days_left(crate::crypto::envelope::now_ms() as i64) >= 0 {
+                        format!("，还剩 {} 天", g.days_left(crate::crypto::envelope::now_ms() as i64))
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => log(&format!("· [goal] 查询失败（不影响流程）: {e}")),
+        }
+    }
+
     // ① policy
     log(&format!("[policy] 拉取策略 runMode={}…", p.run_mode));
     let pol = policy::fetch_policy_for(client, p.run_mode)?;
@@ -320,23 +345,19 @@ pub fn run_full(
         return Ok(out);
     }
 
-    // ⑧ 上传轨迹明细
+    // ⑧ 组装并提交（必须先提交，OBS 的 objectKey 和桶 id 都要 rrid）
     let start_ms = out.start_ms;
     let uid = client
         .credentials()
         .and_then(|c| c.uid.as_ref())
         .cloned()
         .unwrap_or_default();
-    let payload = detail_payload(&out.track, &out.sim, p, &uid);
-    out.obs_keys = upload_detail(client, &payload, p, start_ms, &uid, log)?;
-
-    // ⑨ 组装报文
     let unid = client
         .credentials()
         .and_then(|c| c.unid.as_ref())
         .cloned()
         .unwrap_or_default();
-    let uuid = super::client::uuid_v4();
+    let uuid = super::client::uuid_v4().to_uppercase();
     let stop_ms = start_ms + p.duration_sec * 1000;
 
     let fixed: Vec<super::submit::FixedPoint> = out
@@ -351,7 +372,6 @@ pub fn run_full(
         })
         .collect();
 
-    let policy_str = out.policy.policy.to_string();
     let geo_fences = out
         .fence
         .as_ref()
@@ -360,7 +380,7 @@ pub fn run_full(
 
     let params = super::submit::SubmitParams {
         uid: uid.clone(),
-        unid,
+        unid: unid.clone(),
         uuid: uuid.clone(),
         sport_type: p.sport_type,
         total_distance_m: out.real_length_m,
@@ -368,9 +388,10 @@ pub fn run_full(
         total_steps: out.total_steps,
         start_time_ms: start_ms,
         stop_time_ms: stop_ms,
-        sel_distance_m: p.distance_m.round() as i64,
+        // selDistance 用规则给的最小里程，不是用户设的目标
+        sel_distance_m: out.policy.min_distance,
         sel_run_time_sec: p.duration_sec,
-        policy: policy_str,
+        policy: out.policy.policy.to_string(),
         run_area_id: out
             .fence
             .as_ref()
@@ -384,20 +405,36 @@ pub fn run_full(
     let jitter = crate::track::buckets::make_jitter(bucket_count, 1.0, p.seed);
     let submission = super::submit::build(&params, &out.track, &fixed, &jitter)?;
     log(&format!(
-        "√ [submit] 报文已组装，{} 个轨迹点，objectKey={}",
-        out.track.len(),
-        submission.object_key
+        "√ [submit] 报文已组装，{} 个轨迹点",
+        out.track.len()
     ));
 
-    // ⑩ 提交
     log("[submit] 提交成绩…");
     let data = super::submit::save_record(client, &submission.save_record)?;
     out.submitted = true;
     out.record_id = super::submit::extract_record_id(&data);
-    log(&format!(
-        "√ [submit] 提交成功，记录 id={:?}",
-        out.record_id
-    ));
+    log(&format!("√ [submit] 提交成功，记录 id={:?}", out.record_id));
+
+    // ⑨ OBS：用 rrid 重算桶 id 和 objectKey
+    let rrid = out.record_id.unwrap_or(0);
+    log(&format!("[obs] 用 rrid={rrid} 上传明细…"));
+    let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms);
+    let keys = vec![
+        super::obs::detail_key(start_ms, &uuid),
+        format!("run_data/{}/{rrid}.json", rrid / 1_000_000),
+    ];
+    let bytes = serde_json::to_vec(&payload).map_err(|e| format!("明细序列化失败: {e}"))?;
+    let (ok, errs) = obs::upload_keys(client, &keys, &bytes);
+    for e in &errs {
+        log(&format!("  ⚠ {e}"));
+    }
+    if ok == 0 {
+        log("⚠ [obs] 明细上传全部失败，记录已提交但详情页可能无轨迹");
+    } else {
+        log(&format!("√ [obs] {ok}/{} 个 key 上传成功", keys.len()));
+    }
+    out.obs_keys = keys;
+
     log(&format!(
         "  静默窗口 {} 秒内不要再发跑步请求",
         SILENCE_SEC
@@ -471,6 +508,36 @@ pub fn detail_payload(
         "route": route,
         "speedPerTenSec": speed_per_ten,
         "stepsPerTenSec": steps_per_ten,
+    })
+}
+
+/// 带 rrid 的明细载荷（OBS 用，桶 id 走 `(rrid%100000)*1000+endSec`）。
+pub fn detail_payload_rrid(
+    points: &[crate::track::TrackPoint],
+    sim: &crate::track::SimResult,
+    p: &RunParams,
+    uid: &str,
+    rrid: i64,
+    start_ms: i64,
+) -> Value {
+    let mut speed = sim.speed_buckets.clone();
+    let mut steps = sim.step_buckets.clone();
+    crate::track::buckets::apply_obs_ids(&mut speed, &mut steps, rrid, start_ms);
+
+    let route: Vec<Value> = points
+        .iter()
+        .map(|q| json!({ "lat": q.lat, "lon": q.lon, "time": q.time_ms }))
+        .collect();
+
+    json!({
+        "uid": uid,
+        "sportType": p.sport_type,
+        "totalDistance": sim.actual_length_m,
+        "totalTime": p.duration_sec,
+        "totalSteps": sim.total_steps,
+        "route": route,
+        "speedPerTenSec": speed,
+        "stepsPerTenSec": steps,
     })
 }
 

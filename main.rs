@@ -18,6 +18,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "semester" => show_semester(),
         "run" => {
             let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
             let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
@@ -41,6 +42,7 @@ fn main() {
             println!("pace-forge {} — 运动世界校园协议工具\n", pace_forge::VERSION);
             println!("用法:");
             println!("  pace-forge web [addr]          启动 Web 控制台（默认 127.0.0.1:9998）");
+            println!("  pace-forge semester            查学期进度（记分跑）");
             println!("  pace-forge run [km] [min] [-y] 刷跑并提交（-y 跳过确认）");
             println!("  pace-forge dry [km] [min]      只预演，不提交");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
@@ -95,6 +97,53 @@ fn dry_run(dist_km: f64, dur_min: f64) {
             eprintln!("\n预演失败: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+fn show_semester() {
+    use pace_forge::api::{semester, session};
+
+    let sess = session::load_session();
+    if !sess.is_valid() {
+        eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
+        std::process::exit(1);
+    }
+    let client = pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
+        .with_credentials(pace_forge::api::client::Credentials {
+            uid: Some(sess.uid.to_string()),
+            token: Some(sess.token.clone()),
+            unid: Some(sess.unid.clone()),
+        });
+
+    match semester::fetch_summary(&client) {
+        Ok(sm) => {
+            println!("{}", sm.summary());
+            println!("  有效比例 {:.1}%", sm.valid_ratio() * 100.0);
+        }
+        Err(e) => eprintln!("查学期汇总失败: {e}"),
+    }
+
+    match semester::fetch_goal(&client, 1) {
+        Ok(g) => {
+            if g.target_dis > 0.0 {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                println!(
+                    "学期目标 {:.1}km / {} 次，还剩 {} 天",
+                    g.target_dis / 1000.0,
+                    g.target_count,
+                    g.days_left(now)
+                );
+                if !g.in_term(now) {
+                    println!("⚠ 当前不在学期内");
+                }
+            } else {
+                println!("· 未取到学期目标");
+            }
+        }
+        Err(e) => eprintln!("查学期目标失败: {e}"),
     }
 }
 
