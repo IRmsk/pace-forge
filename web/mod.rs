@@ -104,14 +104,35 @@ impl State {
 }
 
 fn make_client(uid: &str, token: &str, unid: &str) -> Client {
-    // 每个账号独立的 device_id，避免被按设备聚合
-    let mut c = Client::new(DeviceProfile::for_account(uid));
+    // 每个账号独立的 device_id，避免被按设备聚合。
+    //
+    // 作用域必须和登录时完全一致：登录前不知道 uid，用的是手机号。
+    // 之前这里传 uid、登录时传手机号，同一个账号会算出两套 device_id，
+    // 服务端当成两台手机，直接触发 10121「此账号已在其他设备登录」并把
+    // 账号锁一小时。
+    let mut c = Client::new(DeviceProfile::for_account(&device_scope(uid)));
     c.creds = crate::api::client::Credentials {
         uid: Some(uid.to_string()),
         token: Some(token.to_string()),
         unid: Some(unid.to_string()),
     };
     c
+}
+
+/// 设备作用域：一个账号有且只有一套 device_id。
+///
+/// 账号库里 id 是 uid、username 是手机号。登录前后拿到的标识不同，但必须
+/// 映射到同一个作用域，否则就是「换手机登录」。
+fn device_scope(id_or_username: &str) -> String {
+    let book = crate::api::accounts::load();
+    // id 命中就直接用 username，保证和登录时一致
+    if let Some(a) = book.accounts.iter().find(|a| a.id == id_or_username) {
+        if !a.username.is_empty() {
+            return a.username.clone();
+        }
+    }
+    // 传进来本来就是手机号
+    id_or_username.to_string()
 }
 
 /// 启动 Web 控制台。
@@ -1300,3 +1321,22 @@ fn respond_html(request: tiny_http::Request, html: &str) -> Result<(), String> {
 }
 
 const INDEX_HTML: &str = include_str!("index.html");
+
+#[cfg(test)]
+mod device_scope_tests {
+    use super::device_scope;
+
+    /// 登录前后必须算出同一个设备作用域。
+    ///
+    /// 登录前只知道手机号、登录后只知道 uid。两者若映射到不同 scope，
+    /// 就会生成两套 device_id，服务端当成两台手机，触发 10121
+    /// 「此账号已在其他设备登录」并把账号锁一小时。
+    #[test]
+    fn device_scope_is_stable_across_login() {
+        assert_eq!(device_scope("13900000000"), "13900000000");
+        assert_eq!(device_scope("99999"), "99999");
+        for _ in 0..3 {
+            assert_eq!(device_scope("13900000000"), device_scope("13900000000"));
+        }
+    }
+}
