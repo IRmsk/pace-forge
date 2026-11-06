@@ -521,7 +521,7 @@ pub fn run_full(
     // ⑨ OBS：用 rrid 重算桶 id 和 objectKey
     let rrid = out.record_id.unwrap_or(0);
     log(&format!("[obs] 用 rrid={rrid} 上传明细…"));
-    let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms);
+    let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid);
     let keys = vec![
         super::obs::detail_key(start_ms, &uuid),
         format!("run_data/{}/{rrid}.json", rrid / 1_000_000),
@@ -622,27 +622,76 @@ pub fn detail_payload_rrid(
     uid: &str,
     rrid: i64,
     start_ms: i64,
+    uuid: &str,
 ) -> Value {
     let mut speed = sim.speed_buckets.clone();
     let mut steps = sim.step_buckets.clone();
     crate::track::buckets::apply_obs_ids(&mut speed, &mut steps, rrid, start_ms);
 
-    let route: Vec<Value> = points
-        .iter()
-        .map(|q| json!({ "lat": q.lat, "lon": q.lon, "time": q.time_ms }))
-        .collect();
+    // OBS 对象是 10 个 key，每个值都 gzip + base64。
+    // 之前传的是明文 JSON，结构也不对，服务端读不出轨迹，详情页就显示
+    // 「这条记录没有轨迹坐标」。
+    // OBS 点数集和提交用同一套 28 字段，区别只在 id / queueNum
+    let pts: Vec<Value> = {
+        let n = points.len();
+        let mut prev = points.first().map(|q| (q.lat, q.lon)).unwrap_or((0.0, 0.0));
+        let start_pt = prev;
+        let mut cum = (0.0f64, 0i64, 0i64);
+        let mut prev_time = points.first().map(|q| q.time_ms).unwrap_or(start_ms);
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, q)| {
+                super::submit::point_json_full(
+                    q, i, n, start_ms, start_pt, &mut prev, &mut cum, &mut prev_time,
+                    sim.total_steps as i64, start_ms as u64,
+                )
+            })
+            .collect()
+    };
+    let run_wrap = json!({
+        "allLocJson": Value::Array(pts).to_string(),
+        "useZip": false,
+    });
 
     json!({
-        "uid": uid,
-        "sportType": p.sport_type,
-        "totalDistance": sim.actual_length_m,
-        "totalTime": p.duration_sec,
-        "totalSteps": sim.total_steps,
-        "route": route,
-        "speedPerTenSec": speed,
-        "stepsPerTenSec": steps,
+        "rrid": gz_str(&rrid.to_string()),
+        "uuid": gz_str(uuid),
+        "uid": gz_str(uid),
+        "run_data": gz_json(&run_wrap),
+        "fixed_point_json": gz_str(""),
+        "segment_json": gz_str(""),
+        "speed_json": gz_json(&Value::Array(
+            speed.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
+        )),
+        "step_freq_json": gz_json(&Value::Array(
+            steps.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
+        )),
+        "laps_json": gz_json(&Value::Array(Vec::<Value>::new())),
+        "runFaceCheck": gz_str(""),
     })
 }
+
+/// gzip + base64。服务端解这层压缩才读得到内容。
+fn gz(bytes: &[u8]) -> String {
+    use base64::Engine;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut e = GzEncoder::new(Vec::new(), Compression::default());
+    let _ = e.write_all(bytes);
+    let out = e.finish().unwrap_or_default();
+    base64::engine::general_purpose::STANDARD.encode(out)
+}
+
+fn gz_str(v: &str) -> String {
+    gz(v.as_bytes())
+}
+
+fn gz_json(v: &Value) -> String {
+    gz(v.to_string().as_bytes())
+}
+
 
 /// 生成两个 objectKey 并上传。
 pub fn upload_detail(
@@ -669,6 +718,62 @@ pub fn upload_detail(
     }
     log(&format!("√ [obs] {ok}/{} 个 key 上传成功", keys.len()));
     Ok(keys)
+}
+
+#[cfg(test)]
+mod obs_tests {
+    use super::*;
+    use base64::Engine;
+
+    /// OBS 对象必须是 10 个键，且每个值都是 gzip+base64。
+    ///
+    /// 之前传的是明文 JSON，键名也不同，服务端读不出轨迹，详情页显示
+    /// 「这条记录没有轨迹坐标」。
+    #[test]
+    fn obs_payload_is_ten_gzipped_keys() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let p = RunParams { distance_m: 1000.0, duration_sec: 300, ..Default::default() };
+        let pts: Vec<crate::track::TrackPoint> = (0..50)
+            .map(|i| crate::track::TrackPoint {
+                lat: 31.23 + i as f64 * 5.0 / 111320.0,
+                lon: 121.47,
+                time_ms: 1_793_966_000_000 + i as i64 * 1500,
+            })
+            .collect();
+        let sim = crate::track::SimResult {
+            speeds: vec![3.0; 50],
+            cadences: vec![150.0; 50],
+            strides: vec![1.2; 50],
+            total_steps: 300,
+            avg_cadence: 150.0,
+            speed_buckets: vec![],
+            step_buckets: vec![],
+            actual_length_m: 1000.0,
+        };
+        let v = detail_payload_rrid(&pts, &sim, &p, "123", 99, 1_793_966_000_000, "U");
+
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys.len(), 10, "必须是 10 个键，实际 {keys:?}");
+        for k in ["rrid", "uuid", "uid", "run_data", "fixed_point_json",
+                  "segment_json", "speed_json", "step_freq_json", "laps_json", "runFaceCheck"] {
+            assert!(v.get(k).is_some(), "缺 key: {k}");
+        }
+
+        // 每个值都要能 base64 解码 + gzip 解压
+        for k in keys {
+            let raw = v[k].as_str().unwrap_or_else(|| panic!("{k} 不是字符串"));
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(raw)
+                .unwrap_or_else(|e| panic!("{k} base64 解码失败: {e}"));
+            assert_eq!(&bytes[..2], &[31, 139], "{k} 不是 gzip 头");
+            let mut out = String::new();
+            GzDecoder::new(&bytes[..])
+                .read_to_string(&mut out)
+                .unwrap_or_else(|e| panic!("{k} gzip 解压失败: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2405,6 +2405,7 @@ dependencies = [
  "cbc",
  "eframe",
  "egui",
+ "flate2",
  "image",
  "md-5",
  "rand",

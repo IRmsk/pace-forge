@@ -36,6 +36,8 @@ sha2 = "0.10"
 # 极验缺口识别（只编 PNG，避免拖入整套图片编解码）
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
+# OBS 明细要 gzip+base64
+flate2 = "1"
 rand = "0.8"
 # GUI（可选，默认不编译）
 eframe = { version = "0.29", optional = true }

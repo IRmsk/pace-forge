@@ -72,7 +72,7 @@ pub struct Submission {
 /// 字段名与语义对齐服务端：`lat`/`lng` 是**占位**（固定 -1.0），真实坐标走
 /// `gLat`/`gLng` 且必须是 gcj02；`speed` 单位 km/h，`avgSpeed` 单位 m/s。
 #[allow(clippy::too_many_arguments)]
-fn point_json_full(
+pub fn point_json_full(
     p: &TrackPoint,
     idx: usize,
     n: usize,
