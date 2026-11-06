@@ -12,6 +12,8 @@
 
 use serde_json::{json, Value};
 
+use super::client::Client;
+
 use crate::crypto::sign::{sport_signature, SignFields};
 use crate::track::buckets::{speed_buckets, step_buckets, StepBucket};
 use crate::track::TrackPoint;
@@ -368,4 +370,39 @@ mod tests {
         let j = vec![0.0];
         assert!(build(&params(), &[], &[], &j).is_err());
     }
+}
+
+/// 提交成绩：`POST /api/v70260/runnings/save/record`。
+///
+/// 这是整条链路唯一会产生真实记录的请求。失败要区分两类：
+/// - 网络/加密失败 → 可重试
+/// - 业务驳回（`error != 0`）→ **不能重试**，错误次数会累积
+pub fn save_record(client: &Client, body: &Value) -> Result<Value, String> {
+    let raw = client.request(
+        "POST",
+        &format!("{}/api/v70260/runnings/save/record", crate::crypto::consts::hosts::RUN),
+        Some(body),
+    )?;
+    let v = crate::api::client::expect_ok(&raw)?;
+    let err = v.get("error").and_then(|e| e.as_i64()).unwrap_or(0);
+    if err != 0 {
+        let msg = v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("提交被驳回 error={err}: {msg}"));
+    }
+    Ok(v.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// 提交后的记录 id。
+pub fn extract_record_id(data: &Value) -> Option<i64> {
+    data.get("rrid")
+        .or_else(|| data.get("id"))
+        .and_then(|x| x.as_i64())
+        .or_else(|| {
+            data.get("recordId")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+        })
 }

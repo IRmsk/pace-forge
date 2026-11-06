@@ -82,6 +82,14 @@ pub struct RunOutcome {
     pub total_steps: i32,
     pub avg_cadence: f64,
     pub report: Report,
+    /// 轨迹点（含时间戳），提交与明细上传都要用。
+    pub track: Vec<crate::track::TrackPoint>,
+    /// 合成的步数/分桶数据。
+    pub sim: crate::track::SimResult,
+    /// 本次跑步的起始时间戳（毫秒）。
+    pub start_ms: i64,
+    /// 几何实测里程（可能和目标有小偏差）。
+    pub real_length_m: i64,
     pub obs_keys: Vec<String>,
     /// 是否已提交。
     pub submitted: bool,
@@ -282,10 +290,120 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         total_steps: sim.total_steps,
         avg_cadence: sim.avg_cadence,
         report,
+        track: track_points,
+        sim,
+        start_ms,
+        real_length_m: real_len,
         obs_keys: Vec::new(),
         submitted: false,
         record_id: None,
     })
+}
+
+/// 完整流程：自检通过后上传明细并提交成绩。
+///
+/// `confirm` 返回 false 时在提交前中止，已上传的 OBS 对象保留（不影响）。
+pub fn run_full(
+    client: &Client,
+    p: &RunParams,
+    log: &mut Log,
+    confirm: &mut dyn FnMut(&RunOutcome) -> bool,
+) -> Result<RunOutcome, String> {
+    // 前七步与 dry_run 完全一致
+    let mut out = dry_run(client, p, log)?;
+
+    if out.report.blocked() {
+        return Err(format!("自检未通过，不提交：{}", out.report.summary()));
+    }
+    if !confirm(&out) {
+        log("[flow] 已取消，未提交");
+        return Ok(out);
+    }
+
+    // ⑧ 上传轨迹明细
+    let start_ms = out.start_ms;
+    let uid = client
+        .credentials()
+        .and_then(|c| c.uid.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let payload = detail_payload(&out.track, &out.sim, p, &uid);
+    out.obs_keys = upload_detail(client, &payload, p, start_ms, &uid, log)?;
+
+    // ⑨ 组装报文
+    let unid = client
+        .credentials()
+        .and_then(|c| c.unid.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    let uuid = super::client::uuid_v4();
+    let stop_ms = start_ms + p.duration_sec * 1000;
+
+    let fixed: Vec<super::submit::FixedPoint> = out
+        .points
+        .coords
+        .iter()
+        .enumerate()
+        .map(|(i, &(lat, lon))| super::submit::FixedPoint {
+            lat,
+            lon,
+            position: i as i32 + 1,
+        })
+        .collect();
+
+    let policy_str = out.policy.policy.to_string();
+    let geo_fences = out
+        .fence
+        .as_ref()
+        .map(|f| super::fence::canonical_json_for(&f.selected.polygons[0]))
+        .unwrap_or_else(|| "[]".into());
+
+    let params = super::submit::SubmitParams {
+        uid: uid.clone(),
+        unid,
+        uuid: uuid.clone(),
+        sport_type: p.sport_type,
+        total_distance_m: out.real_length_m,
+        total_time_sec: p.duration_sec,
+        total_steps: out.total_steps,
+        start_time_ms: start_ms,
+        stop_time_ms: stop_ms,
+        sel_distance_m: p.distance_m.round() as i64,
+        sel_run_time_sec: p.duration_sec,
+        policy: policy_str,
+        run_area_id: out
+            .fence
+            .as_ref()
+            .map(|f| f.selected.run_area_id)
+            .unwrap_or(-1),
+        geo_fences_json: geo_fences,
+        total_ascent: 0,
+    };
+
+    let bucket_count = (p.duration_sec / 10).max(1) as usize;
+    let jitter = crate::track::buckets::make_jitter(bucket_count, 1.0, p.seed);
+    let submission = super::submit::build(&params, &out.track, &fixed, &jitter)?;
+    log(&format!(
+        "√ [submit] 报文已组装，{} 个轨迹点，objectKey={}",
+        out.track.len(),
+        submission.object_key
+    ));
+
+    // ⑩ 提交
+    log("[submit] 提交成绩…");
+    let data = super::submit::save_record(client, &submission.save_record)?;
+    out.submitted = true;
+    out.record_id = super::submit::extract_record_id(&data);
+    log(&format!(
+        "√ [submit] 提交成功，记录 id={:?}",
+        out.record_id
+    ));
+    log(&format!(
+        "  静默窗口 {} 秒内不要再发跑步请求",
+        SILENCE_SEC
+    ));
+
+    Ok(out)
 }
 
 /// 提交后必须保持静默的时长（秒）。

@@ -18,6 +18,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "run" => {
+            let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let yes = args.iter().any(|a| a == "-y" || a == "--yes");
+            do_run(dist_km, dur_min, yes);
+        }
         "dry" => {
             let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
             let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
@@ -35,11 +41,12 @@ fn main() {
             println!("pace-forge {} — 运动世界校园协议工具\n", pace_forge::VERSION);
             println!("用法:");
             println!("  pace-forge web [addr]          启动 Web 控制台（默认 127.0.0.1:9998）");
-            println!("  pace-forge dry [km] [min]      本地预演（拉策略/围栏/点位 + 自检）");
+            println!("  pace-forge run [km] [min] [-y] 刷跑并提交（-y 跳过确认）");
+            println!("  pace-forge dry [km] [min]      只预演，不提交");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
             println!("  pace-forge version             版本号");
             println!();
-            println!("dry 需要已保存的登录会话（$HOME/.pace-forge/session.json）。");
+            println!("run/dry 需要已保存的登录会话（$HOME/.pace-forge/session.json）。");
         }
         other => {
             eprintln!("未知命令: {other}\n用 `pace-forge help` 查看用法");
@@ -86,6 +93,65 @@ fn dry_run(dist_km: f64, dur_min: f64) {
         }
         Err(e) => {
             eprintln!("\n预演失败: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn do_run(dist_km: f64, dur_min: f64, yes: bool) {
+    use pace_forge::api::{flow, session};
+
+    let sess = session::load_session();
+    if !sess.is_valid() {
+        eprintln!("未登录：先执行 `pace-forge web` 在网页里登录一次");
+        std::process::exit(1);
+    }
+    let client = pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
+        .with_credentials(pace_forge::api::client::Credentials {
+            uid: Some(sess.uid.to_string()),
+            token: Some(sess.token.clone()),
+            unid: Some(sess.unid.clone()),
+        });
+
+    let p = flow::RunParams {
+        distance_m: dist_km * 1000.0,
+        duration_sec: (dur_min * 60.0).round() as i64,
+        ..Default::default()
+    };
+
+    println!("刷跑：{:.1} km / {:.0} 分钟\n", dist_km, dur_min);
+    let mut log = |s: &str| println!("{s}");
+    let mut confirm = |o: &flow::RunOutcome| -> bool {
+        println!();
+        println!("=== 待提交 ===");
+        println!("  轨迹点   {}", o.track.len());
+        println!("  里程     {:.1} m", o.actual_length_m);
+        println!("  步数     {}", o.total_steps);
+        println!("  步频     {:.1} 步/分", o.avg_cadence);
+        println!("  自检     {}", o.report.summary());
+        if yes {
+            println!("  （-y 已跳过确认）");
+            return true;
+        }
+        print!("\n确认提交？[y/N] ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        matches!(line.trim(), "y" | "Y" | "yes")
+    };
+
+    match flow::run_full(&client, &p, &mut log, &mut confirm) {
+        Ok(o) => {
+            if o.submitted {
+                println!("\n✅ 提交成功，记录 id={:?}", o.record_id);
+                println!("   {} 秒内不要再跑", flow::SILENCE_SEC);
+            } else {
+                println!("\n已取消");
+            }
+        }
+        Err(e) => {
+            eprintln!("\n失败: {e}");
             std::process::exit(1);
         }
     }
