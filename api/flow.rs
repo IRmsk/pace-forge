@@ -345,6 +345,23 @@ pub fn run_full(
         return Ok(out);
     }
 
+    // ❼.5 反检测体检：按 7.4.01 的本地规则先过一遍
+    {
+        let xy: Vec<(f64, f64)> = out.points.coords.clone();
+        let rep = crate::track::detect::inspect(
+            &xy,
+            &out.sim.speed_buckets,
+            crate::track::detect::PointRule::default(),
+        );
+        log(&format!("[detect] {}", rep.summary()));
+        for line in rep.lines().iter().take(5) {
+            log(&format!("  · {line}"));
+        }
+        if rep.blocked() {
+            return Err("点位体检未通过，提交会被判异常，已中止".into());
+        }
+    }
+
     // ⑧ 组装并提交（必须先提交，OBS 的 objectKey 和桶 id 都要 rrid）
     let start_ms = out.start_ms;
     let uid = client
@@ -404,13 +421,20 @@ pub fn run_full(
     let bucket_count = (p.duration_sec / 10).max(1) as usize;
     let jitter = crate::track::buckets::make_jitter(bucket_count, 1.0, p.seed);
     let submission = super::submit::build(&params, &out.track, &fixed, &jitter)?;
+
+    // 7.4.01 已移除 BODY_SENSORS，报文里不许出现心率字段
+    let mut body = submission.save_record.clone();
+    let dropped = crate::track::detect::strip_forbidden(&mut body);
+    if !dropped.is_empty() {
+        log(&format!("[detect] 已剔除不该有的字段: {}", dropped.join(", ")));
+    }
     log(&format!(
         "√ [submit] 报文已组装，{} 个轨迹点",
         out.track.len()
     ));
 
     log("[submit] 提交成绩…");
-    let data = super::submit::save_record(client, &submission.save_record)?;
+    let data = super::submit::save_record(client, &body)?;
     out.submitted = true;
     out.record_id = super::submit::extract_record_id(&data);
     log(&format!("√ [submit] 提交成功，记录 id={:?}", out.record_id));

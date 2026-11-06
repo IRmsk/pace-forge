@@ -3,6 +3,7 @@
 //! 全部为纯计算，不碰网络，可用单测完整验证。
 
 pub mod buckets;
+pub mod detect;
 pub mod biomech;
 pub mod kinematics;
 pub mod preflight;

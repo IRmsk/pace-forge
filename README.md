@@ -175,6 +175,60 @@ c_{t+1} = c_t + θ(target_t − c_t)·Δt + σ·√Δt·Z,   Z ~ N(0,1)
 pace-forge dry 2 12      # 只走自检，不发任何写请求
 ```
 
+## 反检测
+
+7.4.01 在客户端本地加了一层校验，`pace-forge` 会先自己过一遍。
+
+### 点位打分
+
+7.4.01 新增的 `libswsport.so` 里有个 `isValidPoint`，**不是布尔判断，是打分**：
+
+```
+score = 基础分(点位等级) + 模式分 + 距离分 + 时间分
+valid = (标志A == 0) && (标志B != 0) && (score > 65)
+```
+
+各项上限：基础 30、模式 30、距离 30、时间 10，满分 80。
+要过 65 分，**基础分必须 ≥ 25**，也就是点位等级要够高——不是随便一个点都算数。
+
+距离分的关键阈值是 **10 米**：相邻点间距低于 10 米才拿满分。
+
+`pace-forge` 默认采样 5 米一个点，所以满分区占比 100%：
+
+```
+$ pace-forge check 2 12
+=== 点位体检（模拟 7.4.01 本地规则）===
+  点位检查通过 · 满分区 100.0% · 平均间距 5.0m
+  判定: ✓ 通过
+```
+
+间距超过 10 米只扣分，超过 20 米直接拦截——因为那已经不是"跑步采样稀疏"，是"轨迹断了"。
+
+### 心率字段
+
+7.4.01 **移除了** `BODY_SENSORS` 权限，不再读心率。所以报文里如果还带心率，
+反而是"用旧版本伪造"的信号。提交前会自动剔除：
+
+```rust
+pub const FORBIDDEN_FIELDS: &[&str] = &[
+    "heartRate", "heartRates", "hrData",
+    "avgHeartRate", "maxHeartRate", "bodySensors",
+];
+```
+
+### 硬件指纹
+
+7.4.01 的 Manifest 把这三个设成 `required=true`（不满足就装不上）：
+
+```
+android.hardware.sensor.stepcounter    计步器
+android.hardware.sensor.stepdetector   步伐检测
+android.hardware.bluetooth             蓝牙
+```
+
+前两个是步数来源，第三个对应新增的 `getBluetoothInfo`（穿戴设备同步）。
+纯软件方案不带这些，属于"设备指纹不全"，但服务端目前没有强制校验的证据。
+
 ## 安装
 
 ```bash

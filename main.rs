@@ -19,6 +19,11 @@ fn main() {
             }
         }
         "semester" => show_semester(),
+        "check" => {
+            let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            local_check(dist_km, dur_min);
+        }
         "run" => {
             let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
             let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
@@ -44,7 +49,8 @@ fn main() {
             println!("  pace-forge web [addr]          启动 Web 控制台（默认 127.0.0.1:9998）");
             println!("  pace-forge semester            查学期进度（记分跑）");
             println!("  pace-forge run [km] [min] [-y] 刷跑并提交（-y 跳过确认）");
-            println!("  pace-forge dry [km] [min]      只预演，不提交");
+            println!("  pace-forge check [km] [min]    离线体检轨迹（不联网、不登录）");
+            println!("  pace-forge dry [km] [min]      只预演，不提交（要登录）");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
             println!("  pace-forge version             版本号");
             println!();
@@ -97,6 +103,88 @@ fn dry_run(dist_km: f64, dur_min: f64) {
             eprintln!("\n预演失败: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// 完全离线的轨迹体检：不登录、不联网，只看本地合成的数据像不像真跑。
+fn local_check(dist_km: f64, dur_min: f64) {
+    use pace_forge::track::{
+        buckets::{make_jitter, speed_buckets, step_buckets},
+        detect::{inspect, PointRule},
+        plan, simulate, KinParams, PlanRequest, SimParams, StadiumSpec,
+    };
+
+    let total_m = dist_km * 1000.0;
+    let total_sec = (dur_min * 60.0).round() as i64;
+    let start_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    println!("离线体检：{dist_km:.1} km / {dur_min:.0} 分钟");
+    println!("（不登录、不发请求，只验证本地合成数据）\n");
+
+    // 用操场轨迹，几何确定，便于看点位间距
+    let spec = StadiumSpec::new(30.5, 104.0).with_lane(1);
+    let lap = pace_forge::track::lap_length(1);
+    let laps = (total_m / lap).max(0.5);
+    let xy = pace_forge::track::stadium_track(&spec, laps, 5.0);
+    println!("  轨迹点      {}", xy.len());
+    println!("  绕圈        {laps:.2} 圈（单圈 {lap:.1} m）");
+
+    // 时间戳
+    let (times, _sp, real_len) = pace_forge::track::retime(
+        &xy, total_sec, start_ms, start_ms as u64,
+        &KinParams::default(), 1.0, 8.0,
+    );
+    let pts3: Vec<(f64, f64, i64)> = xy.iter().zip(&times)
+        .map(|((a, b), t)| (*a, *b, *t)).collect();
+
+    // 分桶
+    let sb = speed_buckets(&pts3, start_ms, total_sec);
+    let jit = make_jitter(sb.len().max(1), 1.0, start_ms as u64);
+    let stb = step_buckets(start_ms, total_sec, 180, &jit);
+
+    // 合成
+    let sp = SimParams {
+        total_distance_m: real_len as f64,
+        total_sec,
+        start_ms,
+        seed: start_ms as u64,
+        ..Default::default()
+    };
+    let sim = match simulate(&pts3, &sp) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("合成失败: {e}"); return; }
+    };
+
+    println!("  实际里程    {:.1} m", real_len);
+    println!("  总步数      {}", sim.total_steps);
+    println!("  平均步频    {:.1} 步/分", sim.avg_cadence);
+
+    // 反检测体检
+    let rep = inspect(&xy, &sb, PointRule::default());
+    println!("\n=== 点位体检（模拟 7.4.01 本地规则）===");
+    println!("  {}", rep.summary());
+    for line in rep.lines().iter().take(8) {
+        println!("  · {line}");
+    }
+    println!(
+        "\n  判定: {}",
+        if rep.blocked() {
+            "✗ 会被判异常"
+        } else {
+            "✓ 通过"
+        }
+    );
+
+    // 分桶统计
+    let caps: Vec<f64> = sb.iter().map(|b| b.distance).collect();
+    if !caps.is_empty() {
+        let mx = caps.iter().cloned().fold(f64::MIN, f64::max);
+        let mn = caps.iter().cloned().fold(f64::MAX, f64::min);
+        let avg = caps.iter().sum::<f64>() / caps.len() as f64;
+        println!("  分桶        {} 个，{:.1}~{:.1} m（均值 {:.1}）", caps.len(), mn, mx, avg);
     }
 }
 
