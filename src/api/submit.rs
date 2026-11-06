@@ -1,0 +1,371 @@
+//! 提交报文构建。
+//!
+//! 两条约束最容易踩：
+//! 1. **签名参与字段 ≠ 报文字段**。签名字段 31 个，报文字段 45 个，
+//!    差集是 `allLocJson` / `fivePointJson` / `signature` 等大字段（不进签名，
+//!    否则报文太大且服务端也是这么算的）。
+//! 2. **`speed` 是配速（分/公里）× 1000**，不是速度 m/s × 1000。
+//!    判据是规则字段 `speedTop/speedBottom` 的单位为分/公里。
+//!
+//! 报文里 `allLocJson` / `fivePointJson` / `speedPerTenSec` 等是**字符串化的 JSON**
+//! （双重序列化），不是嵌套对象。服务端按字符串取出来再解析一层。
+
+use serde_json::{json, Value};
+
+use crate::crypto::sign::{sport_signature, SignFields};
+use crate::track::buckets::{speed_buckets, step_buckets, StepBucket};
+use crate::track::TrackPoint;
+
+/// 每公里消耗千卡。
+const CALORIE_PER_KM: f64 = 62.0;
+/// 最长允许跑步时长（秒）。
+const MAX_RUN_TIME: i64 = 7200;
+/// 最少步数。
+const MIN_STEPS: i32 = 2000;
+
+/// 构建参数。
+#[derive(Debug, Clone)]
+pub struct SubmitParams {
+    pub uid: String,
+    pub unid: String,
+    pub uuid: String,
+    pub sport_type: i32,
+    pub total_distance_m: i64,
+    pub total_time_sec: i64,
+    pub total_steps: i32,
+    pub start_time_ms: i64,
+    pub stop_time_ms: i64,
+    /// 学期目标距离（米），决定 `complete`。
+    pub sel_distance_m: i64,
+    /// 学期目标时长（秒）。
+    pub sel_run_time_sec: i64,
+    /// 规则串，服务端原样回显。
+    pub policy: String,
+    pub run_area_id: i64,
+    pub geo_fences_json: String,
+    pub total_ascent: i32,
+}
+
+/// 打卡点。
+#[derive(Debug, Clone)]
+pub struct FixedPoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub position: i32,
+}
+
+/// 构建结果。
+#[derive(Debug, Clone)]
+pub struct Submission {
+    /// `save/record` 的 body。
+    pub save_record: Value,
+    /// OBS 直传的对象 key。
+    pub object_key: String,
+    /// 供排查用的签名原文。
+    pub canonical: String,
+}
+
+fn point_json(p: &TrackPoint, speed: f64) -> Value {
+    json!({
+        "lat": p.lat,
+        "lon": p.lon,
+        "time": p.time_ms,
+        "speed": speed,
+        "accuracy": 3.0,
+        "isValid": true,
+    })
+}
+
+/// 计算 `speed` 字段：配速（分/公里）× 1000。
+pub fn speed_field(distance_m: f64, time_sec: i64) -> i64 {
+    if distance_m <= 0.0 || time_sec <= 0 {
+        return 0;
+    }
+    let pace_min = (time_sec as f64 / 60.0) / (distance_m / 1000.0);
+    (pace_min * 1000.0).round() as i64
+}
+
+/// 构建完整提交报文。
+pub fn build(
+    params: &SubmitParams,
+    points: &[TrackPoint],
+    fixed: &[FixedPoint],
+    jitter: &[f64],
+) -> Result<Submission, String> {
+    if points.is_empty() {
+        return Err("轨迹为空，无法组装报文".into());
+    }
+    if params.total_distance_m <= 0 || params.total_steps < 0 {
+        return Err("距离必须为正，步数不能为负".into());
+    }
+
+    let complete = params.total_distance_m >= params.sel_distance_m
+        && params.total_time_sec >= params.sel_run_time_sec;
+    let un_complete_reason = if complete { 0 } else { 10 };
+    let avg_step_freq = if params.total_time_sec > 0 {
+        (params.total_steps as f64 * 60.0 / params.total_time_sec as f64).round() as i64
+    } else {
+        0
+    };
+    let speed_val = speed_field(params.total_distance_m as f64, params.total_time_sec);
+    let calorie = (params.total_distance_m as f64 / 1000.0 * CALORIE_PER_KM) as i64;
+
+    // 轨迹点带瞬时速度（中心差分），服务端画图会用到
+    let pts: Vec<(f64, f64, i64)> =
+        points.iter().map(|p| (p.lat, p.lon, p.time_ms)).collect();
+    let sb = speed_buckets(&pts, params.start_time_ms, params.total_time_sec);
+    let stb: Vec<StepBucket> = step_buckets(
+        params.start_time_ms,
+        params.total_time_sec,
+        params.total_steps,
+        jitter,
+    );
+
+    let loc_items: Vec<Value> = points.iter().map(|p| point_json(p, 0.0)).collect();
+    let all_loc_json = serde_json::to_string(&loc_items).map_err(|e| e.to_string())?;
+
+    let fp_items: Vec<Value> = fixed
+        .iter()
+        .map(|f| json!({"lat": f.lat, "lon": f.lon, "position": f.position}))
+        .collect();
+    // fivePointJson 是一层 envelope，不是裸数组：服务端要同时拿到点位列表、
+    // 围栏回显和 runAreaId 才能校验打卡合规。
+    let five_envelope = json!({
+        "fivePointJson": serde_json::to_string(&fp_items).map_err(|e| e.to_string())?,
+        "useZip": false,
+        "freedomShowFence": false,
+        "runAreaId": params.run_area_id,
+        "geoFencesJson": params.geo_fences_json,
+    });
+    let five_pt_json = serde_json::to_string(&five_envelope).map_err(|e| e.to_string())?;
+
+    let speed_json_str = serde_json::to_string(&sb).map_err(|e| e.to_string())?;
+    let step_json_str = serde_json::to_string(&stb).map_err(|e| e.to_string())?;
+
+    // ---- 签名（31 字段）----
+    let sign_fields: SignFields = vec![
+        ("address".into(), Some(String::new())),
+        ("avgPower".into(), Some("0".into())),
+        ("avgStepFreq".into(), Some(avg_step_freq.to_string())),
+        ("calorie".into(), Some(calorie.to_string())),
+        ("complete".into(), Some(complete.to_string())),
+        ("errorCode".into(), Some("0".into())),
+        ("faceCheck".into(), Some("0".into())),
+        ("geeToken".into(), Some(String::new())),
+        ("getPrize".into(), Some("False".into())),
+        // 签名侧固定字符串 "null"，body 侧才是 JSON null
+        ("goalId".into(), Some("null".into())),
+        ("policy".into(), Some(params.policy.clone())),
+        ("selDistance".into(), Some(params.sel_distance_m.to_string())),
+        ("selRunTime".into(), Some(params.sel_run_time_sec.to_string())),
+        ("selectedUnid".into(), Some(params.unid.clone())),
+        ("speed".into(), Some(speed_val.to_string())),
+        ("sportType".into(), Some(params.sport_type.to_string())),
+        ("startTime".into(), Some(params.start_time_ms.to_string())),
+        ("status".into(), Some("1".into())),
+        ("stopTime".into(), Some(params.stop_time_ms.to_string())),
+        ("themeId".into(), Some("0".into())),
+        ("totalAscent".into(), Some(params.total_ascent.to_string())),
+        ("totalDis".into(), Some(params.total_distance_m.to_string())),
+        ("totalSteps".into(), Some(params.total_steps.to_string())),
+        ("totalTime".into(), Some(params.total_time_sec.to_string())),
+        ("uid".into(), Some(params.uid.clone())),
+        ("unCompleteReason".into(), Some(un_complete_reason.to_string())),
+        ("unauthorized".into(), Some("0".into())),
+        ("useMobilityTools".into(), Some("0".into())),
+        ("uuid".into(), Some(params.uuid.clone())),
+        ("validDis".into(), Some(params.total_distance_m.to_string())),
+        ("validTime".into(), Some(params.total_time_sec.to_string())),
+    ];
+    let signature = sport_signature(&sign_fields);
+    let canonical = crate::crypto::sign::canonical_string(&sign_fields);
+
+    let save_record = json!({
+        "address": "",
+        "allLocJson": all_loc_json,
+        "avgPower": 0,
+        "avgStepFreq": avg_step_freq,
+        "calorie": calorie,
+        "complete": complete,
+        "errorCode": 0,
+        "faceCheck": 0,
+        "fivePointJson": five_pt_json,
+        "geeToken": "",
+        "getPrize": false,
+        "goalId": Value::Null,
+        "isUpload": false,
+        "latitude": points[0].lat,
+        "longitude": points[0].lon,
+        "maxRunTime": MAX_RUN_TIME,
+        "minSteps": MIN_STEPS,
+        "policy": params.policy,
+        "recordUrl": "",
+        "roomId": 0,
+        "runAreaId": params.run_area_id,
+        "segmentJson": "[]",
+        "selDistance": params.sel_distance_m,
+        "selRunTime": params.sel_run_time_sec,
+        "selectedUnid": params.unid,
+        "signature": signature,
+        "speed": speed_val,
+        "speedPerTenSec": speed_json_str,
+        "sportType": params.sport_type,
+        "startTime": params.start_time_ms,
+        "status": 1,
+        "stepsPerTenSec": step_json_str,
+        "stopTime": params.stop_time_ms,
+        "themeId": 0,
+        "totalAscent": params.total_ascent,
+        "totalDis": params.total_distance_m,
+        "totalSteps": params.total_steps,
+        "totalTime": params.total_time_sec,
+        "uid": params.uid,
+        "unCompleteReason": un_complete_reason,
+        "unauthorized": 0,
+        "useMobilityTools": 0,
+        "uuid": params.uuid,
+        "validDis": params.total_distance_m,
+        "validTime": params.total_time_sec,
+    });
+
+    let object_key = format!(
+        "runData/{}/{}/{}_{}.txt",
+        params.uid,
+        params.sport_type,
+        params.start_time_ms / 1000,
+        params.uuid
+    );
+
+    Ok(Submission { save_record, object_key, canonical })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> SubmitParams {
+        SubmitParams {
+            uid: "123456".into(),
+            unid: "88".into(),
+            uuid: "00000000-0000-4000-8000-000000000001".into(),
+            sport_type: 1,
+            total_distance_m: 2000,
+            total_time_sec: 720,
+            total_steps: 2300,
+            start_time_ms: 1_730_000_000_000,
+            stop_time_ms: 1_730_000_720_000,
+            sel_distance_m: 1800,
+            sel_run_time_sec: 600,
+            policy: "policy_str".into(),
+            run_area_id: 7,
+            geo_fences_json: "[]".into(),
+            total_ascent: 0,
+        }
+    }
+
+    fn points() -> Vec<TrackPoint> {
+        let n = 200;
+        let step = 720_000 / (n - 1) as i64;
+        (0..n)
+            .map(|i| TrackPoint {
+                lat: 30.5 + i as f64 * 1e-5,
+                lon: 104.0,
+                time_ms: if i == n - 1 {
+                    1_730_000_000_000 + 720_000
+                } else {
+                    1_730_000_000_000 + i as i64 * step
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn speed_is_pace_not_velocity() {
+        // 2000m / 720s → 配速 6.0 分/km → 6000
+        assert_eq!(speed_field(2000.0, 720), 6000);
+        // 若误按 m/s×1000 会得到 2777，明显不同
+        assert_ne!(speed_field(2000.0, 720), (2000.0f64 / 720.0 * 1000.0).round() as i64);
+        assert_eq!(speed_field(0.0, 720), 0);
+        assert_eq!(speed_field(2000.0, 0), 0);
+    }
+
+    #[test]
+    fn payload_has_all_required_fields() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let v = &sub.save_record;
+        for k in [
+            "allLocJson", "fivePointJson", "speedPerTenSec", "stepsPerTenSec",
+            "signature", "speed", "avgStepFreq", "complete", "unCompleteReason",
+            "totalDis", "totalTime", "totalSteps", "uid", "uuid", "sportType",
+        ] {
+            assert!(v.get(k).is_some(), "缺字段 {k}");
+        }
+    }
+
+    #[test]
+    fn nested_json_is_double_serialized() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let v = &sub.save_record;
+        // 这三个必须是字符串，不是数组
+        assert!(v["allLocJson"].is_string(), "allLocJson 应为字符串");
+        assert!(v["speedPerTenSec"].is_string(), "speedPerTenSec 应为字符串");
+        assert!(v["stepsPerTenSec"].is_string(), "stepsPerTenSec 应为字符串");
+        // 但解一层后应是数组
+        let inner: Value = serde_json::from_str(v["allLocJson"].as_str().unwrap()).unwrap();
+        assert!(inner.is_array());
+        let sb: Value = serde_json::from_str(v["speedPerTenSec"].as_str().unwrap()).unwrap();
+        assert!(sb.is_array());
+    }
+
+    #[test]
+    fn signature_is_32_hex() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sig = sub.save_record["signature"].as_str().unwrap();
+        assert_eq!(sig.len(), 32);
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn complete_flag_follows_targets() {
+        let j = vec![0.0; 72];
+        // 达标
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        assert_eq!(sub.save_record["complete"], true);
+        assert_eq!(sub.save_record["unCompleteReason"], 0);
+
+        // 不达标
+        let mut p = params();
+        p.sel_distance_m = 5000;
+        let sub2 = build(&p, &points(), &[], &j).unwrap();
+        assert_eq!(sub2.save_record["complete"], false);
+        assert_eq!(sub2.save_record["unCompleteReason"], 10);
+    }
+
+    #[test]
+    fn buckets_match_duration() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sb: Value =
+            serde_json::from_str(sub.save_record["speedPerTenSec"].as_str().unwrap()).unwrap();
+        assert_eq!(sb.as_array().unwrap().len(), 72, "720s 应有 72 个桶");
+    }
+
+    #[test]
+    fn object_key_shape() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        assert_eq!(
+            sub.object_key,
+            "runData/123456/1/1730000000_00000000-0000-4000-8000-000000000001.txt"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_track() {
+        let j = vec![0.0];
+        assert!(build(&params(), &[], &[], &j).is_err());
+    }
+}

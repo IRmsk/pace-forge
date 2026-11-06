@@ -1,0 +1,43 @@
+[package]
+name = "pace-forge"
+version = "0.1.0"
+edition = "2021"
+description = "运动轨迹合成引擎：生物力学步态建模与运动学速度剖面分析"
+license = "MIT"
+repository = "https://github.com/IRmsk/pace-forge"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["cli"]
+cli = []
+gui = ["dep:eframe", "dep:egui"]
+
+[dependencies]
+# --- 协议层 ---
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tiny_http = "0.12"
+ureq = { version = "2", default-features = false, features = ["json", "tls", "gzip"] }
+# 加密
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+rsa = { version = "0.9", features = ["sha2"] }
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
+# 极验缺口识别（只编 PNG，避免拖入整套图片编解码）
+image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"
+rand = "0.8"
+# GUI（可选，默认不编译）
+eframe = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
