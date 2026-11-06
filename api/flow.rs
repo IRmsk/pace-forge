@@ -261,8 +261,18 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             route.lines,
             route.length_m
         ));
+        // 蛇形直角折线一眼就是机器画的。倒圆 + 低频摆动，让它像人跑的。
+        // 蛇形的每条扫描线是围栏全宽（这里东西 883m），几条平行直线一摆出来
+        // 就是机器味。倒圆把拐角磨掉，摆动让直线变成起伏的曲线。
+        let rounded = crate::track::fence_route::round_corners(&route.points, 30.0, 8);
+        let wandered = crate::track::fence_route::add_wander(
+            &rounded,
+            22.0,
+            95.0,
+            if p.seed != 0 { p.seed } else { start_ms as u64 },
+        );
         let sampled = crate::track::fence_route::resample_with_checkpoints(
-            &route.points,
+            &wandered,
             p.sample_step_m,
             &must,
             15.0,
@@ -521,7 +531,12 @@ pub fn run_full(
     // ⑨ OBS：用 rrid 重算桶 id 和 objectKey
     let rrid = out.record_id.unwrap_or(0);
     log(&format!("[obs] 用 rrid={rrid} 上传明细…"));
-    let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid);
+    let five_pt = body
+        .get("fivePointJson")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid, &five_pt);
     let keys = vec![
         super::obs::detail_key(start_ms, &uuid),
         format!("run_data/{}/{rrid}.json", rrid / 1_000_000),
@@ -623,6 +638,7 @@ pub fn detail_payload_rrid(
     rrid: i64,
     start_ms: i64,
     uuid: &str,
+    five_point_json: &str,
 ) -> Value {
     let mut speed = sim.speed_buckets.clone();
     let mut steps = sim.step_buckets.clone();
@@ -659,7 +675,7 @@ pub fn detail_payload_rrid(
         "uuid": gz_str(uuid),
         "uid": gz_str(uid),
         "run_data": gz_json(&run_wrap),
-        "fixed_point_json": gz_str(""),
+        "fixed_point_json": gz_str(five_point_json),
         "segment_json": gz_str(""),
         "speed_json": gz_json(&Value::Array(
             speed.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
@@ -752,7 +768,7 @@ mod obs_tests {
             step_buckets: vec![],
             actual_length_m: 1000.0,
         };
-        let v = detail_payload_rrid(&pts, &sim, &p, "123", 99, 1_793_966_000_000, "U");
+        let v = detail_payload_rrid(&pts, &sim, &p, "123", 99, 1_793_966_000_000, "U", "[]");
 
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         assert_eq!(keys.len(), 10, "必须是 10 个键，实际 {keys:?}");

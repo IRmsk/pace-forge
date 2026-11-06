@@ -140,6 +140,20 @@ fn boustrophedon(poly: &[(f64, f64)], spacing_m: f64) -> (Vec<(f64, f64)>, usize
     (pts, line_idx)
 }
 
+/// 点集的南北跨度（米），用来定外扩量。
+fn point_span_m(pts: &[(f64, f64)]) -> f64 {
+    if pts.len() < 2 {
+        return 0.0;
+    }
+    let mlat = m_per_deg_lat(pts[0].0).max(1.0);
+    let mlng = m_per_deg_lng(pts[0].0).max(1.0);
+    let dlat = pts.iter().map(|p| p.0).fold(f64::MIN, f64::max)
+        - pts.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+    let dlng = pts.iter().map(|p| p.1).fold(f64::MIN, f64::max)
+        - pts.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+    ((dlat * mlat).powi(2) + (dlng * mlng).powi(2)).sqrt()
+}
+
 /// 折线总长（米）。
 fn path_len(pts: &[(f64, f64)]) -> f64 {
     pts.windows(2).map(|w| distance(w[0], w[1])).sum()
@@ -184,7 +198,8 @@ pub fn route_in_fence_with(
     // 有必经点时，蛇形范围收缩到「必经点包围盒」与「围栏」的交集，
     // 这样里程才会花在打卡点附近，而不是花在没人去的角落。
     let work_area: Vec<(f64, f64)> = if must_inside.len() >= 2 {
-        let pad_m = 60.0;
+        // 外扩要够：钉点必须落在扫描线覆盖的区域内，否则会撕出几百米的直线跳跃
+        let pad_m = 15.0_f64.max(point_span_m(&must_inside) * 0.35);
         let mlat = m_per_deg_lat(must_inside[0].0).max(1.0);
         let mlng = m_per_deg_lng(must_inside[0].0).max(1.0);
         let lat_min = must_inside.iter().map(|p| p.0).fold(f64::MAX, f64::min) - pad_m / mlat;
@@ -327,6 +342,111 @@ pub fn route_in_fence_with(
     Ok(FenceRoute { points, length_m, lines })
 }
 
+/// 转角倒圆：把折线的尖角换成圆弧。
+///
+/// 蛇形扫描出来是 `_|_|_|_|` 这种直角折线，在地图上一眼就是机器画的。
+/// 人跑步拐弯是弧线，哪怕原地折返也有个半径。
+///
+/// `radius_m` 是倒圆半径，超过半边长就自动收敛。
+pub fn round_corners(path: &[(f64, f64)], radius_m: f64, seg_per_corner: usize) -> Vec<(f64, f64)> {
+    if path.len() < 3 || radius_m <= 0.0 || seg_per_corner == 0 {
+        return path.to_vec();
+    }
+    let mut out = vec![path[0]];
+    for i in 1..path.len() - 1 {
+        let (a, b, c) = (path[i - 1], path[i], path[i + 1]);
+        let ab = distance(a, b);
+        let bc = distance(b, c);
+        if ab < 1e-6 || bc < 1e-6 {
+            out.push(b);
+            continue;
+        }
+        // 倒圆半径不能超过任一边的一半
+        let r = radius_m.min(ab / 2.0).min(bc / 2.0);
+        if r < 0.5 {
+            out.push(b);
+            continue;
+        }
+        // 从 b 沿两边各退 r 米，得到切点
+        let ka = r / ab;
+        let kc = r / bc;
+        let p1 = (b.0 + (a.0 - b.0) * ka, b.1 + (a.1 - b.1) * ka);
+        let p2 = (b.0 + (c.0 - b.0) * kc, b.1 + (c.1 - b.1) * kc);
+        // 用二次贝塞尔近似圆弧，控制点就是顶点 b
+        for k in 0..=seg_per_corner {
+            let t = k as f64 / seg_per_corner as f64;
+            let u = 1.0 - t;
+            out.push((
+                u * u * p1.0 + 2.0 * u * t * b.0 + t * t * p2.0,
+                u * u * p1.1 + 2.0 * u * t * b.1 + t * t * p2.1,
+            ));
+        }
+    }
+    out.push(*path.last().unwrap());
+    out
+}
+
+/// 给路径叠一层低频摆动。
+///
+/// 人跑步不会精确贴线，会有横向漂移（避让行人、贴着路边）。用几段不同频率
+/// 的正弦叠加，平均值为零，不改变起终点和总长度太多。
+pub fn add_wander(path: &[(f64, f64)], amp_m: f64, wavelength_m: f64, seed: u64) -> Vec<(f64, f64)> {
+    if path.len() < 3 || amp_m <= 0.0 || wavelength_m <= 1.0 {
+        return path.to_vec();
+    }
+    // 先算累计弧长，摆动按弧长走，不按点数
+    let mut acc = vec![0.0f64; path.len()];
+    for i in 1..path.len() {
+        acc[i] = acc[i - 1] + distance(path[i - 1], path[i]);
+    }
+    let total = acc[path.len() - 1];
+    if total < 1.0 {
+        return path.to_vec();
+    }
+    // 三个不成整数比的频率，避免周期性太明显
+    let ph1 = (seed % 1000) as f64 / 1000.0 * std::f64::consts::TAU;
+    let ph2 = (seed % 997) as f64 / 997.0 * std::f64::consts::TAU;
+
+    let mut out = Vec::with_capacity(path.len());
+    for i in 0..path.len() {
+        // 切线方向。必须先把度换算成米——纬度和经度的度长差了 1.65 倍，
+        // 直接拿度当向量算，法向会歪到天涯海角（实测把点推到 108km 外）。
+        let (dlat, dlng) = if i + 1 < path.len() {
+            (path[i + 1].0 - path[i].0, path[i + 1].1 - path[i].1)
+        } else {
+            (path[i].0 - path[i - 1].0, path[i].1 - path[i - 1].1)
+        };
+        let mlat = m_per_deg_lat(path[i].0).max(1.0);
+        let mlng = m_per_deg_lng(path[i].0).max(1.0);
+        let (dy_m, dx_m) = (dlat * mlat, dlng * mlng);
+        let len_m = (dy_m * dy_m + dx_m * dx_m).sqrt().max(1e-9);
+        // 法向（左转 90 度），仍是米
+        let (ny_m, nx_m) = (-dx_m / len_m, dy_m / len_m);
+
+        let s = acc[i];
+        let w = amp_m
+            * (0.6 * (s / wavelength_m * std::f64::consts::TAU + ph1).sin()
+                + 0.3 * (s / (wavelength_m * 2.7) * std::f64::consts::TAU + ph2).sin()
+                + 0.1 * (s / (wavelength_m * 7.3) * std::f64::consts::TAU).sin());
+
+        // 首尾不摆动，保证起终点精确
+        let fade = if i == 0 || i + 1 == path.len() {
+            0.0
+        } else {
+            let head = (s / 20.0).min(1.0);
+            let tail = ((total - s) / 20.0).min(1.0);
+            head.min(tail)
+        };
+
+        // 米的偏移再换算回度
+        out.push((
+            path[i].0 + ny_m * w * fade / mlat,
+            path[i].1 + nx_m * w * fade / mlng,
+        ));
+    }
+    out
+}
+
 /// 把必经点「钉」进折线：找路径上离它最近的一段，用 A → m → B 替换 A → B。
 ///
 /// 光靠重采样后吸附不行——吸附只能在已有采样点里挑一个最近的，采样间距 5m
@@ -384,42 +504,40 @@ pub fn resample_with_checkpoints(
         return path.to_vec();
     }
 
-    // 沿路径等距采样
-    let mut out = Vec::new();
-    let mut carry = 0.0;
-    out.push(path[0]);
+    // 沿路径等距采样。
+    //
+    // 之前的写法用 `t = step_m - carry` 做段内偏移，但 carry 会累积成
+    // 「整段长度」而不是「不到一步的余量」，下一段起步就变成负数，
+    // while 循环把整段反复插点——一条 2km 的路径能采样出 73 万个点。
+    let mut out = vec![path[0]];
+    let mut carry = 0.0; // 距离下一个采样点还差多少
     for w in path.windows(2) {
         let d = distance(w[0], w[1]);
         if d < 1e-9 {
             continue;
         }
-        let mut t = step_m - carry;
-        while t <= d {
-            let k = t / d;
+        // 段起点已经在上一次（或初始点）压进去了，本段第一个采样位置是
+        // 「还差多少凑够一步」之后的那个点。写成 pos = carry 会在 carry == 0
+        // 时把段起点再插一遍，产生 0 间距的重复点。
+        let mut pos = step_m - carry;
+        while pos <= d {
+            let t = pos / d;
             out.push((
-                w[0].0 + (w[1].0 - w[0].0) * k,
-                w[0].1 + (w[1].1 - w[0].1) * k,
+                w[0].0 + (w[1].0 - w[0].0) * t,
+                w[0].1 + (w[1].1 - w[0].1) * t,
             ));
-            t += step_m;
+            pos += step_m;
         }
-        carry = d - (t - step_m);
+        // 本段走完后离下一个采样点还差多少（落在 [0, step_m)）
+        carry = d - (pos - step_m);
     }
 
-    // 打卡点：找路径上最近的点替换
-    for &m in must {
-        let mut best_i = 0;
-        let mut best_d = f64::MAX;
-        for (i, &p) in out.iter().enumerate() {
-            let d = distance(p, m);
-            if d < best_d {
-                best_d = d;
-                best_i = i;
-            }
-        }
-        if best_d <= snap_m {
-            out[best_i] = m;
-        }
+    // 打卡点最后钉一次：前面的倒圆和摆动会把它们推走，
+    // 光靠 snap 只要超过 snap_m 就吸附不上。
+    if !must.is_empty() {
+        out = pin_checkpoints(&out, must);
     }
+    let _ = snap_m;
     out
 }
 
@@ -527,6 +645,38 @@ mod tests {
                 "相邻点既不在同一行也不在同一列，说明斜穿了: {:?} → {:?}",
                 w[0], w[1]
             );
+        }
+    }
+
+    /// 摆动必须在米制下算，不能拿「度」当向量。
+    ///
+    /// 纬度和经度的度长差 1.65 倍，混着算会把法向指歪——实测把采样点
+    /// 推到 108km 外，采样点数从 463 炸到 73 万。
+    #[test]
+    fn wander_stays_near_path() {
+        let path: Vec<(f64, f64)> = (0..=60)
+            .map(|i| (31.23, 121.47 + i as f64 * 10.0 / m_per_deg_lng(31.23)))
+            .collect();
+        let w = add_wander(&path, 20.0, 100.0, 7);
+        assert_eq!(w.len(), path.len());
+        for (a, b) in path.iter().zip(w.iter()) {
+            let d = distance(*a, *b);
+            assert!(d < 40.0, "摆动把点推了 {d:.0}m，超出振幅量级");
+        }
+    }
+
+    /// 重采样不得产生重复点或漏采样。
+    #[test]
+    fn resample_has_no_duplicates() {
+        let path: Vec<(f64, f64)> = (0..=50)
+            .map(|i| (31.23, 121.47 + i as f64 * 7.0 / m_per_deg_lng(31.23)))
+            .collect();
+        let pts = resample_with_checkpoints(&path, 5.0, &[], 15.0);
+        assert!(pts.len() > 50, "350m / 5m 至少 70 点，实际 {}", pts.len());
+        for w in pts.windows(2) {
+            let d = distance(w[0], w[1]);
+            assert!(d > 2.0, "出现 {d:.2}m 的重复点");
+            assert!(d < 8.0, "间距 {d:.2}m 偏离 5m 太多");
         }
     }
 
