@@ -104,6 +104,15 @@ fn scan_intersections(poly: &[(f64, f64)], lat: f64) -> Vec<f64> {
 ///
 /// `spacing_m` 是相邻扫描线的间距（米）。越小线越密、总长越长。
 fn boustrophedon(poly: &[(f64, f64)], spacing_m: f64) -> (Vec<(f64, f64)>, usize) {
+    boustrophedon_avoiding(poly, spacing_m, &[])
+}
+
+/// 带障碍的蛇形扫描。障碍（湖、河、楼）内部不铺线。
+fn boustrophedon_avoiding(
+    poly: &[(f64, f64)],
+    spacing_m: f64,
+    blockers: &[Vec<(f64, f64)>],
+) -> (Vec<(f64, f64)>, usize) {
     if poly.len() < 3 || spacing_m <= 0.0 {
         return (Vec::new(), 0);
     }
@@ -125,6 +134,11 @@ fn boustrophedon(poly: &[(f64, f64)], spacing_m: f64) -> (Vec<(f64, f64)>, usize
                 break;
             }
             let (mut x0, mut x1) = (pair[0], pair[1]);
+            // 被障碍盖住的区间直接跳过——不然轨迹从湖面上划过去
+            let mid = (x0 + x1) / 2.0;
+            if blockers.iter().any(|b| contains(b, lat, mid)) {
+                continue;
+            }
             if !forward {
                 std::mem::swap(&mut x0, &mut x1);
             }
@@ -155,7 +169,7 @@ fn point_span_m(pts: &[(f64, f64)]) -> f64 {
 }
 
 /// 折线总长（米）。
-fn path_len(pts: &[(f64, f64)]) -> f64 {
+pub fn path_len(pts: &[(f64, f64)]) -> f64 {
     pts.windows(2).map(|w| distance(w[0], w[1])).sum()
 }
 
@@ -180,6 +194,16 @@ pub fn route_in_fence_with(
     fence: &[(f64, f64)],
     want_m: f64,
     must: &[(f64, f64)],
+) -> Result<FenceRoute, String> {
+    route_in_fence_avoiding(fence, want_m, must, &[])
+}
+
+/// 带障碍的版本：湖、河、池塘等区域不铺线。
+pub fn route_in_fence_avoiding(
+    fence: &[(f64, f64)],
+    want_m: f64,
+    must: &[(f64, f64)],
+    blockers: &[Vec<(f64, f64)>],
 ) -> Result<FenceRoute, String> {
     if fence.len() < 3 {
         return Err("围栏点数不足，无法规划".into());
@@ -234,7 +258,7 @@ pub fn route_in_fence_with(
 
     // 铺密一点：间距取「15m」和「能塞下的最密」二者较大值
     let spacing = 15.0f64.max(heat_m / 400.0);
-    let (dense, lines) = boustrophedon(&inner, spacing);
+    let (dense, lines) = boustrophedon_avoiding(&inner, spacing, blockers);
     if dense.len() < 2 {
         return Err("围栏内没能生成扫描线".into());
     }
@@ -445,6 +469,85 @@ pub fn add_wander(path: &[(f64, f64)], amp_m: f64, wavelength_m: f64, seed: u64)
         ));
     }
     out
+}
+
+/// 沿围栏边界内缩跑。
+///
+/// OSM 在多数校园里几乎是空的（实测某个校区整片只有 1 个 landuse 标签），
+/// 拿不到道路和水域，就没法判断哪里能走哪里是湖。但**围栏边界一定是可走的**
+/// ——学校圈地时边界就是围墙或道路。
+///
+/// 所以最稳的路线是贴着围栏内缩若干米跑圈：不会穿水、不会穿楼，形状也像
+/// 人绕着校园跑。里程不够就再来一圈。
+pub fn route_along_fence(
+    fence: &[(f64, f64)],
+    want_m: f64,
+    inset_m: f64,
+    must: &[(f64, f64)],
+) -> Result<FenceRoute, String> {
+    if fence.len() < 3 {
+        return Err("围栏点数不足".into());
+    }
+    if want_m <= 0.0 {
+        return Err("目标里程必须为正".into());
+    }
+    let ring = shrink(fence, inset_m);
+    let one_lap = path_len(&ring);
+    if one_lap < 20.0 {
+        return Err(format!("内缩后周长只有 {one_lap:.0}m，太短"));
+    }
+
+    // 圈数：想跑够里程，但不要超过 3 圈（再多就明显是机器绕圈了）
+    let laps = (want_m / one_lap).ceil().clamp(1.0, 3.0);
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    let mut acc = 0.0;
+    for lap in 0..laps as usize {
+        let mut step = ring.clone();
+        // 偶数圈反向走，避免和上一圈完全重合
+        if lap % 2 == 1 {
+            step.reverse();
+        }
+        // 第一圈也要按目标截断——不然跑 1500m 的目标会走满整圈 3300m
+        let skip = usize::from(!points.is_empty());
+        for &p in step.iter().skip(skip) {
+            if acc >= want_m {
+                break;
+            }
+            if let Some(&last) = points.last() {
+                acc += distance(last, p);
+            }
+            points.push(p);
+        }
+        if acc >= want_m {
+            break;
+        }
+    }
+
+    // 打卡点：环形路径上找最近的顶点插进去
+    if !must.is_empty() {
+        for &m in must {
+            let mut best_i = 0;
+            let mut bd = f64::MAX;
+            for (i, &p) in points.iter().enumerate() {
+                let d = distance(p, m);
+                if d < bd {
+                    bd = d;
+                    best_i = i;
+                }
+            }
+            // 只在内缩环附近生成支线，不硬跳过去
+            if bd < 150.0 {
+                points.insert(best_i + 1, m);
+            }
+        }
+    }
+
+    let length_m = path_len(&points);
+    Ok(FenceRoute {
+        points,
+        length_m,
+        lines: laps as usize,
+    })
 }
 
 /// 把必经点「钉」进折线：找路径上离它最近的一段，用 A → m → B 替换 A → B。
@@ -677,6 +780,35 @@ mod tests {
             let d = distance(w[0], w[1]);
             assert!(d > 2.0, "出现 {d:.2}m 的重复点");
             assert!(d < 8.0, "间距 {d:.2}m 偏离 5m 太多");
+        }
+    }
+
+    /// 沿边界跑必须打卡全中，且里程不能超目标太多。
+    #[test]
+    fn lap_route_hits_all_checkpoints() {
+        // 400m × 300m 的矩形围栏，周长约 1400m
+        let mlat = m_per_deg_lat(31.23);
+        let mlng = m_per_deg_lng(31.23);
+        let (lat0, lon0) = (31.2304, 121.4737);
+        let ring: Vec<(f64, f64)> = vec![
+            (lat0, lon0),
+            (lat0, lon0 + 400.0 / mlng),
+            (lat0 + 300.0 / mlat, lon0 + 400.0 / mlng),
+            (lat0 + 300.0 / mlat, lon0),
+        ];
+        let cps = vec![
+            (lat0, lon0 + 200.0 / mlng),
+            (lat0 + 300.0 / mlat, lon0 + 200.0 / mlng),
+        ];
+        let r = route_along_fence(&ring, 1000.0, 20.0, &cps).unwrap();
+        assert!(r.length_m > 800.0 && r.length_m < 1500.0, "长度 {:.0}m 不合理", r.length_m);
+        let dense = resample_with_checkpoints(&r.points, 5.0, &cps, 15.0);
+        for c in &cps {
+            let near = dense
+                .iter()
+                .map(|p| distance(*p, *c))
+                .fold(f64::MAX, f64::min);
+            assert!(near < 0.5, "打卡点离最近轨迹 {near:.2}m");
         }
     }
 

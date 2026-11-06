@@ -250,25 +250,42 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
 
         let must: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
-        let route = crate::track::fence_route::route_in_fence_with(
+        // 路线优先级：
+        //   ① 沿围栏边界内缩跑——围墙边界一定是能走的路，绝不会落在湖面
+        //      或楼里；形状也像人绕着校园跑。
+        //   ② 几何蛇形填充——边界周长不够或内缩失败时的兜底。
+        //
+        // 之前只有 ②，纯几何不看地形，轨迹直接从水面划过去。
+        let inset = 25.0;
+        let route = match crate::track::fence_route::route_along_fence(
             &fence_ring,
             p.distance_m,
+            inset,
             &must,
-        )?;
-        log(&format!(
-            "√ [track] 围栏内 {} 顶点，{} 条扫描线，{:.0}m",
-            route.points.len(),
-            route.lines,
-            route.length_m
-        ));
-        // 蛇形直角折线一眼就是机器画的。倒圆 + 低频摆动，让它像人跑的。
-        // 蛇形的每条扫描线是围栏全宽（这里东西 883m），几条平行直线一摆出来
-        // 就是机器味。倒圆把拐角磨掉，摆动让直线变成起伏的曲线。
-        let rounded = crate::track::fence_route::round_corners(&route.points, 30.0, 8);
+        ) {
+            Ok(r) => {
+                log(&format!(
+                    "[track] 沿围栏内缩 {inset:.0}m 跑，{} 圈 {:.0}m",
+                    r.lines, r.length_m
+                ));
+                r
+            }
+            Err(e) => {
+                log(&format!("[track] 沿边界规划失败（{e}），退回几何填充"));
+                crate::track::fence_route::route_in_fence_avoiding(
+                    &fence_ring,
+                    p.distance_m,
+                    &must,
+                    &[],
+                )?
+            }
+        };
+        // 沿边界是贴着围墙的折线，拐角磨圆 + 轻微摆动，别像尺子画的
+        let rounded = crate::track::fence_route::round_corners(&route.points, 20.0, 6);
         let wandered = crate::track::fence_route::add_wander(
             &rounded,
-            22.0,
-            95.0,
+            6.0,
+            120.0,
             if p.seed != 0 { p.seed } else { start_ms as u64 },
         );
         let sampled = crate::track::fence_route::resample_with_checkpoints(
