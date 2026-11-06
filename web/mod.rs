@@ -87,6 +87,8 @@ impl State {
             a.name = p.name.clone();
             a.school = p.campus_name.clone();
             a.last_login_ms = crate::crypto::envelope::now_ms() as i64;
+            // 能登录成功就说明凭据有效，标记启用；否则 login-all 会一直跳过它
+            a.enabled = true;
         }
         self.clients
             .insert(id.to_string(), make_client(&p.uid, &p.token, &p.unid));
@@ -428,7 +430,11 @@ fn handle_plan(
                     "note": "已连服务端：围栏与打卡点为真实数据，未提交",
                 }));
             }
-            // dry_run 失败就退回本地合成
+            // dry_run 失败就退回本地合成，但要把原因带出来——
+            // 否则页面只显示「本地合成」，完全不知道服务端哪一步卡住了
+            if let Err(e) = r {
+                return json_err(request, &format!("真实流程失败：{e}"));
+            }
         }
     }
 
