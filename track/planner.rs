@@ -262,7 +262,7 @@ fn square_ring(lat: f64, lng: f64, side_m: f64) -> Vec<(f64, f64)> {
 }
 
 /// 等间隔时间戳，末点精确等于 start + total_sec。
-fn assign_times(n: usize, start_ms: i64, total_sec: i64) -> Vec<i64> {
+pub fn assign_times(n: usize, start_ms: i64, total_sec: i64) -> Vec<i64> {
     let end = start_ms + total_sec * 1000;
     if n <= 1 {
         return vec![start_ms];

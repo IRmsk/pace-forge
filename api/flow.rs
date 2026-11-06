@@ -26,7 +26,8 @@ use super::obs;
 use super::points::{self, PointsContext};
 use super::policy::{self, PolicyInfo};
 use crate::track::{
-    inspect, plan, retime, simulate, Check, Checkpoint, KinParams, PlanRequest, Report, SimParams,
+    inspect, plan, retime, simulate, Check, Checkpoint, KinParams, PlanRequest, PlanResult,
+    Report, SimParams, TrackPoint,
 };
 
 /// 一次跑步的参数。
@@ -224,21 +225,67 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             name: format!("P{}", i + 1),
         })
         .collect();
-    log(&format!("[track] 规划 {}m，{} 个必经点…", p.distance_m, cps.len()));
+    // 有围栏就在围栏内铺路：早先不管围栏形状，按中心点画固定半径的圆，
+    // 围栏一大轨迹就有一半在外面，服务端判越界，整条记录作废（距离 0.00km）。
+    let fence_ring: Vec<(f64, f64)> = pick
+        .as_ref()
+        .map(|k| {
+            // 多个多边形取最大的那块，避免拼成跨越围栏的直线
+            k.selected
+                .polygons
+                .iter()
+                .max_by(|a, b| a.len().cmp(&b.len()))
+                .cloned()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
 
-    let req = PlanRequest {
-        center_lat: p.center_lat,
-        center_lng: p.center_lng,
-        checkpoints: cps.clone(),
-        total_distance_m: p.distance_m,
-        total_sec: p.duration_sec,
-        start_ms,
-        sport_type: p.sport_type,
-        sample_step_m: p.sample_step_m,
+    let track = if fence_ring.len() >= 3 {
+        log(&format!(
+            "[track] 围栏内规划 {}m，{} 个必经点…",
+            p.distance_m,
+            cps.len()
+        ));
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
+
+        let route = crate::track::fence_route::route_in_fence(&fence_ring, p.distance_m)?;
+        let must: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
+        let sampled = crate::track::fence_route::resample_with_checkpoints(
+            &route.points,
+            p.sample_step_m,
+            &must,
+            15.0,
+        );
+        // 逐点补时间戳，和围栏规划是两件事
+        let times = crate::track::assign_times(sampled.len(), start_ms, p.duration_sec);
+        let pts: Vec<TrackPoint> = sampled
+            .iter()
+            .zip(times.iter())
+            .map(|(&(lat, lng), &t)| TrackPoint { lat, lon: lng, time_ms: t })
+            .collect();
+        let actual = crate::track::geo::path_length(&sampled);
+        PlanResult {
+            points: pts,
+            checkpoints: cps.clone(),
+            actual_length_m: actual,
+        }
+    } else {
+        log(&format!("[track] 规划 {}m，{} 个必经点…", p.distance_m, cps.len()));
+        let req = PlanRequest {
+            center_lat: p.center_lat,
+            center_lng: p.center_lng,
+            checkpoints: cps.clone(),
+            total_distance_m: p.distance_m,
+            total_sec: p.duration_sec,
+            start_ms,
+            sport_type: p.sport_type,
+            sample_step_m: p.sample_step_m,
+        };
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
+        plan(&req, &mut rng)?
     };
-    use rand::SeedableRng;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
-    let track = plan(&req, &mut rng)?;
     log(&format!(
         "√ [track] {} 点，实测 {:.1}m（目标 {:.0}m，偏差 {:.2}%）",
         track.points.len(),
