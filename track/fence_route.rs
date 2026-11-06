@@ -289,11 +289,26 @@ pub fn route_in_fence_with(
 
     let (points, length_m) = best.ok_or("围栏内规划失败")?;
 
-    // 把必经点钉进折线，保证轨迹真的穿过打卡点
+    // 把必经点钉进折线，保证轨迹真的穿过打卡点。
+    //
+    // 钉点会把折线拐出去再拐回来，长度随之变长（实测 2000m 能涨到 2551m）。
+    // 所以先量一次钉点带来的增量，按缺口重新规划，再钉一次。
     let points = if must_inside.is_empty() {
         points
     } else {
-        pin_checkpoints(&points, &must_inside)
+        let probe = pin_checkpoints(&points, &must_inside);
+        let grow = path_len(&probe) - length_m;
+        if grow > want_m * 0.02 {
+            if let Ok(trimmed) =
+                route_in_fence_with(fence, (want_m - grow).max(want_m * 0.5), &[])
+            {
+                pin_checkpoints(&trimmed.points, &must_inside)
+            } else {
+                probe
+            }
+        } else {
+            probe
+        }
     };
     let length_m = path_len(&points);
 

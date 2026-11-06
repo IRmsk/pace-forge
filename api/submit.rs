@@ -534,7 +534,11 @@ mod tests {
 ///
 /// 这是整条链路唯一会产生真实记录的请求。失败要区分两类：
 /// - 网络/加密失败 → 可重试
-/// - 业务驳回（`error != 0`）→ **不能重试**，错误次数会累积
+/// - 业务驳回 → **不能重试**，错误次数会累积
+///
+/// 成功码是 **10000**，不是 0。这一点很容易踩：接口在顶层 `error` 里回
+/// `{"error":10000,"message":"成功"}`，照「err != 0 就是失败」判断就会把
+/// 一次成功的提交当成驳回，用户看到「提交被驳回 error=10000: 成功」。
 pub fn save_record(client: &Client, body: &Value) -> Result<Value, String> {
     let raw = client.request(
         "POST",
@@ -543,7 +547,8 @@ pub fn save_record(client: &Client, body: &Value) -> Result<Value, String> {
     )?;
     let v = crate::api::client::expect_ok(&raw)?;
     let err = v.get("error").and_then(|e| e.as_i64()).unwrap_or(0);
-    if err != 0 {
+    // 10000 是成功码（和 HTTP 的 200 一个道理，别拿 0 当成功）
+    if err != 0 && err != 10000 {
         let msg = v
             .get("message")
             .and_then(|m| m.as_str())
