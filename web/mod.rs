@@ -102,7 +102,8 @@ impl State {
 }
 
 fn make_client(uid: &str, token: &str, unid: &str) -> Client {
-    let mut c = Client::new(DeviceProfile::default());
+    // 每个账号独立的 device_id，避免被按设备聚合
+    let mut c = Client::new(DeviceProfile::for_account(uid));
     c.creds = crate::api::client::Credentials {
         uid: Some(uid.to_string()),
         token: Some(token.to_string()),
@@ -122,8 +123,13 @@ pub fn serve(addr: &str) -> Result<(), String> {
     for request in server.incoming_requests() {
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
-            if let Err(e) = handle(request, state) {
-                eprintln!("请求处理失败: {e}");
+            // 单个请求里的 panic 只杀这一个线程，不带走整个进程和正在跑的批次。
+            // 之前 release 配的是 panic="abort"，一处 unwrap 失败就等于全崩。
+            let guard = std::panic::AssertUnwindSafe(|| handle(request, state));
+            match std::panic::catch_unwind(guard) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("请求处理失败: {e}"),
+                Err(_) => eprintln!("请求处理 panic（已隔离，进程继续）"),
             }
         });
     }
@@ -313,7 +319,9 @@ fn handle_plan(
     {
         let st = state.lock().map_err(|e| e.to_string())?;
         if st.logged_in() {
-            let client = st.client().unwrap();
+            let Some(client) = st.client() else {
+                return json_err(request, "当前账号没有可用会话，请重新登录");
+            };
             let p = crate::api::flow::RunParams {
                 center_lat: lat,
                 center_lng: lng,
@@ -645,7 +653,8 @@ fn handle_add_account(
         return json_err(request, "手机号和密码都要填");
     }
 
-    let mut client = Client::new(DeviceProfile::default());
+    // 登录前还不知道 uid，用手机号做设备作用域；登录成功后再按 uid 重建
+    let mut client = Client::new(DeviceProfile::for_account(&username));
     match login(&mut client, &username, &password) {
         Ok(LoginOutcome::Ok(profile)) => {
             let mut st = state.lock().map_err(|e| e.to_string())?;
@@ -1004,7 +1013,9 @@ fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), Str
     if !st.logged_in() {
         return json_err(request, "请先登录");
     }
-    let client = st.client().unwrap();
+    let Some(client) = st.client() else {
+        return json_err(request, "当前账号没有可用会话，请重新登录");
+    };
 
     let mut out = serde_json::Map::new();
     // 原始响应也带上，字段名不对时能直接看
@@ -1079,7 +1090,9 @@ fn handle_fences(
     if !st.logged_in() {
         return json_err(request, "请先登录");
     }
-    let client = st.client().unwrap();
+    let Some(client) = st.client() else {
+        return json_err(request, "当前账号没有可用会话，请重新登录");
+    };
     match crate::api::fence::fetch_fences(client) {
         Ok(fs) => {
             let list: Vec<Value> = fs
@@ -1122,7 +1135,9 @@ fn handle_run(
     if !st.logged_in() {
         return json_err(request, "请先登录");
     }
-    let client = st.client().unwrap();
+    let Some(client) = st.client() else {
+        return json_err(request, "当前账号没有可用会话，请重新登录");
+    };
 
     // 中心点：没传就用围栏中心反推
     let (clat, clng) = match (lat, lng) {
@@ -1185,7 +1200,9 @@ fn handle_records(request: tiny_http::Request, state: Shared, query: &str) -> Re
     if !st.logged_in() {
         return json_err(request, "请先登录");
     }
-    let client = st.client().unwrap();
+    let Some(client) = st.client() else {
+        return json_err(request, "当前账号没有可用会话，请重新登录");
+    };
     match records::list_records(client, page, size, sport) {
         Ok(data) => json_ok(request, data),
         Err(e) => json_err(request, &e),
@@ -1201,7 +1218,9 @@ fn handle_record_detail(
     if !st.logged_in() {
         return json_err(request, "请先登录");
     }
-    let client = st.client().unwrap();
+    let Some(client) = st.client() else {
+        return json_err(request, "当前账号没有可用会话，请重新登录");
+    };
     match records::get_record(client, rrid) {
         Ok(data) => json_ok(request, data),
         Err(e) => json_err(request, &e),

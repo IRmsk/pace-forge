@@ -551,15 +551,24 @@ mod tests {
         let pts = straight_track(400, 720);
         let r = simulate(&pts, &params()).unwrap();
         let counts: Vec<f64> = r.step_buckets.iter().map(|b| b.steps_num as f64).collect();
-        // 相邻桶差值的平均绝对值，应显著小于整体波动范围
-        let diffs: Vec<f64> = counts.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-        let mean_diff = diffs.iter().sum::<f64>() / diffs.len() as f64;
-        let spread = counts.iter().cloned().fold(f64::MIN, f64::max)
-            - counts.iter().cloned().fold(f64::MAX, f64::min);
+
+        // 用 lag-1 自相关判断时间相关性——这是唯一能区分「有惯性」和「白噪声」的量。
+        // 相邻差值小并不代表有相关性：白噪声的相邻差也小（因为都围着均值转）。
+        let r1 = crate::track::kinematics::lag1_autocorr(&counts);
+        let bound = crate::track::kinematics::noise_upper_bound(counts.len());
         assert!(
-            mean_diff < spread * 0.7,
-            "相邻桶差 {mean_diff:.1} 相对波动 {spread:.1} 过大"
+            r1 > bound,
+            "分桶步数 lag-1 自相关 {r1:.3} 未超过白噪声上界 {bound:.3}"
         );
+    }
+
+    /// 步数分桶之间不该完全独立，但也不该锁死（那会导致总步数对不上）。
+    #[test]
+    fn bucket_steps_sum_to_total() {
+        let pts = straight_track(400, 720);
+        let r = simulate(&pts, &params()).unwrap();
+        let sum: i64 = r.step_buckets.iter().map(|b| b.steps_num as i64).sum();
+        assert_eq!(sum, r.total_steps as i64, "分桶步数之和必须等于总步数");
     }
 
     #[test]

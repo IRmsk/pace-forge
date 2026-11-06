@@ -31,9 +31,19 @@ pub struct DeviceProfile {
     pub user_agent: String,
 }
 
-impl Default for DeviceProfile {
-    fn default() -> Self {
+impl DeviceProfile {
+    /// 按账号隔离设备标识的构造。
+    ///
+    /// `scope` 传账号 uid（或手机号）：同一个账号永远拿到同一个 device_id，
+    /// 不同账号拿到不同的，避免被按设备聚合。
+    pub fn for_account(scope: &str) -> Self {
+        Self { device_id: persistent_device_id(scope), ..Self::base() }
+    }
+
+    /// 不隔离的默认构造（单账号 / CLI 用）。
+    fn base() -> Self {
         Self {
+            device_id: String::new(),
             app_version: "7.4.01".into(),
             physic_pixel: "1080x2400".into(),
             logic_pixel: "393x873".into(),
@@ -41,10 +51,15 @@ impl Default for DeviceProfile {
             os_type: "0".into(),
             cpu_model: "arm64-v8a".into(),
             device_name: "Android Device".into(),
-            device_id: persistent_device_id(),
             os_version: "13".into(),
             user_agent: "okhttp/4.12.0".into(),
         }
+    }
+}
+
+impl Default for DeviceProfile {
+    fn default() -> Self {
+        Self { device_id: persistent_device_id(""), ..Self::base() }
     }
 }
 
@@ -70,9 +85,19 @@ pub fn uuid_v4() -> String {
 /// 必须稳定：服务端按设备判断「是不是同一台机」。每次随机生成会让
 /// 第二次登录被判成「其他设备」，直接返回 10121（账号已在其他设备登录），
 /// 而且退出后一小时内无法再登。
-fn persistent_device_id() -> String {
+///
+/// 多账号时按 `scope` 隔离：同一台机器上的不同账号拿到不同 device_id。
+/// 物理上它们当然是同一台手机，但服务端如果按 device_id 做关联分析，
+/// 共享一个标识等于主动告诉厂商「这些号都是同一台机在刷」。
+/// 隔离后每个账号看起来来自一台独立设备。
+fn persistent_device_id(scope: &str) -> String {
     let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let path = std::path::Path::new(&dir).join(".pace-forge-device-id");
+    let name = if scope.is_empty() {
+        ".pace-forge-device-id".to_string()
+    } else {
+        format!(".pace-forge-device-id-{}", short_hash(scope))
+    };
+    let path = std::path::Path::new(&dir).join(name);
 
     if let Ok(s) = std::fs::read_to_string(&path) {
         let t = s.trim().to_string();
@@ -87,6 +112,15 @@ fn persistent_device_id() -> String {
     }
     let _ = std::fs::write(&path, &id);
     id
+}
+
+/// 8 位十六进制摘要，用来给每个账号派生一个独立的设备文件。
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let d = h.finalize();
+    format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
 }
 
 fn random_hex32() -> String {

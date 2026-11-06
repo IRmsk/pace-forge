@@ -562,9 +562,9 @@ mod point_shape_tests {
     #[test]
     fn all_loc_json_has_server_fields() {
         let pts = vec![
-            tp(31.2384, 121.4785, 1_790_000_000_000),
-            tp(31.2386, 121.4789, 1_790_000_005_000),
-            tp(31.2389, 121.4793, 1_790_000_010_000),
+            tp(31.2304, 121.4737, 1_790_000_000_000),
+            tp(31.2306, 121.4741, 1_790_000_005_000),
+            tp(31.2309, 121.4745, 1_790_000_010_000),
         ];
         let j = vec![0.0; 3];
         let params = params();
@@ -578,9 +578,9 @@ mod point_shape_tests {
         assert_eq!(p0["lat"], -1.0, "lat 是占位");
         assert_eq!(p0["lng"], -1.0, "lng 是占位");
         // 真实坐标在 gLat/gLng，且已转到 gcj02
-        assert!(p0["gLat"].as_f64().unwrap() > 47.0);
-        assert!(p0["gLng"].as_f64().unwrap() > 123.0);
-        assert_ne!(p0["gLat"].as_f64().unwrap(), 31.2384, "应该是转换后的坐标");
+        assert!(p0["gLat"].as_f64().unwrap() > 31.0);
+        assert!(p0["gLng"].as_f64().unwrap() > 121.0);
+        assert_ne!(p0["gLat"].as_f64().unwrap(), 31.2304, "应该是转换后的坐标");
         assert_eq!(p0["coorType"], "gcj02");
 
         // 关键字段齐全
@@ -609,7 +609,7 @@ mod point_shape_tests {
     fn point_types_cover_realistic_mix() {
         let n = 200;
         let pts: Vec<TrackPoint> = (0..n)
-            .map(|i| tp(31.2304 + i as f64 * 1e-5, 121.458, 1_790_000_000_000 + i as i64 * 5000))
+            .map(|i| tp(31.2304 + i as f64 * 1e-5, 121.4737, 1_790_000_000_000 + i as i64 * 5000))
             .collect();
         let j = vec![0.0; n];
         let sub = build(&params(), &pts, &[], &j).unwrap();

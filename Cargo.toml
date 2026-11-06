@@ -46,4 +46,6 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# 不用 panic = "abort"：Web 是长期驻留进程，一个请求里漏掉的 panic 不该
+# 把整个进程连同正在跑的批次一起带走。配下面的 catch_unwind 把它隔离在单个请求内。
+panic = "unwind"

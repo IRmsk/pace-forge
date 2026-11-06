@@ -278,7 +278,7 @@ mod tests {
 mod real_payload_tests {
     use super::*;
 
-    /// 7.4.01 真实响应（字段名经实测确认，账号信息已脱敏）
+    /// 7.4.01 响应结构（字段名经实测确认，账号信息已脱敏）
     #[test]
     fn parses_real_7401_payload() {
         let v: serde_json::Value = serde_json::from_str(

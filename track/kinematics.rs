@@ -252,6 +252,43 @@ fn fit_capped(w: &mut [f64], dts: &[f64], target: f64, floor: f64, caps: &[f64])
     }
 }
 
+/// lag-1 自相关系数。
+///
+/// `r1 = Σ(x[i]-μ)(x[i+1]-μ) / Σ(x[i]-μ)²`，取值 [-1, 1]。
+/// 白噪声的期望值是 0（样本小时会在 ±2/√n 内波动）；OU 过程因为有均值回归
+/// 和惯性，真实跑步数据的 lag-1 通常落在 0.3~0.8。
+///
+/// 之前这里只有「相邻差 < 波动幅度 × 系数」这种断言，白噪声也能过，
+/// 等于没测。要看序列有没有时间相关性，必须用自相关本身。
+pub fn lag1_autocorr(xs: &[f64]) -> f64 {
+    if xs.len() < 3 {
+        return 0.0;
+    }
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for i in 0..xs.len() {
+        let d = xs[i] - mean;
+        den += d * d;
+        if i + 1 < xs.len() {
+            num += d * (xs[i + 1] - mean);
+        }
+    }
+    if den <= 1e-12 {
+        return 0.0;
+    }
+    (num / den).clamp(-1.0, 1.0)
+}
+
+/// 白噪声的 lag-1 自相关置信上界（95%），约 2/√n。
+pub fn noise_upper_bound(n: usize) -> f64 {
+    if n < 4 {
+        return 1.0;
+    }
+    2.0 / (n as f64).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,13 +376,33 @@ mod tests {
             .collect();
         let dts = vec![1.5; 299];
         let w = pace_profile(&pts, 3.0, &dts, 1200.0, 7, &KinParams::default(), 1.0, 6.0);
-        let diffs: Vec<f64> = w.windows(2).map(|x| (x[1] - x[0]).abs()).collect();
-        let mean_diff = diffs.iter().sum::<f64>() / diffs.len() as f64;
-        let spread = w.iter().cloned().fold(f64::MIN, f64::max)
-            - w.iter().cloned().fold(f64::MAX, f64::min);
+
+        // 真·lag-1 自相关：必须显著高于白噪声上界
+        let r1 = lag1_autocorr(&w);
+        let bound = noise_upper_bound(w.len());
         assert!(
-            mean_diff < spread * 0.4,
-            "相邻速度差 {mean_diff:.4} 相对波动 {spread:.4} 过大，不像 OU 过程"
+            r1 > bound,
+            "速度序列 lag-1 自相关 {r1:.3} 没超过白噪声上界 {bound:.3}，说明不是 OU 过程"
+        );
+        // 也不该接近 1（那是一条直线，没有波动）
+        assert!(r1 < 0.98, "自相关 {r1:.3} 太高，序列几乎是常量");
+    }
+
+    /// 反向验证：白噪声的自相关必须被判为「无相关」。
+    ///
+    /// 这条测试保证 `lag1_autocorr` 本身有效——如果它把白噪声也判成有相关，
+    /// 上面那条测试就没有意义了。
+    #[test]
+    fn white_noise_is_not_autocorrelated() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(42);
+        let noise: Vec<f64> = (0..500).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let r1 = lag1_autocorr(&noise);
+        let bound = noise_upper_bound(noise.len());
+        assert!(
+            r1.abs() < bound,
+            "白噪声自相关 {r1:.3} 超出上界 {bound:.3}，说明函数把噪声当成了信号"
         );
     }
 
