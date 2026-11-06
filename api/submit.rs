@@ -67,14 +67,103 @@ pub struct Submission {
     pub canonical: String,
 }
 
-fn point_json(p: &TrackPoint, speed: f64) -> Value {
+/// 单个轨迹点在 `allLocJson` 里的完整结构。
+///
+/// 字段名与语义对齐服务端：`lat`/`lng` 是**占位**（固定 -1.0），真实坐标走
+/// `gLat`/`gLng` 且必须是 gcj02；`speed` 单位 km/h，`avgSpeed` 单位 m/s。
+#[allow(clippy::too_many_arguments)]
+fn point_json_full(
+    p: &TrackPoint,
+    idx: usize,
+    n: usize,
+    start_ms: i64,
+    start_pt: (f64, f64),
+    prev: &mut (f64, f64),
+    cum: &mut (f64, i64, i64),
+    prev_time: &mut i64,
+    seed: u64,
+) -> Value {
+    // BD-09 → GCJ-02（原点是 BD-09，服务端要 gcj02）
+    let (glat, glng) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
+
+    // 累计量
+    let step_m = if idx == 0 {
+        0.0
+    } else {
+        crate::track::geo::distance(*prev, (p.lat, p.lon))
+    };
+    cum.0 += step_m;
+    cum.1 = (p.time_ms - start_ms) / 1000;
+    *prev = (p.lat, p.lon);
+
+    // 瞬时速度用真实采样间隔，不是固定 5 秒
+    let gap_sec = if idx == 0 {
+        0.0
+    } else {
+        ((p.time_ms - *prev_time) as f64 / 1000.0).max(0.1)
+    };
+    *prev_time = p.time_ms;
+
+    let dt = if idx == 0 { 0.0 } else { (p.time_ms - start_ms) as f64 / 1000.0 };
+    let avg_speed = if dt > 0.5 { (cum.0 / dt).clamp(0.0, 6.3) } else { 0.0 };
+    // 夹到跑步的物理区间（1.9~6.3 m/s），和规则里的 SPEED_FLOOR/CEIL 一致
+    let inst = if idx == 0 {
+        // 起点给个常见起步速度，不能是 0
+        2.6
+    } else {
+        (step_m / gap_sec).clamp(1.9, 6.3) * 3.6
+    };
+
+    // 点位类型：起点 0，途中以 0/3 为主，偶发 1/2
+    let ptype = if idx == 0 {
+        0
+    } else if idx + 1 == n {
+        6
+    } else {
+        // 用坐标做确定性伪随机，同一轨迹重放结果一致
+        let h = (p.lat.to_bits() ^ p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
+        match (h >> 33) % 100 {
+            0..=38 => 3,
+            39..=92 => 0,
+            93..=95 => 1,
+            96..=97 => 2,
+            _ => 8,
+        }
+    };
+
+    // GPS 精度半径
+    let h2 = (p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
+    let radius = 1.5 + ((h2 >> 40) % 150) as f64 / 100.0;
+
     json!({
-        "lat": p.lat,
-        "lon": p.lon,
-        "time": p.time_ms,
-        "speed": speed,
-        "accuracy": 3.0,
-        "isValid": true,
+        "avgSpeed": (avg_speed * 10000.0).round() / 10000.0,
+        "bdA": 0.0,
+        "bdD": 0.0,
+        "bdG": 0.0,
+        "bdS": 0.0,
+        "coorType": "gcj02",
+        "count": 0,
+        "dtr": 0.0,
+        "flag": start_ms,
+        "gLat": (glat * 1e7).round() / 1e7,
+        "gLng": (glng * 1e7).round() / 1e7,
+        "gainTime": 0,
+        "id": idx as i64 + 1,
+        "lat": -1.0,
+        "lng": -1.0,
+        "locType": 1,
+        "locationId": "",
+        "queueNum": idx as i32,
+        "radius": (radius * 100.0).round() / 100.0,
+        "speed": (inst * 10000.0).round() / 10000.0,
+        "state": if idx == 0 { 1 } else { 0 },
+        "steps": 0,
+        "stepDistance": 0.0,
+        "totalDis": (cum.0 * 10000.0).round() / 10000.0,
+        "totalTime": cum.1,
+        "type": ptype,
+        "validDis": (cum.0 * 10000.0).round() / 10000.0,
+        "validTime": cum.1,
     })
 }
 
@@ -123,7 +212,22 @@ pub fn build(
         jitter,
     );
 
-    let loc_items: Vec<Value> = points.iter().map(|p| point_json(p, 0.0)).collect();
+    // 逐点生成，累计量必须顺序推进
+    let mut prev = points.first().map(|p| (p.lat, p.lon)).unwrap_or((0.0, 0.0));
+    let start_pt = prev;
+    let mut cum = (0.0f64, 0i64, 0i64);
+    let seed = params.start_time_ms as u64 ^ 0x9E3779B97F4A7C15;
+    let mut prev_time = points.first().map(|p| p.time_ms).unwrap_or(params.start_time_ms);
+    let loc_items: Vec<Value> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            point_json_full(
+                p, i, points.len(), params.start_time_ms, start_pt,
+                &mut prev, &mut cum, &mut prev_time, seed,
+            )
+        })
+        .collect();
     let all_loc_json = serde_json::to_string(&loc_items).map_err(|e| e.to_string())?;
 
     let fp_items: Vec<Value> = fixed
@@ -425,4 +529,100 @@ pub fn extract_record_id(data: &Value) -> Option<i64> {
                 .and_then(|x| x.as_str())
                 .and_then(|s| s.parse().ok())
         })
+}
+
+#[cfg(test)]
+mod point_shape_tests {
+    use super::*;
+
+    fn params() -> SubmitParams {
+        SubmitParams {
+            uid: "123456".into(),
+            unid: "88".into(),
+            uuid: "00000000-0000-4000-8000-000000000001".into(),
+            sport_type: 1,
+            total_distance_m: 2000,
+            total_time_sec: 720,
+            total_steps: 2300,
+            start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_720_000,
+            sel_distance_m: 1800,
+            sel_run_time_sec: 600,
+            policy: "policy_str".into(),
+            run_area_id: 7,
+            geo_fences_json: "[]".into(),
+            total_ascent: 0,
+        }
+    }
+
+    fn tp(lat: f64, lon: f64, t: i64) -> TrackPoint {
+        TrackPoint { lat, lon, time_ms: t }
+    }
+
+    #[test]
+    fn all_loc_json_has_server_fields() {
+        let pts = vec![
+            tp(31.2384, 121.4785, 1_790_000_000_000),
+            tp(31.2386, 121.4789, 1_790_000_005_000),
+            tp(31.2389, 121.4793, 1_790_000_010_000),
+        ];
+        let j = vec![0.0; 3];
+        let params = params();
+        let sub = build(&params, &pts, &[], &j).unwrap();
+        let s = sub.save_record["allLocJson"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        assert_eq!(arr.len(), 3);
+
+        let p0 = &arr[0];
+        // 占位坐标必须是 -1
+        assert_eq!(p0["lat"], -1.0, "lat 是占位");
+        assert_eq!(p0["lng"], -1.0, "lng 是占位");
+        // 真实坐标在 gLat/gLng，且已转到 gcj02
+        assert!(p0["gLat"].as_f64().unwrap() > 47.0);
+        assert!(p0["gLng"].as_f64().unwrap() > 123.0);
+        assert_ne!(p0["gLat"].as_f64().unwrap(), 31.2384, "应该是转换后的坐标");
+        assert_eq!(p0["coorType"], "gcj02");
+
+        // 关键字段齐全
+        for k in [
+            "avgSpeed", "flag", "id", "locType", "queueNum", "radius", "speed",
+            "state", "steps", "totalDis", "totalTime", "type", "validDis", "validTime",
+        ] {
+            assert!(p0.get(k).is_some(), "缺字段 {k}");
+        }
+
+        // 起点与终点的 type
+        assert_eq!(arr[0]["type"], 0, "起点 type=0");
+        assert_eq!(arr[2]["type"], 6, "终点 type=6");
+
+        // 累计量递增
+        let d0 = arr[0]["totalDis"].as_f64().unwrap();
+        let d2 = arr[2]["totalDis"].as_f64().unwrap();
+        assert!(d2 > d0, "累计里程要递增");
+
+        // speed 是 km/h（步行 5km/h 量级，不是 1.4）
+        let sp = arr[2]["speed"].as_f64().unwrap();
+        assert!(sp > 1.0 && sp < 30.0, "speed 应在 km/h 量级，实际 {sp}");
+    }
+
+    #[test]
+    fn point_types_cover_realistic_mix() {
+        let n = 200;
+        let pts: Vec<TrackPoint> = (0..n)
+            .map(|i| tp(31.2304 + i as f64 * 1e-5, 121.458, 1_790_000_000_000 + i as i64 * 5000))
+            .collect();
+        let j = vec![0.0; n];
+        let sub = build(&params(), &pts, &[], &j).unwrap();
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+
+        let mut types = std::collections::HashSet::new();
+        for p in &arr {
+            types.insert(p["type"].as_i64().unwrap());
+        }
+        // 不该只有一种类型
+        assert!(types.len() >= 2, "点位类型要有变化，实际 {types:?}");
+        // 不该出现异常点 -1（那是 GPS 失效，故意不生成）
+        assert!(!types.contains(&-1), "不生成异常点");
+    }
 }

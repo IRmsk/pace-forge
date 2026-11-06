@@ -1,5 +1,6 @@
 //! 业务接口层。
 
+pub mod accounts;
 pub mod client;
 pub mod coord;
 pub mod fence;

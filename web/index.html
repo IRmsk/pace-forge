@@ -114,6 +114,8 @@
 .kv b { color: #e6edf3; font-weight: 600; }
 .kv b.mono { font-family: ui-monospace, monospace; font-size: 11px; }
 .planout .note { grid-column: 1/-1; margin-top: 8px; font-size: 12px; color: #6b7c91; }
+button.mini{padding:3px 8px;font-size:11px;line-height:1.6}
+button.mini:disabled{opacity:.35}
 button.danger{background:#dc2626;border-color:#dc2626;color:#fff}
 button.danger:hover{background:#b91c1c}
 button.danger:disabled{opacity:.5}
@@ -133,9 +135,11 @@ button.danger:disabled{opacity:.5}
     <label>密码</label>
     <input id="p" type="password" autocomplete="current-password" placeholder="请输入密码">
   </div>
-  <button id="btn">登 录</button>
+  <button id="btn">登录并保存</button>
   <div class="msg" id="msg"></div>
 </div>
+
+<div id="picker" style="display:none"></div>
 
 <!-- 主界面 -->
 <div id="app" class="wrap">
@@ -148,6 +152,19 @@ button.danger:disabled{opacity:.5}
     <button class="ghost" id="semBtn">查学期</button>
     <button class="ghost" id="reload">刷新记录</button>
     <button class="ghost" id="logout">退出</button>
+  </div>
+
+  <div class="panel" id="accPanel">
+    <h2>账号 <span id="accCount" class="hint" style="font-weight:400"></span></h2>
+    <div id="accList"><div class="hint">加载中…</div></div>
+    <div class="runform" style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d">
+      <input id="accUser" type="tel" placeholder="手机号" style="flex:1;min-width:120px">
+      <input id="accPass" type="password" placeholder="密码" style="flex:1;min-width:120px">
+      <button id="accAdd">添加</button>
+      <button class="ghost" id="accLoginAll">全部登录</button>
+      <button class="ghost" id="accBatch">批量刷</button>
+    </div>
+    <div id="accMsg" class="msg"></div>
   </div>
 
   <div class="panel" id="semPanel">
@@ -445,6 +462,164 @@ function drawPreview(coords, fence, checkpoints) {
   } catch (e) {}
 }
 
+
+/* ---------- 账号管理 ---------- */
+
+async function loadAccounts() {
+  try {
+    const r = await api('/api/accounts');
+    renderAccounts(r);
+    return r;
+  } catch (e) {
+    $('accList').innerHTML = `<div class="msg err">${e.message}</div>`;
+  }
+}
+
+function renderAccounts(r) {
+  $('accCount').textContent = `${r.count} 个 · ${r.ready} 个就绪`;
+  const list = $('accList');
+  if (!r.accounts || !r.accounts.length) {
+    list.innerHTML = '<div class="hint">还没有账号，下面添加一个</div>';
+    return;
+  }
+  list.innerHTML = r.accounts.map(a => {
+    const dot = a.loggedIn ? '#22c55e' : (a.enabled ? '#f59e0b' : '#6b7280');
+    const state = a.loggedIn ? '已登录'
+      : (a.hasPassword ? (a.enabled ? '待登录' : '已停用') : '无密码');
+    return `<div class="accrow" data-id="${a.id}" style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #161b22${a.current ? ';background:#161b22;border-radius:6px;padding-left:8px' : ''}">
+      <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex:none"></span>
+      <div style="flex:1;min-width:0">
+        <b style="font-size:13px">${a.label}${a.current ? ' <span style="color:#22d3a6;font-size:11px">当前</span>' : ''}</b>
+        <div class="hint" style="font-size:11px">${a.username} · ${a.school || '—'} · ${state}</div>
+      </div>
+      <button class="ghost mini" data-act="switch"  data-id="${a.id}" ${a.current ? 'disabled' : ''}>切换</button>
+      <button class="ghost mini" data-act="login"   data-id="${a.id}" ${a.hasPassword ? '' : 'disabled'}>重登</button>
+      <button class="ghost mini" data-act="toggle"  data-id="${a.id}">${a.enabled ? '停用' : '启用'}</button>
+      <button class="ghost mini" data-act="del"     data-id="${a.id}" style="color:#ef4444">删除</button>
+    </div>`;
+  }).join('');
+
+  list.querySelectorAll('button[data-act]').forEach(b => {
+    b.onclick = () => accountAction(b.dataset.act, b.dataset.id);
+  });
+}
+
+async function accountAction(act, id) {
+  const m = $('accMsg');
+  try {
+    if (act === 'del') {
+      if (!confirm('删除这个账号？存盘的密码也会一起删掉。')) return;
+      await api('/api/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
+      m.textContent = '已删除';
+    } else if (act === 'switch') {
+      await api('/api/accounts/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
+      m.textContent = '已切换';
+      await boot();
+    } else if (act === 'login') {
+      m.textContent = '登录中…';
+      const r = await api('/api/accounts/' + encodeURIComponent(id) + '/login', { method: 'POST' });
+      m.textContent = '登录成功：' + (r.name || r.uid);
+    } else if (act === 'toggle') {
+      await api('/api/accounts/' + encodeURIComponent(id) + '/toggle', { method: 'POST' });
+      m.textContent = '';
+    }
+    m.className = 'msg';
+    await loadAccounts();
+  } catch (e) {
+    m.textContent = e.message;
+    m.className = 'msg err';
+  }
+}
+
+$('accAdd').onclick = async () => {
+  const u = $('accUser').value.trim();
+  const p = $('accPass').value;
+  const m = $('accMsg');
+  if (!u || !p) { m.textContent = '手机号和密码都要填'; m.className = 'msg err'; return; }
+  const btn = $('accAdd');
+  btn.disabled = true;
+  m.textContent = '登录中（极验本地求解，可能要几秒）…';
+  m.className = 'msg';
+  try {
+    const r = await api('/api/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    });
+    m.textContent = `已添加：${r.name || r.uid}`;
+    $('accUser').value = '';
+    $('accPass').value = '';
+    await loadAccounts();
+    await boot();
+  } catch (e) {
+    m.textContent = e.message;
+    m.className = 'msg err';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$('accLoginAll').onclick = async () => {
+  const m = $('accMsg');
+  const btn = $('accLoginAll');
+  btn.disabled = true;
+  m.textContent = '批量登录中…';
+  m.className = 'msg';
+  try {
+    const r = await api('/api/accounts/login-all', { method: 'POST' });
+    m.textContent = `完成：${r.ok}/${r.total} 个成功`;
+    const bad = (r.results || []).filter(x => !x.ok);
+    if (bad.length) {
+      m.textContent += ' · 失败：' + bad.map(x => x.error).slice(0, 3).join('；');
+      m.className = 'msg warn';
+    }
+    await loadAccounts();
+  } catch (e) {
+    m.textContent = e.message;
+    m.className = 'msg err';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$('accBatch').onclick = async () => {
+  const dist = parseFloat($('rDist').value);
+  const dur = parseFloat($('rDur').value);
+  const mode = parseInt($('rRunMode').value, 10) || 1;
+  const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
+  if (!(dist > 0) || !(dur > 0)) { $('accMsg').textContent = '先在上面的表单填好距离和时长'; return; }
+  if (!confirm(`所有已登录账号都跑 ${dist} km / ${dur} 分钟（${modeName}）？\n\n账号之间间隔 8 秒，避免同 IP 高频。`)) return;
+
+  const m = $('accMsg');
+  const btn = $('accBatch');
+  btn.disabled = true;
+  m.textContent = '批量提交中，别关页面…';
+  m.className = 'msg';
+  try {
+    const r = await api('/api/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        distance: dist, duration: dur, runMode: mode,
+        sportType: 1, gapMs: 8000
+      })
+    });
+    const lines = (r.results || []).map(x => {
+      if (x.ok && x.submitted) return `✓ ${x.id} → 记录 #${x.recordId}`;
+      if (x.ok) return `· ${x.id} 未提交`;
+      return `✗ ${x.id} → ${x.error}`;
+    });
+    m.innerHTML = `<b>完成：${r.submitted}/${r.total} 个已提交</b><pre class="mono" style="font-size:11px;white-space:pre-wrap;max-height:240px;overflow:auto;margin-top:6px">${lines.join('\n')}</pre>`;
+    m.className = r.submitted === r.total ? 'msg ok' : 'msg warn';
+    await loadAccounts();
+  } catch (e) {
+    m.textContent = e.message;
+    m.className = 'msg err';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 /* ---------- 地图 ---------- */
 let map, layer, marker, previewLayer;
 function initMap() {
@@ -654,13 +829,69 @@ function pace(km, sec) {
   return `${m}′${String(s).padStart(2, '0')}″/km`;
 }
 
-/* ---------- 启动：已登录则直接进入 ---------- */
-(async () => {
+/* ---------- 启动 ---------- */
+async function boot() {
   try {
     const me = await api('/api/me');
     enter(me);
-  } catch (_) { /* 未登录，停在登录页 */ }
-})();
+    await loadAccounts();
+  } catch (_) {
+    // 未登录：如果库里有存过密码的账号，直接给个选择界面
+    try {
+      const r = await api('/api/accounts');
+      const usable = (r.accounts || []).filter(a => a.hasPassword);
+      if (usable.length) {
+        showPicker(usable, r);
+        return;
+      }
+    } catch (_) {}
+    // 什么都没有，停在登录页
+  }
+}
+
+function showPicker(list, r) {
+  $('login').style.display = 'none';
+  const box = $('picker');
+  box.style.display = 'flex';
+  box.innerHTML = `
+    <div style="margin:auto;max-width:420px;width:100%;padding:32px 22px;background:#0d1117;border:1px solid #21262d;border-radius:14px">
+      <h1 style="margin:0 0 4px;font-size:22px">选择账号</h1>
+      <p class="hint" style="margin:0 0 18px">库里存了 ${list.length} 个账号，点一下直接登录</p>
+      ${list.map(a => `
+        <button class="ghost" data-id="${a.id}"
+          style="width:100%;text-align:left;margin-bottom:8px;padding:12px 14px">
+          <b>${a.label}</b>
+          <div class="hint" style="font-size:11px">${a.username} · ${a.school || '—'}</div>
+        </button>`).join('')}
+      <button class="ghost" id="pickOther" style="width:100%;margin-top:6px">用其他账号登录</button>
+      <div class="msg" id="pickMsg"></div>
+    </div>`;
+
+  box.querySelectorAll('button[data-id]').forEach(b => {
+    b.onclick = async () => {
+      const m = $('pickMsg');
+      m.textContent = '登录中…';
+      m.className = 'msg';
+      try {
+        const res = await api('/api/accounts/' + encodeURIComponent(b.dataset.id) + '/login', { method: 'POST' });
+        box.style.display = 'none';
+        $('picker').innerHTML = '';
+        enter({ name: res.name, uid: res.uid });
+        await loadAccounts();
+      } catch (e) {
+        m.textContent = e.message;
+        m.className = 'msg err';
+      }
+    };
+  });
+  $('pickOther').onclick = () => {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    $('login').style.display = 'flex';
+  };
+}
+
+boot();
 </script>
 </body>
 </html>

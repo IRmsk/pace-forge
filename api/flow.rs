@@ -100,7 +100,13 @@ pub struct RunOutcome {
 ///
 /// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
 pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, String> {
-    let start_ms = crate::crypto::envelope::now_ms() as i64;
+    // 起点加 0~4 秒随机偏移：每次都整秒开始太规律
+    let jitter_ms = {
+        use rand::Rng;
+        let mut r = rand::thread_rng();
+        r.gen_range(0..5_000i64)
+    };
+    let start_ms = crate::crypto::envelope::now_ms() as i64 + jitter_ms;
 
     // ⓿ 学期进度：记分跑要先知道还差多少
     if p.run_mode == 1 {
@@ -347,7 +353,8 @@ pub fn run_full(
 
     // ❼.5 反检测体检：按 7.4.01 的本地规则先过一遍
     {
-        let xy: Vec<(f64, f64)> = out.points.coords.clone();
+        // 必须是轨迹点（400 个），不是打卡点（5 个）
+        let xy: Vec<(f64, f64)> = out.track.iter().map(|t| (t.lat, t.lon)).collect();
         let rep = crate::track::detect::inspect(
             &xy,
             &out.sim.speed_buckets,
@@ -419,7 +426,9 @@ pub fn run_full(
     };
 
     let bucket_count = (p.duration_sec / 10).max(1) as usize;
-    let jitter = crate::track::buckets::make_jitter(bucket_count, 1.0, p.seed);
+    // 用实际种子，否则每次抖动完全一样
+    let real_seed = if p.seed != 0 { p.seed } else { start_ms as u64 };
+    let jitter = crate::track::buckets::make_jitter(bucket_count, 1.0, real_seed);
     let submission = super::submit::build(&params, &out.track, &fixed, &jitter)?;
 
     // 7.4.01 已移除 BODY_SENSORS，报文里不许出现心率字段

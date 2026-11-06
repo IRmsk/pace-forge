@@ -106,6 +106,7 @@ pub struct Credentials {
 }
 
 /// 协议客户端。
+#[derive(Clone)]
 pub struct Client {
     pub device: DeviceProfile,
     pub creds: Credentials,
