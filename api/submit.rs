@@ -270,7 +270,8 @@ pub fn build(
         ("errorCode".into(), Some("0".into())),
         ("faceCheck".into(), Some("0".into())),
         ("geeToken".into(), Some(String::new())),
-        ("getPrize".into(), Some("False".into())),
+        // Android 的 String.valueOf(false) 是小写；写成 "False" 签名必然不过（10501）
+        ("getPrize".into(), Some("false".into())),
         // 签名侧固定字符串 "null"，body 侧才是 JSON null
         ("goalId".into(), Some("null".into())),
         ("policy".into(), Some(params.policy.clone())),
@@ -326,7 +327,7 @@ pub fn build(
         "selRunTime": params.sel_run_time_sec,
         "selectedUnid": params.unid,
         "more": false,
-        "originalSign": crate::crypto::sign::canonical_string(&sign_fields),
+        "originalSign": crate::crypto::sign::original_sign(&sign_fields),
         "signature": signature,
         "speed": speed_val,
         "speedPerTenSec": speed_arr,
@@ -435,6 +436,24 @@ mod tests {
         assert!(v["stepsPerTenSec"].is_array(), "stepsPerTenSec 应为数组");
         assert!(v["speedPerTenSec"].as_array().unwrap().len() > 0);
         assert!(v["stepsPerTenSec"].as_array().unwrap().len() > 0);
+    }
+
+    /// 签名里的 bool 必须是小写。
+    ///
+    /// Android 的 `String.valueOf(false)` 是 `"false"`，而 Rust 的
+    /// `false.to_string()` 是 `"false"`、手写 `"False"` 就成了大写。
+    /// 差一个字母，服务端直接回 10501 验证签名失败。
+    #[test]
+    fn sign_bool_is_lowercase() {
+        let j = vec![0.0; 72];
+        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let orig = sub.save_record["originalSign"].as_str().unwrap();
+        assert!(
+            !orig.contains("=True") && !orig.contains("=False"),
+            "originalSign 里出现大写 bool: {orig}"
+        );
+        assert!(orig.contains("getPrize=false"), "getPrize 应为小写: {orig}");
+        assert!(orig.contains("complete="), "complete 应参与签名");
     }
 
     #[test]

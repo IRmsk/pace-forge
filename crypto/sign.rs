@@ -78,6 +78,29 @@ pub fn token_sign(fields: &SignFields) -> String {
 }
 
 /// 提交报文签名（`signature`）。
+/// `originalSign`：Android 侧按**原始字符串**（大小写敏感）排序后拼接。
+///
+/// 和 `canonical_string` 的区别就在排序基准：那边是 `to_lowercase()` 再比，
+/// 这边直接 `a.cmp(b)`。大小写不一致会拼出不同的串。
+pub fn original_sign(fields: &SignFields) -> String {
+    let mut items: Vec<(String, String)> = fields
+        .iter()
+        .filter_map(|(k, v)| {
+            let v = v.as_ref()?;
+            if k.eq_ignore_ascii_case("signature") {
+                return None;
+            }
+            Some((k.clone(), v.clone()))
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 pub fn sport_signature(fields: &SignFields) -> String {
     sign_with_salt(fields, SIGN_SALT)
 }

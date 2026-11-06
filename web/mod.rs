@@ -283,7 +283,13 @@ fn handle_plan(
 ) -> Result<(), String> {
     let distance_km = body["distance"].as_f64().unwrap_or(2.0);
     let duration_min = body["duration"].as_f64().unwrap_or(12.0);
-    let steps = body["steps"].as_i64().unwrap_or((distance_km * 1150.0) as i64) as i32;
+    // 0 或缺失都表示「没指定」，交给模型按配速推算。
+    // 手填步数很容易和配速对不上——12 分钟 2300 步 = 192 步/分，
+    // 而 2.78 m/s 的典型步频只有 158，差 34 步会被自检判 GAIT_MISMATCH。
+    let steps = body["steps"]
+        .as_i64()
+        .filter(|v| *v > 0)
+        .map(|v| v as i32);
     let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
     let mut lat = body["lat"].as_f64().unwrap_or(0.0);
     let mut lng = body["lng"].as_f64().unwrap_or(0.0);
@@ -498,7 +504,7 @@ fn handle_plan(
         total_distance_m: real_len as f64,
         total_sec,
         start_ms,
-        target_steps: body["steps"].as_i64().map(|v| v as i32),
+        target_steps: steps,
         seed: start_ms as u64,
         ..Default::default()
     };
