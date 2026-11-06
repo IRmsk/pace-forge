@@ -114,6 +114,9 @@
 .kv b { color: #e6edf3; font-weight: 600; }
 .kv b.mono { font-family: ui-monospace, monospace; font-size: 11px; }
 .planout .note { grid-column: 1/-1; margin-top: 8px; font-size: 12px; color: #6b7c91; }
+button.danger{background:#dc2626;border-color:#dc2626;color:#fff}
+button.danger:hover{background:#b91c1c}
+button.danger:disabled{opacity:.5}
 </style>
 </head>
 <body>
@@ -142,14 +145,25 @@
       <b id="uname">—</b>
       <div id="uinfo">—</div>
     </div>
+    <button class="ghost" id="semBtn">查学期</button>
     <button class="ghost" id="reload">刷新记录</button>
     <button class="ghost" id="logout">退出</button>
   </div>
 
+  <div class="panel" id="semPanel">
+    <h2>记分跑 · 学期进度</h2>
+    <div id="semOut" class="planout"><div class="hint">点右上「查学期」加载</div></div>
+  </div>
+
   <div class="panel" id="runPanel">
-    <h2>刷跑（本地预演）</h2>
+    <h2>刷跑</h2>
     <div class="runform">
-      <label>模式<select id="rMode">
+      <label>跑法<select id="rRunMode">
+        <option value="1">记分跑（校园跑）</option>
+        <option value="2">户外跑</option>
+        <option value="3">室外锻炼</option>
+      </select></label>
+      <label>路线<select id="rMode">
         <option value="free">自由路线</option>
         <option value="stadium">操场绕圈</option>
       </select></label>
@@ -161,6 +175,7 @@
       <label>时长 分<input id="rDur" type="number" value="12" step="1" min="3" max="180"></label>
       <label>步数<input id="rSteps" type="number" value="2300" step="10" min="100" placeholder="留空则由模型推算"></label>
       <button id="planBtn">生成轨迹</button>
+      <button id="runBtn" class="danger">真的跑（提交）</button>
     </div>
     <div id="planOut" class="planout"></div>
   </div>
@@ -259,7 +274,8 @@ $('planBtn').onclick = async () => {
       body: JSON.stringify({
         distance: dist, duration: dur,
         steps: (Number.isFinite(steps) && steps > 0) ? steps : 0,
-        mode: $('rMode').value, lane: parseInt($('rLane').value, 10) || 1
+        mode: $('rMode').value, lane: parseInt($('rLane').value, 10) || 1,
+        runMode: parseInt($('rRunMode').value, 10) || 1
       })
     });
     setOut('');
@@ -273,37 +289,160 @@ $('planBtn').onclick = async () => {
           return `<div class="msg ${cls}" style="margin-top:4px">${t}</div>`;
         }).join('')
       : '<div class="msg" style="margin-top:6px">自检全部通过</div>';
+    const policyHtml = r.policy
+      ? `<div class="kv"><span>规则最小里程</span><b>${r.policy.minDistance} m</b></div>
+         <div class="kv"><span>规则有效时长</span><b>${r.policy.validTime} s</b></div>`
+      : '';
+    const fenceHtml = r.fence
+      ? `<div class="kv"><span>围栏</span><b class="${r.fence.fallback ? 'warn' : 'ok'}">${r.fence.name}${r.fence.fallback ? `（兜底 ${Math.round(r.fence.distance)}m）` : ''}</b></div>`
+      : '<div class="kv"><span>围栏</span><b class="warn">未取到</b></div>';
+    const cpHtml = r.checkpointTotal != null
+      ? `<div class="kv"><span>打卡点</span><b class="${r.checkpointPassed === r.checkpointTotal ? 'ok' : 'err'}">${r.checkpointPassed || 0} / ${r.checkpointTotal} 经过</b></div>`
+      : '';
     $('planOut').innerHTML = `
-      <div class="kv"><span>模式</span><b>${modeTxt}</b></div>
+      <div class="kv"><span>模式</span><b>${r.online ? '已连服务端' : '本地合成'} · ${modeTxt}</b></div>
+      ${fenceHtml}
+      ${cpHtml}
+      ${policyHtml}
       <div class="kv"><span>实际里程</span><b>${r.actualLength} m</b></div>
       <div class="kv"><span>轨迹点数</span><b>${r.pointCount}</b></div>
       <div class="kv"><span>时间桶</span><b>${r.bucketCount}</b></div>
-      <div class="kv"><span>配速 speed</span><b>${r.predictedSpeed}</b></div>
-      <div class="kv"><span>平均步频</span><b>${r.avgCadence ?? r.avgStepFreq} 步/分</b></div>
+      <div class="kv"><span>平均步频</span><b>${(r.avgCadence ?? 0).toFixed(1)} 步/分</b></div>
       <div class="kv"><span>步数自相关</span><b>${acTxt}</b></div>
-      <div class="kv"><span>消耗</span><b>${r.predictedCalorie} kcal</b></div>
-      <div class="kv"><span>完成目标</span><b>${r.complete ? '是' : '否'}</b></div>
-      <div class="kv"><span>报文大小</span><b>${(r.payloadBytes/1024).toFixed(1)} KB</b></div>
-      <div class="kv"><span>签名</span><b class="mono">${r.signature.slice(0,16)}…</b></div>
       <div class="kv"><span>自检</span><b class="${r.blocked ? 'err' : 'ok'}">${r.issueSummary}</b></div>
       ${issueHtml}
+      ${r.logs && r.logs.length ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#8b949e">流程日志（${r.logs.length} 条）</summary><pre class="mono" style="font-size:11px;max-height:200px;overflow:auto;white-space:pre-wrap">${r.logs.join('\n')}</pre></details>` : ''}
       <div class="note">${r.note}</div>`;
-    drawPreview(r.coords);
+    drawPreview(r.coords, r.fence, r.checkpoints);
   } catch (e) {
     setOut(e.message, true);
   } finally {
     btn.disabled = false;
   }
 };
+/* ---------- 记分跑：学期进度 ---------- */
+$('semBtn').onclick = async () => {
+  const btn = $('semBtn');
+  btn.disabled = true;
+  $('semOut').innerHTML = '<div class="hint"><span class="spin"></span> 查询中…</div>';
+  try {
+    const r = await api('/api/semester');
+    if (r.summaryError) {
+      $('semOut').innerHTML = `<div class="msg err">${r.summaryError}</div>`;
+      return;
+    }
+    const sm = r.summary || {};
+    const g = r.goal || {};
+    const done = sm.semesterValidDis || 0;
+    const target = g.targetDis || 0;
+    const pct = target > 0 ? Math.min(100, done / target * 100) : 0;
+    $('semOut').innerHTML = `
+      <div class="kv"><span>学期</span><b>${sm.sname || '—'}</b></div>
+      <div class="kv"><span>有效里程</span><b>${(done/1000).toFixed(2)} km</b></div>
+      <div class="kv"><span>累计里程</span><b>${((sm.semesterDis||0)/1000).toFixed(2)} km</b></div>
+      <div class="kv"><span>有效次数</span><b>${sm.semesterValidCount || 0} 次</b></div>
+      <div class="kv"><span>累计次数</span><b>${sm.semesterCount || 0} 次</b></div>
+      <div class="kv"><span>有效率</span><b class="${(sm.validRatio||0) < 0.9 ? 'warn' : 'ok'}">${((sm.validRatio||0)*100).toFixed(1)}%</b></div>
+      ${target > 0 ? `
+        <div class="kv"><span>目标</span><b>${(target/1000).toFixed(1)} km / ${g.targetCount || 0} 次</b></div>
+        <div class="kv"><span>还差</span><b class="${pct >= 100 ? 'ok' : 'warn'}">${Math.max(0, (target-done)/1000).toFixed(2)} km</b></div>
+        <div class="kv"><span>学期剩余</span><b class="${g.daysLeft < 7 ? 'err' : ''}">${g.daysLeft >= 0 ? g.daysLeft + ' 天' : '已结束'}</b></div>
+        <div style="margin-top:10px;height:8px;background:#21262d;border-radius:4px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;background:${pct>=100?'#22c55e':'#22d3a6'}"></div>
+        </div>
+        <div class="hint" style="margin-top:6px">完成 ${pct.toFixed(1)}%</div>
+      ` : '<div class="hint" style="margin-top:8px">未取到学期目标</div>'}
+      ${r.goalError ? `<div class="msg warn" style="margin-top:6px">${r.goalError}</div>` : ''}`;
+  } catch (e) {
+    $('semOut').innerHTML = `<div class="msg err">${e.message}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+/* ---------- 真跑 ---------- */
+$('runBtn').onclick = async () => {
+  const dist = parseFloat($('rDist').value);
+  const dur = parseFloat($('rDur').value);
+  if (!(dist > 0) || !(dur > 0)) return setOut('距离和时长要填正数', true);
+  const mode = parseInt($('rRunMode').value, 10) || 1;
+  const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
+  if (!confirm(`确认提交 ${modeName}：${dist} km / ${dur} 分钟？\n\n提交后 10 分钟内不能再跑。`)) return;
+
+  const btn = $('runBtn');
+  btn.disabled = true;
+  setOut('提交中，别关页面…');
+  try {
+    const r = await api('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        distance: dist, duration: dur,
+        runMode: mode,
+        sportType: 1,
+        mode: $('rMode').value,
+        lane: parseInt($('rLane').value, 10) || 1
+      })
+    });
+    setOut('');
+    $('planOut').innerHTML = `
+      <div class="msg ok" style="font-size:15px;font-weight:600">
+        ${r.submitted ? '✓ 提交成功' : '未提交'}</div>
+      <div class="kv"><span>记录 id</span><b>${r.recordId ?? '—'}</b></div>
+      <div class="kv"><span>里程</span><b>${r.distance} m</b></div>
+      <div class="kv"><span>步数</span><b>${r.steps}</b></div>
+      <div class="kv"><span>步频</span><b>${(r.cadence||0).toFixed(1)} 步/分</b></div>
+      <div class="kv"><span>明细 key</span><b>${r.obsKeys || 0} 个已上传</b></div>
+      ${r.logs && r.logs.length ? `<details style="margin-top:8px"><summary style="cursor:pointer;color:#8b949e">流程日志</summary><pre class="mono" style="font-size:11px;max-height:240px;overflow:auto;white-space:pre-wrap">${r.logs.join('\n')}</pre></details>` : ''}`;
+    loadRecords();
+  } catch (e) {
+    setOut(e.message, true);
+    $('planOut').innerHTML = `<div class="msg err">提交失败</div><pre class="mono" style="font-size:11px;white-space:pre-wrap;max-height:300px;overflow:auto">${e.message}</pre>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 function setOut(t, err) {
   const o = $('planOut');
   o.innerHTML = t ? `<div class="msg ${err ? 'err' : ''}">${t}</div>` : '';
 }
-function drawPreview(coords) {
-  if (!map || !coords || !coords.length) return;
-  if (previewLayer) { map.removeLayer(previewLayer); }
-  previewLayer = L.polyline(coords, { color: '#22d3a6', weight: 4, opacity: 0.9 }).addTo(map);
-  map.fitBounds(previewLayer.getBounds(), { padding: [30, 30] });
+function drawPreview(coords, fence, checkpoints) {
+  if (!map) return;
+  if (previewLayer) { map.removeLayer(previewLayer); previewLayer = null; }
+
+  const group = L.featureGroup();
+
+  // 围栏
+  if (fence && fence.ring && fence.ring.length) {
+    const poly = L.polygon(fence.ring, {
+      color: '#f59e0b', weight: 2, fillOpacity: 0.05, dashArray: '6 4'
+    }).bindPopup('围栏：' + fence.name);
+    group.addLayer(poly);
+  }
+
+  // 轨迹
+  if (coords && coords.length) {
+    group.addLayer(L.polyline(coords, { color: '#22d3a6', weight: 4, opacity: 0.9 }));
+  }
+
+  // 打卡点
+  if (checkpoints && checkpoints.length) {
+    for (const c of checkpoints) {
+      const color = c.passed ? '#22c55e' : '#ef4444';
+      group.addLayer(L.circleMarker([c.lat, c.lng], {
+        radius: 7, color: color, fillColor: color, fillOpacity: 0.85, weight: 2
+      }).bindPopup(
+        `打卡点 #${c.index}<br>${c.passed ? '✓ 轨迹经过' : '✗ 未经过'}（最近 ${c.nearest}m）`
+      ));
+    }
+  }
+
+  previewLayer = group.addTo(map);
+  try {
+    const b = group.getBounds();
+    if (b.isValid()) map.fitBounds(b, { padding: [30, 30] });
+  } catch (e) {}
 }
 
 /* ---------- 地图 ---------- */

@@ -133,6 +133,12 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
             let body = read_json(&mut request)?;
             handle_plan(request, state, &body)
         }
+        (Method::Get, "/api/semester") => handle_semester(request, state),
+        (Method::Post, "/api/run") => {
+            let body = read_json(&mut request)?;
+            handle_run(request, state, &body)
+        }
+        (Method::Get, "/api/fences") => handle_fences(request, state, &query),
         (Method::Get, "/api/records") => handle_records(request, state, &query),
         (Method::Get, "/api/health") => json_ok(request, json!({"ok": true, "version": crate::VERSION})),
         _ => {
@@ -173,21 +179,148 @@ fn handle_login(request: tiny_http::Request, state: Shared, body: &Value) -> Res
 /// 真实提交需要先拿服务端的规则/围栏/打卡点，且要过静默期。
 fn handle_plan(
     request: tiny_http::Request,
-    _state: Shared,
+    state: Shared,
     body: &serde_json::Value,
 ) -> Result<(), String> {
     let distance_km = body["distance"].as_f64().unwrap_or(2.0);
     let duration_min = body["duration"].as_f64().unwrap_or(12.0);
     let steps = body["steps"].as_i64().unwrap_or((distance_km * 1150.0) as i64) as i32;
     let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
-    let lat = body["lat"].as_f64().unwrap_or(30.5);
-    let lng = body["lng"].as_f64().unwrap_or(104.0);
+    let mut lat = body["lat"].as_f64().unwrap_or(0.0);
+    let mut lng = body["lng"].as_f64().unwrap_or(0.0);
+    let run_mode = body["runMode"].as_i64().unwrap_or(1);
+
+    // 没传坐标就用围栏中心，别用写死的成都坐标
+    if lat == 0.0 || lng == 0.0 {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if let Some(client) = st.client.as_ref() {
+            if let Ok(fs) = crate::api::fence::fetch_fences(client) {
+                if let Some(f) = fs.first() {
+                    if !f.ring.is_empty() {
+                        let n = f.ring.len() as f64;
+                        let sum = f.ring.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+                        lat = sum.0 / n;
+                        lng = sum.1 / n;
+                    }
+                }
+            }
+        }
+        if lat == 0.0 { lat = 30.5; lng = 104.0; }
+    }
 
     if distance_km <= 0.0 || distance_km > 42.0 {
         return json_err(request, "距离需在 0~42 公里之间");
     }
     if duration_min <= 0.0 || duration_min > 300.0 {
         return json_err(request, "时长需在 0~300 分钟之间");
+    }
+
+    // ---- 已登录：走真实流程拿围栏和打卡点 ----
+    {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if st.logged_in() {
+            let client = st.client.as_ref().unwrap();
+            let p = crate::api::flow::RunParams {
+                center_lat: lat,
+                center_lng: lng,
+                distance_m: distance_km * 1000.0,
+                duration_sec: (duration_min * 60.0).round() as i64,
+                sport_type,
+                run_mode,
+                ..Default::default()
+            };
+            let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let l2 = std::rc::Rc::clone(&logs);
+            let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+            let r = crate::api::flow::dry_run(client, &p, &mut log);
+            drop(log);
+
+            if let Ok(o) = r {
+                // 围栏多边形
+                let fence = o.fence.as_ref().map(|f| {
+                    json!({
+                        "name": f.selected.name,
+                        "runAreaId": f.selected.run_area_id,
+                        "fallback": f.fallback,
+                        "distance": f.distance_m,
+                        "ring": f.selected.polygons.first().cloned().unwrap_or_default(),
+                        "allPolygons": f.selected.polygons,
+                    })
+                });
+
+                // 打卡点 + 是否被轨迹覆盖
+                let track_xy: Vec<(f64, f64)> =
+                    o.track.iter().map(|t| (t.lat, t.lon)).collect();
+                let cps: Vec<Value> = o
+                    .points
+                    .coords
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(a, b))| {
+                        let nearest = track_xy
+                            .iter()
+                            .map(|q| crate::track::geo::distance((a, b), *q))
+                            .fold(f64::MAX, f64::min);
+                        json!({
+                            "index": i + 1,
+                            "lat": a,
+                            "lng": b,
+                            "passed": nearest < 15.0,
+                            "nearest": (nearest * 10.0).round() / 10.0,
+                        })
+                    })
+                    .collect();
+
+                let passed = cps.iter().filter(|c| c["passed"] == true).count();
+                let step = (o.track.len() / 300).max(1);
+                let coords: Vec<Value> = o
+                    .track
+                    .iter()
+                    .step_by(step)
+                    .map(|t| json!([t.lat, t.lon]))
+                    .collect();
+
+                let ac = {
+                    let c: Vec<f64> = o.sim.step_buckets.iter().map(|b| b.steps_num as f64).collect();
+                    if c.len() >= 4 {
+                        let m = c.iter().sum::<f64>() / c.len() as f64;
+                        let den: f64 = c.iter().map(|x| (x - m).powi(2)).sum();
+                        if den > 1e-9 {
+                            c.windows(2).map(|w| (w[0] - m) * (w[1] - m)).sum::<f64>() / den
+                        } else { 0.0 }
+                    } else { 0.0 }
+                };
+
+                return json_ok(request, json!({
+                    "online": true,
+                    "distance": distance_km,
+                    "duration": duration_min,
+                    "actualLength": o.real_length_m,
+                    "steps": o.total_steps,
+                    "avgCadence": (o.avg_cadence * 10.0).round() / 10.0,
+                    "pointCount": o.track_points,
+                    "bucketCount": o.sim.step_buckets.len(),
+                    "stepAutocorr": (ac * 1000.0).round() / 1000.0,
+                    "blocked": o.report.blocked(),
+                    "issueSummary": o.report.summary(),
+                    "issues": o.report.lines(),
+                    "fence": fence,
+                    "checkpoints": cps,
+                    "checkpointTotal": o.points.coords.len(),
+                    "checkpointPassed": passed,
+                    "coords": coords,
+                    "mode": "online",
+                    "policy": {
+                        "minDistance": o.policy.min_distance,
+                        "validTime": o.policy.valid_time,
+                    },
+                    "logs": logs.borrow().clone(),
+                    "note": "已连服务端：围栏与打卡点为真实数据，未提交",
+                }));
+            }
+            // dry_run 失败就退回本地合成
+        }
     }
 
     let total_m = distance_km * 1000.0;
@@ -363,6 +496,184 @@ fn handle_plan(
         "issues": issues,
         "note": "本地预演，未提交到服务器",
     }))
+}
+
+
+// ---------- 记分跑：学期进度 ----------
+
+fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), String> {
+    let st = state.lock().map_err(|e| e.to_string())?;
+    if !st.logged_in() {
+        return json_err(request, "请先登录");
+    }
+    let client = st.client.as_ref().unwrap();
+
+    let mut out = serde_json::Map::new();
+    // 原始响应也带上，字段名不对时能直接看
+    if let Ok(raw) = client.request(
+        "POST",
+        &format!("{}{}", crate::crypto::consts::hosts::RUN, crate::api::semester::SUMMARY_PATH),
+        Some(&json!({})),
+    ) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(d) = v.get("data") {
+                out.insert("summaryRaw".into(), d.clone());
+            }
+        }
+    }
+
+    match crate::api::semester::fetch_summary(client) {
+        Ok(sm) => {
+            out.insert("summary".into(), json!({
+                "sname": sm.sname,
+                "semesterDis": sm.semester_dis,
+                "semesterValidDis": sm.semester_valid_dis,
+                "semesterCount": sm.semester_count,
+                "semesterValidCount": sm.semester_valid_count,
+                "validRatio": sm.valid_ratio(),
+                "text": sm.summary(),
+            }));
+        }
+        Err(e) => {
+            out.insert("summaryError".into(), json!(e));
+        }
+    }
+    if let Ok(raw) = client.request(
+        "POST",
+        &format!("{}{}", crate::crypto::consts::hosts::RUN, crate::api::semester::PERSONAL_PATH),
+        Some(&json!({"runMode": 1})),
+    ) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(d) = v.get("data") {
+                out.insert("goalRaw".into(), d.clone());
+            }
+        }
+    }
+
+    match crate::api::semester::fetch_goal(client, 1) {
+        Ok(g) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            out.insert("goal".into(), json!({
+                "targetDis": g.target_dis,
+                "targetCount": g.target_count,
+                "daysLeft": g.days_left(now),
+                "inTerm": g.in_term(now),
+            }));
+        }
+        Err(e) => {
+            out.insert("goalError".into(), json!(e));
+        }
+    }
+    json_ok(request, Value::Object(out))
+}
+
+// ---------- 围栏列表（地图上画出来） ----------
+
+fn handle_fences(
+    request: tiny_http::Request,
+    state: Shared,
+    _query: &str,
+) -> Result<(), String> {
+    let st = state.lock().map_err(|e| e.to_string())?;
+    if !st.logged_in() {
+        return json_err(request, "请先登录");
+    }
+    let client = st.client.as_ref().unwrap();
+    match crate::api::fence::fetch_fences(client) {
+        Ok(fs) => {
+            let list: Vec<Value> = fs
+                .iter()
+                .map(|f| json!({
+                    "id": f.id,
+                    "name": f.name,
+                    "ring": f.ring,
+                }))
+                .collect();
+            json_ok(request, json!({"count": list.len(), "fences": list}))
+        }
+        Err(e) => json_err(request, &format!("拉围栏失败: {e}")),
+    }
+}
+
+// ---------- 真跑：提交 ----------
+
+fn handle_run(
+    request: tiny_http::Request,
+    state: Shared,
+    body: &Value,
+) -> Result<(), String> {
+    let distance_km = body["distance"].as_f64().unwrap_or(2.0);
+    let duration_min = body["duration"].as_f64().unwrap_or(12.0);
+    let lat = body["lat"].as_f64();
+    let lng = body["lng"].as_f64();
+    let run_mode = body["runMode"].as_i64().unwrap_or(1);
+    let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
+
+    if distance_km <= 0.0 || distance_km > 42.0 {
+        return json_err(request, "距离需在 0~42 公里之间");
+    }
+    if duration_min <= 0.0 || duration_min > 300.0 {
+        return json_err(request, "时长需在 0~300 分钟之间");
+    }
+
+    let mut st = state.lock().map_err(|e| e.to_string())?;
+    if !st.logged_in() {
+        return json_err(request, "请先登录");
+    }
+    let client = st.client.as_ref().unwrap();
+
+    // 中心点：没传就用围栏中心反推
+    let (clat, clng) = match (lat, lng) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            match crate::api::fence::fetch_fences(client) {
+                Ok(fs) if !fs.is_empty() && !fs[0].ring.is_empty() => {
+                    let r = &fs[0].ring;
+                    let n = r.len() as f64;
+                    let s: (f64, f64) = r.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+                    (s.0 / n, s.1 / n)
+                }
+                _ => (30.5, 104.0),
+            }
+        }
+    };
+
+    let p = crate::api::flow::RunParams {
+        center_lat: clat,
+        center_lng: clng,
+        distance_m: distance_km * 1000.0,
+        duration_sec: (duration_min * 60.0).round() as i64,
+        sport_type,
+        run_mode,
+        ..Default::default()
+    };
+
+    // 日志用共享容器，闭包借用结束后还能读
+    let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let logs2 = std::rc::Rc::clone(&logs);
+    let mut log = move |s: &str| logs2.borrow_mut().push(s.to_string());
+    let mut confirm = |_o: &crate::api::flow::RunOutcome| true;
+
+    let result = crate::api::flow::run_full(client, &p, &mut log, &mut confirm);
+    drop(log);
+
+    match result {
+        Ok(o) => json_ok(request, json!({
+            "submitted": o.submitted,
+            "recordId": o.record_id,
+            "distance": o.real_length_m,
+            "steps": o.total_steps,
+            "cadence": o.avg_cadence,
+            "points": o.track_points,
+            "obsKeys": o.obs_keys.len(),
+            "logs": logs.borrow().clone(),
+        })),
+        Err(e) => json_err(request, &format!("{e}\n---\n{}", logs.borrow().join("\n"))),
+    }
 }
 
 fn handle_records(request: tiny_http::Request, state: Shared, query: &str) -> Result<(), String> {
