@@ -323,7 +323,7 @@ fn handle_plan(
     if lat == 0.0 || lng == 0.0 {
         let st = state.lock().map_err(|e| e.to_string())?;
         if let Some(client) = st.client() {
-            if let Ok(fs) = crate::api::fence::fetch_fences(client) {
+            if let Ok(fs) = crate::api::fence::fetch_fences(&client) {
                 if let Some(f) = fs.first() {
                     if !f.ring.is_empty() {
                         let n = f.ring.len() as f64;
@@ -346,11 +346,15 @@ fn handle_plan(
 
     // ---- 已登录：走真实流程拿围栏和打卡点 ----
     {
-        let st = state.lock().map_err(|e| e.to_string())?;
-        if st.logged_in() {
-            let Some(client) = st.client() else {
-                return json_err(request, "当前账号没有可用会话，请重新登录");
-            };
+        let maybe_client = {
+            let st = state.lock().map_err(|e| e.to_string())?;
+            if !st.logged_in() {
+                None
+            } else {
+                st.client().cloned()
+            }
+        };
+        if let Some(client) = maybe_client {
             let p = crate::api::flow::RunParams {
                 center_lat: lat,
                 center_lng: lng,
@@ -365,7 +369,7 @@ fn handle_plan(
                 std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
             let l2 = std::rc::Rc::clone(&logs);
             let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
-            let r = crate::api::flow::dry_run(client, &p, &mut log);
+            let r = crate::api::flow::dry_run(&client, &p, &mut log);
             drop(log);
 
             if let Ok(o) = r {
@@ -1042,12 +1046,18 @@ fn handle_starttimes(request: tiny_http::Request) -> Result<(), String> {
 }
 
 fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), String> {
-    let st = state.lock().map_err(|e| e.to_string())?;
-    if !st.logged_in() {
-        return json_err(request, "请先登录");
-    }
-    let Some(client) = st.client() else {
-        return json_err(request, "当前账号没有可用会话，请重新登录");
+    // 先把 client 克隆出来再放锁。Client 是 Clone，网络请求几十秒，
+    // 持着 Mutex 做 IO 会让 /api/accounts 之类的请求全部排队，
+    // 页面看起来就是「服务假死」。
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
     };
 
     let mut out = serde_json::Map::new();
@@ -1064,7 +1074,7 @@ fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), Str
         }
     }
 
-    match crate::api::semester::fetch_summary(client) {
+    match crate::api::semester::fetch_summary(&client) {
         Ok(sm) => {
             out.insert("summary".into(), json!({
                 "sname": sm.sname,
@@ -1092,7 +1102,7 @@ fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), Str
         }
     }
 
-    match crate::api::semester::fetch_goal(client, 1) {
+    match crate::api::semester::fetch_goal(&client, 1) {
         Ok(g) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1119,14 +1129,20 @@ fn handle_fences(
     state: Shared,
     _query: &str,
 ) -> Result<(), String> {
-    let st = state.lock().map_err(|e| e.to_string())?;
-    if !st.logged_in() {
-        return json_err(request, "请先登录");
-    }
-    let Some(client) = st.client() else {
-        return json_err(request, "当前账号没有可用会话，请重新登录");
+    // 先把 client 克隆出来再放锁。Client 是 Clone，网络请求几十秒，
+    // 持着 Mutex 做 IO 会让 /api/accounts 之类的请求全部排队，
+    // 页面看起来就是「服务假死」。
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
     };
-    match crate::api::fence::fetch_fences(client) {
+    match crate::api::fence::fetch_fences(&client) {
         Ok(fs) => {
             let list: Vec<Value> = fs
                 .iter()
@@ -1176,7 +1192,7 @@ fn handle_run(
     let (clat, clng) = match (lat, lng) {
         (Some(a), Some(b)) => (a, b),
         _ => {
-            match crate::api::fence::fetch_fences(client) {
+            match crate::api::fence::fetch_fences(&client) {
                 Ok(fs) if !fs.is_empty() && !fs[0].ring.is_empty() => {
                     let r = &fs[0].ring;
                     let n = r.len() as f64;
@@ -1229,14 +1245,20 @@ fn handle_records(request: tiny_http::Request, state: Shared, query: &str) -> Re
     let size = query_param(query, "size").and_then(|v| v.parse().ok()).unwrap_or(20u32);
     let sport = query_param(query, "type").and_then(|v| v.parse().ok()).unwrap_or(1u32);
 
-    let st = state.lock().map_err(|e| e.to_string())?;
-    if !st.logged_in() {
-        return json_err(request, "请先登录");
-    }
-    let Some(client) = st.client() else {
-        return json_err(request, "当前账号没有可用会话，请重新登录");
+    // 先把 client 克隆出来再放锁。Client 是 Clone，网络请求几十秒，
+    // 持着 Mutex 做 IO 会让 /api/accounts 之类的请求全部排队，
+    // 页面看起来就是「服务假死」。
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
     };
-    match records::list_records(client, page, size, sport) {
+    match records::list_records(&client, page, size, sport) {
         Ok(data) => json_ok(request, data),
         Err(e) => json_err(request, &e),
     }
@@ -1247,14 +1269,20 @@ fn handle_record_detail(
     state: Shared,
     rrid: i64,
 ) -> Result<(), String> {
-    let st = state.lock().map_err(|e| e.to_string())?;
-    if !st.logged_in() {
-        return json_err(request, "请先登录");
-    }
-    let Some(client) = st.client() else {
-        return json_err(request, "当前账号没有可用会话，请重新登录");
+    // 先把 client 克隆出来再放锁。Client 是 Clone，网络请求几十秒，
+    // 持着 Mutex 做 IO 会让 /api/accounts 之类的请求全部排队，
+    // 页面看起来就是「服务假死」。
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
     };
-    match records::get_record(client, rrid) {
+    match records::get_record(&client, rrid) {
         Ok(data) => json_ok(request, data),
         Err(e) => json_err(request, &e),
     }

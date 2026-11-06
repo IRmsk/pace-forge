@@ -206,6 +206,15 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                 c.coords.len(),
                 points::span_m(&c.coords)
             ));
+            // 「按顺序通过所有点位」判定失败时，得知道服务端给的正式顺序
+            if let Some(first) = c.points.first() {
+                let keys: Vec<&String> = first
+                    .as_object()
+                    .map(|o| o.keys().collect())
+                    .unwrap_or_default();
+                log(&format!("[points] 原始字段: {keys:?}"));
+                log(&format!("[points] 首点: {first}"));
+            }
             c
         }
         Err(e) => {
@@ -256,29 +265,37 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         //   ② 几何蛇形填充——边界周长不够或内缩失败时的兜底。
         //
         // 之前只有 ②，纯几何不看地形，轨迹直接从水面划过去。
-        let inset = 25.0;
-        let route = match crate::track::fence_route::route_along_fence(
-            &fence_ring,
-            p.distance_m,
-            inset,
-            &must,
-        ) {
-            Ok(r) => {
-                log(&format!(
-                    "[track] 沿围栏内缩 {inset:.0}m 跑，{} 圈 {:.0}m",
-                    r.lines, r.length_m
-                ));
-                r
+        // 服务端判「按顺序通过所有点位」用的是点位数组顺序，那个顺序不是
+        // 地理上的环形顺序（实测是锯齿）。所以骨架必须按数组顺序穿点，
+        // 绕圈再漂亮也没用——顺序错一条记录就废。
+        let seed = if p.seed != 0 { p.seed } else { start_ms as u64 };
+        let route = if must.len() >= 2 {
+            match crate::track::fence_route::route_through_in_order(
+                &fence_ring,
+                p.distance_m,
+                &must,
+                seed,
+            ) {
+                Ok(r) => {
+                    log(&format!(
+                        "[track] 按打卡点顺序串 {} 段，{:.0}m",
+                        r.lines, r.length_m
+                    ));
+                    r
+                }
+                Err(e) => {
+                    log(&format!("[track] 按序串点失败（{e}），退回沿边界绕圈"));
+                    crate::track::fence_route::route_along_fence(
+                        &fence_ring,
+                        p.distance_m,
+                        25.0,
+                        &must,
+                    )?
+                }
             }
-            Err(e) => {
-                log(&format!("[track] 沿边界规划失败（{e}），退回几何填充"));
-                crate::track::fence_route::route_in_fence_avoiding(
-                    &fence_ring,
-                    p.distance_m,
-                    &must,
-                    &[],
-                )?
-            }
+        } else {
+            log("[track] 没有打卡点，沿围栏内缩 25m 跑");
+            crate::track::fence_route::route_along_fence(&fence_ring, p.distance_m, 25.0, &must)?
         };
         // 沿边界是贴着围墙的折线，拐角磨圆 + 轻微摆动，别像尺子画的
         let rounded = crate::track::fence_route::round_corners(&route.points, 20.0, 6);

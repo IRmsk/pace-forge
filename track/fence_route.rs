@@ -550,6 +550,126 @@ pub fn route_along_fence(
     })
 }
 
+/// 按给定顺序穿过所有必经点，凑够里程。
+///
+/// 服务端判「按顺序通过所有点位」用的是点位数组顺序，而数组顺序不一定
+/// 是地理上的环形顺序——实测某校的 5 个点是「东→西→更西→东→中间」的
+/// 锯齿，绕圈永远对不上。所以骨架必须按顺序串。
+///
+/// 走法：每两个点之间走一条绕行弧（不是直线），弧朝围栏内侧鼓出，这样
+/// 既按顺序经过，又不会横穿整个校区。里程不够就在最后两个点之间多绕。
+pub fn route_through_in_order(
+    fence: &[(f64, f64)],
+    want_m: f64,
+    must: &[(f64, f64)],
+    seed: u64,
+) -> Result<FenceRoute, String> {
+    if must.len() < 2 {
+        return Err("至少两个必经点".into());
+    }
+    if want_m <= 0.0 {
+        return Err("目标里程必须为正".into());
+    }
+    let mut rng = seed | 1;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+
+    let mut points: Vec<(f64, f64)> = vec![must[0]];
+    let legs = must.len() - 1;
+
+    // 先按顺序把点串起来，每段用一条鼓出的弧
+    for i in 0..legs {
+        let (a, b) = (must[i], must[i + 1]);
+        let d = distance(a, b);
+        if d < 1.0 {
+            points.push(b);
+            continue;
+        }
+        // 弧的鼓出量：段长的 35%，但夹在 30~180m
+        let bulge = (d * 0.35).clamp(30.0, 180.0);
+        // 鼓向：朝围栏中心那一侧，别跑到围栏外面
+        let cx = fence.iter().map(|p| p.0).sum::<f64>() / fence.len() as f64;
+        let cy = fence.iter().map(|p| p.1).sum::<f64>() / fence.len() as f64;
+        let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+        let to_center = (cx - mid.0, cy - mid.1);
+        let seg = (b.0 - a.0, b.1 - a.1);
+        let mlat = m_per_deg_lat(a.0).max(1.0);
+        let mlng = m_per_deg_lng(a.0).max(1.0);
+        let cross = seg.0 * to_center.1 - seg.1 * to_center.0;
+        let sign = if cross > 0.0 { 1.0 } else { -1.0 };
+        // 段法向（米制），再乘上鼓出量和方向
+        let (sy, sx) = (seg.0 * mlat, seg.1 * mlng);
+        let slen = (sy * sy + sx * sx).sqrt().max(1e-9);
+        let (ny, nx) = (-sx / slen * sign, sy / slen * sign);
+
+        // 二次贝塞尔：控制点在弧顶
+        let ctrl = (
+            mid.0 + ny * bulge / mlat,
+            mid.1 + nx * bulge / mlng,
+        );
+        let steps = ((d / 8.0) as usize).clamp(8, 400);
+        // 加一点随机偏摆，别让每条弧都一样鼓
+        let wob = 0.75 + (next() % 500) as f64 / 1000.0;
+        for k in 1..=steps {
+            let t = k as f64 / steps as f64;
+            let u = 1.0 - t;
+            let p = (
+                u * u * a.0 + 2.0 * u * t * ctrl.0 * wob + t * t * b.0,
+                u * u * a.1 + 2.0 * u * t * ctrl.1 * wob + t * t * b.1,
+            );
+            points.push(p);
+        }
+        // 末端精确落在点位上
+        if let Some(last) = points.last_mut() {
+            *last = b;
+        }
+    }
+
+    // 里程还不够：在最后一点附近绕小圈补足
+    let mut total = path_len(&points);
+    let mut guard = 0;
+    while total < want_m && guard < 200 {
+        guard += 1;
+        let anchor = *points.last().unwrap();
+        // 绕圈半径 40~90m，圈心朝围栏中心
+        let cx = fence.iter().map(|p| p.0).sum::<f64>() / fence.len() as f64;
+        let cy = fence.iter().map(|p| p.1).sum::<f64>() / fence.len() as f64;
+        let dir = (cx - anchor.0, cy - anchor.1);
+        let dl = (dir.0 * dir.0 + dir.1 * dir.1).sqrt();
+        let r = 45.0 + (next() % 400) as f64 / 10.0;
+        let mlat = m_per_deg_lat(anchor.0).max(1.0);
+        let mlng = m_per_deg_lng(anchor.0).max(1.0);
+        let (dy, dx) = if dl > 1e-9 { (dir.0 / dl, dir.1 / dl) } else { (1.0, 0.0) };
+        let center = (anchor.0 + dy * r / mlat, anchor.1 + dx * r / mlng);
+        let segments = 40;
+        for k in 1..=segments {
+            let th = std::f64::consts::TAU * k as f64 / segments as f64;
+            let p = (
+                center.0 + r * th.cos() / mlat,
+                center.1 + r * th.sin() / mlng,
+            );
+            if contains(fence, p.0, p.1) {
+                total += distance(*points.last().unwrap(), p);
+                points.push(p);
+                if total >= want_m {
+                    break;
+                }
+            }
+        }
+    }
+
+    let length_m = path_len(&points);
+    Ok(FenceRoute {
+        points,
+        length_m,
+        lines: must.len(),
+    })
+}
+
 /// 把必经点「钉」进折线：找路径上离它最近的一段，用 A → m → B 替换 A → B。
 ///
 /// 光靠重采样后吸附不行——吸附只能在已有采样点里挑一个最近的，采样间距 5m
@@ -809,6 +929,43 @@ mod tests {
                 .map(|p| distance(*p, *c))
                 .fold(f64::MAX, f64::min);
             assert!(near < 0.5, "打卡点离最近轨迹 {near:.2}m");
+        }
+    }
+
+    /// 骨架必须按给定顺序穿过点位——服务端判「按顺序通过所有点位」。
+    #[test]
+    fn in_order_route_preserves_sequence() {
+        let mlat = m_per_deg_lat(31.23);
+        let mlng = m_per_deg_lng(31.23);
+        let (lat0, lon0) = (31.2304, 121.4737);
+        let fence: Vec<(f64, f64)> = vec![
+            (lat0, lon0),
+            (lat0, lon0 + 800.0 / mlng),
+            (lat0 + 800.0 / mlat, lon0 + 800.0 / mlng),
+            (lat0 + 800.0 / mlat, lon0),
+        ];
+        // 锯齿顺序，不是环形顺序
+        let must = vec![
+            (lat0 + 600.0 / mlat, lon0 + 700.0 / mlng),
+            (lat0 + 500.0 / mlat, lon0 + 200.0 / mlng),
+            (lat0 + 300.0 / mlat, lon0 + 100.0 / mlng),
+            (lat0 + 550.0 / mlat, lon0 + 650.0 / mlng),
+        ];
+        let r = route_through_in_order(&fence, 1500.0, &must, 11).unwrap();
+        assert!(r.length_m > 1000.0, "长度 {:.0}m 太短", r.length_m);
+
+        // 每个打卡点在路径上的「首次到达索引」必须严格递增
+        let mut first_idx = Vec::new();
+        for m in &must {
+            let idx = r
+                .points
+                .iter()
+                .position(|p| distance(*p, *m) < 5.0)
+                .unwrap_or_else(|| panic!("点位 {m:?} 没被穿过"));
+            first_idx.push(idx);
+        }
+        for w in first_idx.windows(2) {
+            assert!(w[0] < w[1], "经过顺序错了: {first_idx:?}");
         }
     }
 
