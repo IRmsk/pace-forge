@@ -81,6 +81,7 @@ fn point_json_full(
     prev: &mut (f64, f64),
     cum: &mut (f64, i64, i64),
     prev_time: &mut i64,
+    total_steps: i64,
     seed: u64,
 ) -> Value {
     // BD-09 → GCJ-02（原点是 BD-09，服务端要 gcj02）
@@ -137,17 +138,18 @@ fn point_json_full(
 
     json!({
         "avgSpeed": (avg_speed * 10000.0).round() / 10000.0,
-        "bdA": 0.0,
+        // 海拔三兄弟不能是 0：服务端按它们算累计爬升，全 0 等于「在海底跑」
+        "bdA": 1.0,
         "bdD": 0.0,
-        "bdG": 0.0,
-        "bdS": 0.0,
+        "bdG": 1,
+        "bdS": 1.0,
         "coorType": "gcj02",
-        "count": 0,
+        "count": 1,
         "dtr": 0.0,
         "flag": start_ms,
         "gLat": (glat * 1e7).round() / 1e7,
         "gLng": (glng * 1e7).round() / 1e7,
-        "gainTime": 0,
+        "gainTime": "",
         "id": idx as i64 + 1,
         "lat": -1.0,
         "lng": -1.0,
@@ -157,8 +159,12 @@ fn point_json_full(
         "radius": (radius * 100.0).round() / 100.0,
         "speed": (inst * 10000.0).round() / 10000.0,
         "state": if idx == 0 { 1 } else { 0 },
-        "steps": 0,
-        "stepDistance": 0.0,
+        "steps": ((total_steps as f64) * (idx as f64 + 1.0) / n as f64).round() as i64,
+        "stepDistance": if cum.0 > 1.0 {
+            ((cum.0 / cum.0.max(1.0)) * (cum.0 / (total_steps as f64).max(1.0)) * 10000.0).round() / 10000.0
+        } else {
+            0.0
+        },
         "totalDis": (cum.0 * 10000.0).round() / 10000.0,
         "totalTime": cum.1,
         "type": ptype,
@@ -224,7 +230,7 @@ pub fn build(
         .map(|(i, p)| {
             point_json_full(
                 p, i, points.len(), params.start_time_ms, start_pt,
-                &mut prev, &mut cum, &mut prev_time, seed,
+                &mut prev, &mut cum, &mut prev_time, params.total_steps as i64, seed,
             )
         })
         .collect();
@@ -249,8 +255,10 @@ pub fn build(
     let mut sb = sb;
     let mut stb = stb;
     crate::track::buckets::apply_submit_ids(&mut sb, &mut stb);
-    let speed_json_str = serde_json::to_string(&sb).map_err(|e| e.to_string())?;
-    let step_json_str = serde_json::to_string(&stb).map_err(|e| e.to_string())?;
+    // 服务端要的是**数组**，不是字符串化的 JSON。
+    // 早先按 allLocJson 的模式套成了字符串，结果提交回来 -10000。
+    let speed_arr = serde_json::to_value(&sb).map_err(|e| e.to_string())?;
+    let step_arr = serde_json::to_value(&stb).map_err(|e| e.to_string())?;
 
     // ---- 签名（31 字段）----
     let sign_fields: SignFields = vec![
@@ -272,7 +280,7 @@ pub fn build(
         ("speed".into(), Some(speed_val.to_string())),
         ("sportType".into(), Some(params.sport_type.to_string())),
         ("startTime".into(), Some(params.start_time_ms.to_string())),
-        ("status".into(), Some("1".into())),
+        ("status".into(), Some("0".into())),
         ("stopTime".into(), Some(params.stop_time_ms.to_string())),
         ("themeId".into(), Some("0".into())),
         ("totalAscent".into(), Some(params.total_ascent.to_string())),
@@ -306,8 +314,9 @@ pub fn build(
         "isUpload": false,
         "latitude": points[0].lat,
         "longitude": points[0].lon,
-        "maxRunTime": MAX_RUN_TIME,
-        "minSteps": MIN_STEPS,
+        // 服务端从策略里取，客户端传 0
+        "maxRunTime": 0,
+        "minSteps": 0,
         "policy": params.policy,
         "recordUrl": "",
         "roomId": 0,
@@ -316,13 +325,15 @@ pub fn build(
         "selDistance": params.sel_distance_m,
         "selRunTime": params.sel_run_time_sec,
         "selectedUnid": params.unid,
+        "more": false,
+        "originalSign": crate::crypto::sign::canonical_string(&sign_fields),
         "signature": signature,
         "speed": speed_val,
-        "speedPerTenSec": speed_json_str,
+        "speedPerTenSec": speed_arr,
         "sportType": params.sport_type,
         "startTime": params.start_time_ms,
-        "status": 1,
-        "stepsPerTenSec": step_json_str,
+        "status": 0,
+        "stepsPerTenSec": step_arr,
         "stopTime": params.stop_time_ms,
         "themeId": 0,
         "totalAscent": params.total_ascent,
@@ -413,15 +424,17 @@ mod tests {
         let j = vec![0.0; 72];
         let sub = build(&params(), &points(), &[], &j).unwrap();
         let v = &sub.save_record;
-        // 这三个必须是字符串，不是数组
+        // allLocJson 是字符串化的 JSON（双重序列化）
         assert!(v["allLocJson"].is_string(), "allLocJson 应为字符串");
-        assert!(v["speedPerTenSec"].is_string(), "speedPerTenSec 应为字符串");
-        assert!(v["stepsPerTenSec"].is_string(), "stepsPerTenSec 应为字符串");
-        // 但解一层后应是数组
         let inner: Value = serde_json::from_str(v["allLocJson"].as_str().unwrap()).unwrap();
-        assert!(inner.is_array());
-        let sb: Value = serde_json::from_str(v["speedPerTenSec"].as_str().unwrap()).unwrap();
-        assert!(sb.is_array());
+        assert!(inner.is_array(), "allLocJson 解一层后应是数组");
+
+        // speedPerTenSec / stepsPerTenSec 是**数组**，不要套成字符串。
+        // 早先按 allLocJson 的模式一起套了，提交回来 -10000。
+        assert!(v["speedPerTenSec"].is_array(), "speedPerTenSec 应为数组");
+        assert!(v["stepsPerTenSec"].is_array(), "stepsPerTenSec 应为数组");
+        assert!(v["speedPerTenSec"].as_array().unwrap().len() > 0);
+        assert!(v["stepsPerTenSec"].as_array().unwrap().len() > 0);
     }
 
     #[test]
@@ -453,9 +466,14 @@ mod tests {
     fn buckets_match_duration() {
         let j = vec![0.0; 72];
         let sub = build(&params(), &points(), &[], &j).unwrap();
-        let sb: Value =
-            serde_json::from_str(sub.save_record["speedPerTenSec"].as_str().unwrap()).unwrap();
-        assert_eq!(sb.as_array().unwrap().len(), 72, "720s 应有 72 个桶");
+        let sb = sub.save_record["speedPerTenSec"]
+            .as_array()
+            .expect("speedPerTenSec 应为数组");
+        assert_eq!(sb.len(), 72, "720s 应有 72 个桶");
+        let st = sub.save_record["stepsPerTenSec"]
+            .as_array()
+            .expect("stepsPerTenSec 应为数组");
+        assert_eq!(st.len(), 72, "步数桶也要 72 个");
     }
 
     #[test]
@@ -472,14 +490,18 @@ mod tests {
     fn submit_buckets_use_60000_ids() {
         let j = vec![0.0; 72];
         let sub = build(&params(), &points(), &[], &j).unwrap();
-        let sp: serde_json::Value =
-            serde_json::from_str(sub.save_record["speedPerTenSec"].as_str().unwrap()).unwrap();
-        let arr = sp.as_array().unwrap();
+        let sp = &sub.save_record["speedPerTenSec"];
+        let arr = sp.as_array().expect("speedPerTenSec 应该是数组");
         assert!(!arr.is_empty());
         assert_eq!(arr[0]["id"], 60000);
         assert_eq!(arr[0]["queueNum"], 0);
         assert_eq!(arr[1]["id"], 60001);
         assert_eq!(arr[1]["queueNum"], 1);
+
+        // stepsPerTenSec 用同样的 id 规则
+        let sa = sub.save_record["stepsPerTenSec"].as_array().expect("应为数组");
+        assert_eq!(sa[0]["id"], 60000);
+        assert_eq!(sa[0]["queueNum"], 0);
     }
 
     #[test]
