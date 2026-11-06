@@ -186,6 +186,7 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
             handle_plan(request, state, &body)
         }
         (Method::Get, "/api/accounts") => handle_accounts(request, state),
+        (Method::Get, "/api/starttimes") => handle_starttimes(request),
         (Method::Post, "/api/accounts") => {
             let body = read_json(&mut request)?;
             handle_add_account(request, state, &body)
@@ -281,6 +282,7 @@ fn handle_plan(
     let mut lat = body["lat"].as_f64().unwrap_or(0.0);
     let mut lng = body["lng"].as_f64().unwrap_or(0.0);
     let run_mode = body["runMode"].as_i64().unwrap_or(1);
+    let start_at_ms = body["startAtMs"].as_i64().filter(|v| *v > 0);
 
     // 没传坐标就用围栏中心，别用写死的成都坐标
     if lat == 0.0 || lng == 0.0 {
@@ -319,6 +321,7 @@ fn handle_plan(
                 duration_sec: (duration_min * 60.0).round() as i64,
                 sport_type,
                 run_mode,
+                start_at_ms,
                 ..Default::default()
             };
             let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
@@ -806,6 +809,7 @@ fn handle_batch(
     let distance_km = body["distance"].as_f64().unwrap_or(2.0);
     let duration_min = body["duration"].as_f64().unwrap_or(12.0);
     let run_mode = body["runMode"].as_i64().unwrap_or(1);
+    let start_at_ms = body["startAtMs"].as_i64().filter(|v| *v > 0);
     let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
     let dry = body["dry"].as_bool().unwrap_or(false);
     // 账号间隔（毫秒），默认 8 秒，避免同 IP 高频
@@ -873,6 +877,7 @@ fn handle_batch(
             duration_sec: (duration_min * 60.0).round() as i64,
             sport_type,
             run_mode,
+            start_at_ms,
             ..Default::default()
         };
 
@@ -922,6 +927,76 @@ fn handle_batch(
         "submitted": submitted,
         "results": results,
     }))
+}
+
+
+// ---------- 补跑时刻 ----------
+
+/// 算补跑时刻。查询参数：`mode`=at|ago|rand，`hhmm`、`days`、`minutes`、`dur`。
+///
+/// 只算不跑，前端拿到结果给用户确认；确认后再带着 `startAtMs` 调 `/api/run`。
+fn handle_starttimes(request: tiny_http::Request) -> Result<(), String> {
+    use crate::api::start_time as st;
+
+    let q = request.url().split_once('?').map(|x| x.1).unwrap_or("");
+    let mut get = |k: &str| -> Option<String> {
+        q.split('&').find_map(|kv| {
+            let (a, b) = kv.split_once('=')?;
+            if a == k {
+                Some(b.replace("%3A", ":").replace("%20", " ").to_string())
+            } else {
+                None
+            }
+        })
+    };
+
+    let mode = get("mode").unwrap_or_else(|| "now".into());
+    let dur_s: i64 = get("dur").and_then(|v| v.parse().ok()).unwrap_or(720);
+    let days: i64 = get("days").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let now = crate::crypto::envelope::now_ms() as i64;
+    let tz = st::default_tz_offset_min();
+
+    let result = match mode.as_str() {
+        "at" => {
+            let hhmm = get("hhmm").unwrap_or_else(|| "07:30".into());
+            match st::parse_hhmm(&hhmm) {
+                Ok((h, m)) => st::specified(now, days, h, m, dur_s),
+                Err(e) => return json_err(request, &e),
+            }
+        }
+        "ago" => {
+            let mins: i64 = get("minutes").and_then(|v| v.parse().ok()).unwrap_or(60);
+            st::ago(now, mins, dur_s)
+        }
+        "rand" => {
+            use rand::Rng;
+            let r: f64 = rand::thread_rng().gen();
+            st::random_in_day(now, days, dur_s, r)
+        }
+        // 现在跑就是现在跑，不参与钳制（前端也不会拿它去弹确认框）
+        "now" => Ok(st::StartTime { ms: now, clamped: false }),
+        other => return json_err(request, &format!("未知模式 {other}")),
+    };
+
+    match result {
+        Ok(x) => json_ok(request, json!({
+            "mode": mode,
+            "startMs": x.ms,
+            "stopMs": x.stop_ms(dur_s),
+            "startText": st::format_ms(x.ms, tz),
+            "stopText": st::format_ms(x.stop_ms(dur_s), tz),
+            "clamped": x.clamped,
+            "durationSec": dur_s,
+            "nowText": st::format_ms(now, tz),
+            "limits": {
+                "maxDaysAgo": st::MAX_DAYS_AGO,
+                "maxAgoMin": st::MAX_AGO_MIN,
+                "randHourLo": st::RAND_HOUR_LO,
+                "randHourHi": st::RAND_HOUR_HI,
+            },
+        })),
+        Err(e) => json_err(request, &e),
+    }
 }
 
 fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), String> {
@@ -1033,6 +1108,7 @@ fn handle_run(
     let lat = body["lat"].as_f64();
     let lng = body["lng"].as_f64();
     let run_mode = body["runMode"].as_i64().unwrap_or(1);
+    let start_at_ms = body["startAtMs"].as_i64().filter(|v| *v > 0);
     let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
 
     if distance_km <= 0.0 || distance_km > 42.0 {
@@ -1071,6 +1147,7 @@ fn handle_run(
         duration_sec: (duration_min * 60.0).round() as i64,
         sport_type,
         run_mode,
+        start_at_ms,
         ..Default::default()
     };
 

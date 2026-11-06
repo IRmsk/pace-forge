@@ -35,6 +35,41 @@ fn main() {
             let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
             dry_run(dist_km, dur_min);
         }
+        "at" => {
+            // at <HH:MM> <km> <min> [--days N]
+            let hhmm = args.get(1).cloned().unwrap_or_default();
+            let dist_km: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let dur_min: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let days: i64 = args
+                .iter()
+                .position(|a| a == "--days")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let yes = args.iter().any(|a| a == "-y" || a == "--yes");
+            do_at(&hhmm, days, dist_km, dur_min, yes);
+        }
+        "ago" => {
+            // ago <分钟> <km> <min>
+            let mins: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
+            let dist_km: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let dur_min: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let yes = args.iter().any(|a| a == "-y" || a == "--yes");
+            do_ago(mins, dist_km, dur_min, yes);
+        }
+        "rand" => {
+            // rand <km> <min> [--days N]
+            let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
+            let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let days: i64 = args
+                .iter()
+                .position(|a| a == "--days")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let yes = args.iter().any(|a| a == "-y" || a == "--yes");
+            do_rand(days, dist_km, dur_min, yes);
+        }
         "stadium" => {
             let laps: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
             let lane: u8 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -51,10 +86,14 @@ fn main() {
             println!("  pace-forge run [km] [min] [-y] 刷跑并提交（-y 跳过确认）");
             println!("  pace-forge check [km] [min]    离线体检轨迹（不联网、不登录）");
             println!("  pace-forge dry [km] [min]      只预演，不提交（要登录）");
+            println!("  pace-forge at <HH:MM> [km] [min] [--days N]  补跑：指定当天/往前的时刻");
+            println!("  pace-forge ago <分钟> [km] [min]            补跑：N 分钟前");
+            println!("  pace-forge rand [km] [min] [--days N]       补跑：当天 7-20 点随机时刻");
             println!("  pace-forge stadium [圈] [道次] 操场轨迹参数");
             println!("  pace-forge version             版本号");
             println!();
-            println!("run/dry 需要已保存的登录会话（$HOME/.pace-forge/session.json）。");
+            println!("规则：开始 + 用时 + 5s 余量 ≤ 现在，最多往前补 3 天。");
+            println!("run/dry/at/ago/rand 需要已保存的登录会话（$HOME/.pace-forge/session.json）。");
         }
         other => {
             eprintln!("未知命令: {other}\n用 `pace-forge help` 查看用法");
@@ -236,6 +275,11 @@ fn show_semester() {
 }
 
 fn do_run(dist_km: f64, dur_min: f64, yes: bool) {
+    run_with_start(dist_km, dur_min, None, yes);
+}
+
+/// 通用提交：`start_at` 为 `None` 就是现在开跑。
+fn run_with_start(dist_km: f64, dur_min: f64, start_at: Option<i64>, yes: bool) {
     use pace_forge::api::{flow, session};
 
     let sess = session::load_session();
@@ -253,6 +297,7 @@ fn do_run(dist_km: f64, dur_min: f64, yes: bool) {
     let p = flow::RunParams {
         distance_m: dist_km * 1000.0,
         duration_sec: (dur_min * 60.0).round() as i64,
+        start_at_ms: start_at,
         ..Default::default()
     };
 
@@ -310,4 +355,74 @@ fn stadium_probe(laps: f64, lane: u8) {
     println!("  最大曲率  {max_k:.5} /m（理论 {:.5}）", 1.0 / (36.5 + 0.3 + 1.22 * (lane as f64 - 1.0)));
     println!();
     println!("建议：{:.0}m 跑 {:.0} 秒（配速 {:.2} 分/km）", len, (len / 2.78).round(), 1000.0 / 2.78 / 60.0);
+}
+
+
+// ---------------------------------------------------------------------------
+// 补跑：指定时间
+// ---------------------------------------------------------------------------
+
+fn show_plan(st: pace_forge::api::start_time::StartTime, dur_min: f64) {
+    let dur_s = (dur_min * 60.0).round() as i64;
+    println!("开始 {}", pace_forge::api::start_time::format_ms(
+        st.ms, pace_forge::api::start_time::default_tz_offset_min()));
+    println!("结束 {}", pace_forge::api::start_time::format_ms(
+        st.stop_ms(dur_s), pace_forge::api::start_time::default_tz_offset_min()));
+    if st.clamped {
+        println!("注意：原时刻会让结束时间落在未来，已自动提前");
+    }
+}
+
+fn do_at(hhmm: &str, days: i64, dist_km: f64, dur_min: f64, yes: bool) {
+    use pace_forge::api::start_time as st_mod;
+    let (h, m) = match st_mod::parse_hhmm(hhmm) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let now = pace_forge::crypto::envelope::now_ms() as i64;
+    let dur_s = (dur_min * 60.0).round() as i64;
+    let st = match st_mod::specified(now, days, h, m, dur_s) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    show_plan(st, dur_min);
+    run_with_start(dist_km, dur_min, Some(st.ms), yes);
+}
+
+fn do_ago(mins: i64, dist_km: f64, dur_min: f64, yes: bool) {
+    use pace_forge::api::start_time as st_mod;
+    let now = pace_forge::crypto::envelope::now_ms() as i64;
+    let dur_s = (dur_min * 60.0).round() as i64;
+    let st = match st_mod::ago(now, mins, dur_s) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    show_plan(st, dur_min);
+    run_with_start(dist_km, dur_min, Some(st.ms), yes);
+}
+
+fn do_rand(days: i64, dist_km: f64, dur_min: f64, yes: bool) {
+    use pace_forge::api::start_time as st_mod;
+    use rand::Rng;
+    let now = pace_forge::crypto::envelope::now_ms() as i64;
+    let dur_s = (dur_min * 60.0).round() as i64;
+    let r: f64 = rand::thread_rng().gen();
+    let st = match st_mod::random_in_day(now, days, dur_s, r) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    show_plan(st, dur_min);
+    run_with_start(dist_km, dur_min, Some(st.ms), yes);
 }

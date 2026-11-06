@@ -191,6 +191,15 @@ button.danger:disabled{opacity:.5}
       <label>距离 km<input id="rDist" type="number" value="2.0" step="0.1" min="0.5" max="21"></label>
       <label>时长 分<input id="rDur" type="number" value="12" step="1" min="3" max="180"></label>
       <label>步数<input id="rSteps" type="number" value="2300" step="10" min="100" placeholder="留空则由模型推算"></label>
+      <label>何时跑<select id="rWhen">
+        <option value="now">现在</option>
+        <option value="at">指定时刻</option>
+        <option value="ago">N 分钟前</option>
+        <option value="rand">当天随机</option>
+      </select></label>
+      <label id="wrapAt" style="display:none">时刻<input id="rAt" type="time" value="07:30"></label>
+      <label id="wrapDays" style="display:none">几天前<input id="rDays" type="number" min="0" max="3" value="0" style="width:70px"></label>
+      <label id="wrapAgo" style="display:none">分钟前<input id="rAgo" type="number" min="1" max="5760" value="60" style="width:80px"></label>
       <button id="planBtn">生成轨迹</button>
       <button id="runBtn" class="danger">真的跑（提交）</button>
     </div>
@@ -275,6 +284,8 @@ $('rMode').onchange = () => {
 };
 
 $('planBtn').onclick = async () => {
+  let st = null;
+  try { st = await resolveStartAt(); } catch (e) { if (e.message !== '已取消') setOut(e.message, true); return; }
   const dist = parseFloat($('rDist').value);
   const dur = parseFloat($('rDur').value);
   const stepsRaw = $('rSteps').value.trim();
@@ -292,7 +303,8 @@ $('planBtn').onclick = async () => {
         distance: dist, duration: dur,
         steps: (Number.isFinite(steps) && steps > 0) ? steps : 0,
         mode: $('rMode').value, lane: parseInt($('rLane').value, 10) || 1,
-        runMode: parseInt($('rRunMode').value, 10) || 1
+        runMode: parseInt($('rRunMode').value, 10) || 1,
+        startAtMs: (st ? st.startMs : undefined)
       })
     });
     setOut('');
@@ -384,7 +396,10 @@ $('runBtn').onclick = async () => {
   if (!(dist > 0) || !(dur > 0)) return setOut('距离和时长要填正数', true);
   const mode = parseInt($('rRunMode').value, 10) || 1;
   const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
-  if (!confirm(`确认提交 ${modeName}：${dist} km / ${dur} 分钟？\n\n提交后 10 分钟内不能再跑。`)) return;
+  let st = null;
+  try { st = await resolveStartAt(); } catch (e) { if (e.message !== '已取消') setOut(e.message, true); return; }
+  const when = st ? `${st.startText} ~ ${st.stopText}` : '现在开始';
+  if (!confirm(`确认提交 ${modeName}：${dist} km / ${dur} 分钟？\n时间：${when}\n\n提交后 10 分钟内不能再跑。`)) return;
 
   const btn = $('runBtn');
   btn.disabled = true;
@@ -398,7 +413,8 @@ $('runBtn').onclick = async () => {
         runMode: mode,
         sportType: 1,
         mode: $('rMode').value,
-        lane: parseInt($('rLane').value, 10) || 1
+        lane: parseInt($('rLane').value, 10) || 1,
+        startAtMs: (st ? st.startMs : undefined)
       })
     });
     setOut('');
@@ -531,6 +547,37 @@ async function accountAction(act, id) {
   }
 }
 
+/* ---------- 何时跑 ---------- */
+$('rWhen').onchange = () => {
+  const v = $('rWhen').value;
+  $('wrapAt').style.display   = (v === 'at') ? '' : 'none';
+  $('wrapDays').style.display = (v === 'at' || v === 'rand') ? '' : 'none';
+  $('wrapAgo').style.display  = (v === 'ago') ? '' : 'none';
+};
+
+/** 问后端要补跑时刻。返回 {startMs, startText, stopText, clamped} 或 null（现在跑）。 */
+async function resolveStartAt() {
+  const mode = $('rWhen').value;
+  if (mode === 'now') return null;
+  const dur = Math.round(parseFloat($('rDur').value) * 60) || 720;
+  const qs = new URLSearchParams({ mode, dur: String(dur) });
+  if (mode === 'at') {
+    qs.set('hhmm', $('rAt').value || '07:30');
+    qs.set('days', $('rDays').value || '0');
+  } else if (mode === 'ago') {
+    qs.set('minutes', $('rAgo').value || '60');
+  } else if (mode === 'rand') {
+    qs.set('days', $('rDays').value || '0');
+  }
+  const r = await api('/api/starttimes?' + qs.toString());
+  if (r.clamped) {
+    if (!confirm(`你选的时间会让结束时刻落在未来。\n\n已自动提前到：${r.startText}\n结束：${r.stopText}\n\n继续？`)) {
+      throw new Error('已取消');
+    }
+  }
+  return r;
+}
+
 $('accAdd').onclick = async () => {
   const u = $('accUser').value.trim();
   const p = $('accPass').value;
@@ -588,7 +635,10 @@ $('accBatch').onclick = async () => {
   const mode = parseInt($('rRunMode').value, 10) || 1;
   const modeName = {1: '记分跑', 2: '户外跑', 3: '室外锻炼'}[mode];
   if (!(dist > 0) || !(dur > 0)) { $('accMsg').textContent = '先在上面的表单填好距离和时长'; return; }
-  if (!confirm(`所有已登录账号都跑 ${dist} km / ${dur} 分钟（${modeName}）？\n\n账号之间间隔 8 秒，避免同 IP 高频。`)) return;
+  let st = null;
+  try { st = await resolveStartAt(); } catch (e) { if (e.message !== '已取消') return; }
+  const when = st ? `${st.startText} ~ ${st.stopText}` : '现在开始';
+  if (!confirm(`所有已登录账号都跑 ${dist} km / ${dur} 分钟（${modeName}）？\n时间：${when}\n\n账号之间间隔 8 秒，避免同 IP 高频。`)) return;
 
   const m = $('accMsg');
   const btn = $('accBatch');
@@ -601,7 +651,8 @@ $('accBatch').onclick = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         distance: dist, duration: dur, runMode: mode,
-        sportType: 1, gapMs: 8000
+        sportType: 1, gapMs: 8000,
+        startAtMs: (st ? st.startMs : undefined)
       })
     });
     const lines = (r.results || []).map(x => {

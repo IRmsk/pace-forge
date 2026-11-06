@@ -50,6 +50,11 @@ pub struct RunParams {
     pub seed: u64,
     /// 采样间距（米）。
     pub sample_step_m: f64,
+    /// 指定开始时刻（毫秒戳）。`None` 表示现在开跑。
+    ///
+    /// 补跑时由 `start_time` 模块算好传进来——那边已经保证了
+    /// 「开始 + 用时 + 抖动余量 ≤ 现在」，所以这里不再二次校验。
+    pub start_at_ms: Option<i64>,
 }
 
 impl Default for RunParams {
@@ -64,6 +69,7 @@ impl Default for RunParams {
             steps: None,
             seed: 0,
             sample_step_m: 5.0,
+            start_at_ms: None,
         }
     }
 }
@@ -100,13 +106,20 @@ pub struct RunOutcome {
 ///
 /// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
 pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, String> {
-    // 起点加 0~4 秒随机偏移：每次都整秒开始太规律
-    let jitter_ms = {
-        use rand::Rng;
-        let mut r = rand::thread_rng();
-        r.gen_range(0..5_000i64)
+    let start_ms = match p.start_at_ms {
+        // 补跑：时间是外部算好的，直接用它，但照样加抖动让秒数不整齐
+        Some(t) => {
+            use rand::Rng;
+            let mut r = rand::thread_rng();
+            t + r.gen_range(0..4_000i64)
+        }
+        // 现在开跑：加 0~4 秒偏移，每次都整秒开始太规律
+        None => {
+            use rand::Rng;
+            let mut r = rand::thread_rng();
+            crate::crypto::envelope::now_ms() as i64 + r.gen_range(0..5_000i64)
+        }
     };
-    let start_ms = crate::crypto::envelope::now_ms() as i64 + jitter_ms;
 
     // ⓿ 学期进度：记分跑要先知道还差多少
     if p.run_mode == 1 {
