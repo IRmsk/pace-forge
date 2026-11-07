@@ -187,7 +187,7 @@ pub fn build(
     params: &SubmitParams,
     points: &[TrackPoint],
     fixed: &[FixedPoint],
-    jitter: &[f64],
+    sim: &crate::track::SimResult,
 ) -> Result<Submission, String> {
     if points.is_empty() {
         return Err("轨迹为空，无法组装报文".into());
@@ -210,13 +210,14 @@ pub fn build(
     // 轨迹点带瞬时速度（中心差分），服务端画图会用到
     let pts: Vec<(f64, f64, i64)> =
         points.iter().map(|p| (p.lat, p.lon, p.time_ms)).collect();
-    let sb = speed_buckets(&pts, params.start_time_ms, params.total_time_sec);
-    let stb: Vec<StepBucket> = step_buckets(
-        params.start_time_ms,
-        params.total_time_sec,
-        params.total_steps,
-        jitter,
-    );
+    // 单一数据源：直接用 simulate() 产出的桶。
+    //
+    // 之前这里拿 make_jitter(amp=1.0) **重新生成**了一套桶写进报文，而自检
+    // 校验的是 sim.step_buckets、OBS 明细传的也是 sim.step_buckets——
+    // 自检守 A、提交发 B、明细传 A，反检测设计整个落空。
+    // amp=1.0 还是 ±100% 的均匀抖动，会造出 0 步桶（10 秒静止）。
+    let sb: Vec<crate::track::SpeedBucket> = sim.speed_buckets.clone();
+    let stb: Vec<crate::track::StepBucket> = sim.step_buckets.clone();
 
     // 逐点生成，累计量必须顺序推进
     let mut prev = points.first().map(|p| (p.lat, p.lon)).unwrap_or((0.0, 0.0));
@@ -360,6 +361,46 @@ pub fn build(
 mod tests {
     use super::*;
 
+    /// 给旧测试造一份 sim，桶用确定值（不依赖 OU 随机）。
+    pub(super) fn test_sim(p: &SubmitParams, pts: &[TrackPoint]) -> crate::track::SimResult {
+        let _ = p;
+        let n = (p.total_time_sec / 10).max(1) as usize;
+        let per = (p.total_steps.max(0) as f64 / n as f64).ceil() as i32;
+        crate::track::SimResult {
+            speeds: vec![2.8; pts.len().max(1)],
+            cadences: vec![160.0; pts.len().max(1)],
+            strides: vec![1.05; pts.len().max(1)],
+            total_steps: p.total_steps,
+            avg_cadence: 160.0,
+            speed_buckets: (0..n)
+                .map(|i| crate::track::SpeedBucket {
+                    distance: 28.0,
+                    begin_time: p.start_time_ms + i as i64 * 10_000,
+                    end_time: p.start_time_ms + (i as i64 + 1) * 10_000,
+                    flag: p.start_time_ms,
+                    id: 60_000 + i as i64,
+                    state: 0,
+                    queue_num: i as i32,
+                })
+                .collect(),
+            step_buckets: (0..n)
+                .map(|i| crate::track::StepBucket {
+                    steps_num: per,
+                    begin_time: p.start_time_ms + i as i64 * 10_000,
+                    end_time: p.start_time_ms + (i as i64 + 1) * 10_000,
+                    flag: p.start_time_ms,
+                    id: 60_000 + i as i64,
+                    max_diff: 2,
+                    min_diff: 0,
+                    avg_diff: 1,
+                    state: 0,
+                    queue_num: i as i32,
+                })
+                .collect(),
+            actual_length_m: p.total_distance_m as f64,
+        }
+    }
+
     fn params() -> SubmitParams {
         SubmitParams {
             uid: "123456".into(),
@@ -408,8 +449,8 @@ mod tests {
 
     #[test]
     fn payload_has_all_required_fields() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         let v = &sub.save_record;
         for k in [
             "allLocJson", "fivePointJson", "speedPerTenSec", "stepsPerTenSec",
@@ -422,8 +463,8 @@ mod tests {
 
     #[test]
     fn nested_json_is_double_serialized() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         let v = &sub.save_record;
         // allLocJson 是字符串化的 JSON（双重序列化）
         assert!(v["allLocJson"].is_string(), "allLocJson 应为字符串");
@@ -445,8 +486,8 @@ mod tests {
     /// 差一个字母，服务端直接回 10501 验证签名失败。
     #[test]
     fn sign_bool_is_lowercase() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         let orig = sub.save_record["originalSign"].as_str().unwrap();
         assert!(
             !orig.contains("=True") && !orig.contains("=False"),
@@ -458,8 +499,8 @@ mod tests {
 
     #[test]
     fn signature_is_32_hex() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         let sig = sub.save_record["signature"].as_str().unwrap();
         assert_eq!(sig.len(), 32);
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
@@ -467,24 +508,24 @@ mod tests {
 
     #[test]
     fn complete_flag_follows_targets() {
-        let j = vec![0.0; 72];
+        let sim = test_sim(&params(), &points());
         // 达标
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         assert_eq!(sub.save_record["complete"], true);
         assert_eq!(sub.save_record["unCompleteReason"], 0);
 
         // 不达标
         let mut p = params();
         p.sel_distance_m = 5000;
-        let sub2 = build(&p, &points(), &[], &j).unwrap();
+        let sub2 = build(&p, &points(), &[], &sim).unwrap();
         assert_eq!(sub2.save_record["complete"], false);
         assert_eq!(sub2.save_record["unCompleteReason"], 10);
     }
 
     #[test]
     fn buckets_match_duration() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         let sb = sub.save_record["speedPerTenSec"]
             .as_array()
             .expect("speedPerTenSec 应为数组");
@@ -497,8 +538,8 @@ mod tests {
 
     #[test]
     fn object_key_shape() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         // 详情页 key：run_data/{YYYYMMDDHH}/{uuid}.json
         assert!(sub.object_key.starts_with("run_data/"), "{}", sub.object_key);
         assert!(sub.object_key.ends_with(".json"), "{}", sub.object_key);
@@ -507,8 +548,8 @@ mod tests {
 
     #[test]
     fn submit_buckets_use_60000_ids() {
-        let j = vec![0.0; 72];
-        let sub = build(&params(), &points(), &[], &j).unwrap();
+        let sim = test_sim(&params(), &points());
+        let sub = build(&params(), &points(), &[], &sim).unwrap();
         let sp = &sub.save_record["speedPerTenSec"];
         let arr = sp.as_array().expect("speedPerTenSec 应该是数组");
         assert!(!arr.is_empty());
@@ -525,8 +566,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_track() {
-        let j = vec![0.0];
-        assert!(build(&params(), &[], &[], &j).is_err());
+        assert!(build(&params(), &[], &[], &test_sim(&params(), &[])).is_err());
     }
 }
 
@@ -579,6 +619,7 @@ pub fn extract_record_id(data: &Value) -> Option<i64> {
 
 #[cfg(test)]
 mod point_shape_tests {
+    use super::tests::test_sim;
     use super::*;
 
     fn params() -> SubmitParams {
@@ -612,9 +653,9 @@ mod point_shape_tests {
             tp(31.2306, 121.4741, 1_790_000_005_000),
             tp(31.2309, 121.4745, 1_790_000_010_000),
         ];
-        let j = vec![0.0; 3];
         let params = params();
-        let sub = build(&params, &pts, &[], &j).unwrap();
+        let sim = test_sim(&params, &pts);
+        let sub = build(&params, &pts, &[], &sim).unwrap();
         let s = sub.save_record["allLocJson"].as_str().unwrap();
         let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
         assert_eq!(arr.len(), 3);
@@ -657,8 +698,9 @@ mod point_shape_tests {
         let pts: Vec<TrackPoint> = (0..n)
             .map(|i| tp(31.2304 + i as f64 * 1e-5, 121.4737, 1_790_000_000_000 + i as i64 * 5000))
             .collect();
-        let j = vec![0.0; n];
-        let sub = build(&params(), &pts, &[], &j).unwrap();
+        let p0 = params();
+        let sim = test_sim(&p0, &pts);
+        let sub = build(&p0, &pts, &[], &sim).unwrap();
         let arr: Vec<serde_json::Value> =
             serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
 
@@ -670,5 +712,108 @@ mod point_shape_tests {
         assert!(types.len() >= 2, "点位类型要有变化，实际 {types:?}");
         // 不该出现异常点 -1（那是 GPS 失效，故意不生成）
         assert!(!types.contains(&-1), "不生成异常点");
+    }
+}
+
+#[cfg(test)]
+mod single_source_tests {
+    use super::tests::test_sim;
+    use super::*;
+    use crate::track::TrackPoint;
+
+    fn params() -> SubmitParams {
+        SubmitParams {
+            uid: "1".into(),
+            unid: "1".into(),
+            uuid: "00000000-0000-4000-8000-000000000000".into(),
+            sport_type: 1,
+            total_distance_m: 2000,
+            total_time_sec: 720,
+            total_steps: 1800,
+            start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_720_000,
+            sel_distance_m: 2000,
+            sel_run_time_sec: 720,
+            policy: "0".into(),
+            run_area_id: 0,
+            geo_fences_json: "[]".into(),
+            total_ascent: 0,
+        }
+    }
+
+    fn track() -> Vec<TrackPoint> {
+        let n = 400;
+        (0..n)
+            .map(|i| TrackPoint {
+                lat: 31.2304 + i as f64 * 5.0 / 111_320.0,
+                lon: 121.4737,
+                time_ms: 1_790_000_000_000 + i as i64 * 1800,
+            })
+            .collect()
+    }
+
+    /// 报文里的分桶必须和 simulate() 产出的**逐项相等**。
+    ///
+    /// 这是全项目最关键的一条不变量。之前 build() 里拿 make_jitter(amp=1.0)
+    /// 重新生成了一套桶写进报文，而自检校验的是 sim.step_buckets、OBS 明细
+    /// 传的也是 sim.step_buckets——自检守 A、提交发 B、明细传 A，
+    /// 所有反检测设计都作用在了发不出去的那份数据上。
+    #[test]
+    fn payload_buckets_equal_sim_buckets() {
+        let p = params();
+        let t = track();
+        let sim = test_sim(&p, &t);
+
+        let sub = build(&p, &t, &[], &sim).expect("build");
+        let body = &sub.save_record;
+
+        // 报文里是数组（不是字符串化的 JSON）
+        let sent_steps = body["stepsPerTenSec"]
+            .as_array()
+            .expect("stepsPerTenSec 必须是数组");
+        assert_eq!(
+            sent_steps.len(),
+            sim.step_buckets.len(),
+            "桶数不一致：报文 {} vs sim {}",
+            sent_steps.len(),
+            sim.step_buckets.len()
+        );
+        for (i, (sent, want)) in sent_steps.iter().zip(sim.step_buckets.iter()).enumerate() {
+            let v = sent
+                .get("stepsNum")
+                .or_else(|| sent.get("steps"))
+                .and_then(|x| x.as_i64());
+            if let Some(v) = v {
+                assert_eq!(
+                    v, want.steps_num as i64,
+                    "第 {i} 桶步数不一致：报文 {v} vs sim {}",
+                    want.steps_num
+                );
+            }
+        }
+
+        // 速度桶同理
+        let sent_speed = body["speedPerTenSec"]
+            .as_array()
+            .expect("speedPerTenSec 必须是数组");
+        assert_eq!(sent_speed.len(), sim.speed_buckets.len());
+    }
+
+    /// 报文里不许出现 0 步的桶——10 秒 0 步等于静止，服务端判断点。
+    #[test]
+    fn payload_has_no_empty_step_bucket() {
+        let p = params();
+        let t = track();
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).expect("build");
+        let sent = sub.save_record["stepsPerTenSec"].as_array().unwrap();
+        for (i, b) in sent.iter().enumerate() {
+            let v = b
+                .get("stepsNum")
+                .or_else(|| b.get("steps"))
+                .and_then(|x| x.as_i64())
+                .unwrap_or(-1);
+            assert!(v > 0, "第 {i} 桶步数是 {v}，会出现静止断点");
+        }
     }
 }

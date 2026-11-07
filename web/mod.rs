@@ -562,7 +562,10 @@ fn handle_plan(
     let report = crate::track::inspect(&check);
 
     // ── 报文 ──
-    let jitter: Vec<f64> = vec![1.0; sim.step_buckets.len().max(1)];
+    //
+    // 这里原来把 jitter 写死成 vec![1.0; n] 再交给 build，结果所有桶权重
+    // 相同，步数退化成常数序列（一阶自相关 ≈ 0），正是 README 说「一眼假」
+    // 的那种机器指纹。现在 build 直接取 sim 的桶，不再吃 jitter。
     let params = crate::api::submit::SubmitParams {
         uid: "preview".into(),
         unid: "0".into(),
@@ -581,7 +584,7 @@ fn handle_plan(
         total_ascent: 0,
     };
 
-    let sub = match crate::api::submit::build(&params, &track_points, &[], &jitter) {
+    let sub = match crate::api::submit::build(&params, &track_points, &[], &sim) {
         Ok(s) => s,
         Err(e) => return json_err(request, &format!("报文组装失败: {e}")),
     };

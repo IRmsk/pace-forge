@@ -539,11 +539,9 @@ pub fn run_full(
         total_ascent: 0,
     };
 
-    let bucket_count = (p.duration_sec / 10).max(1) as usize;
-    // 用实际种子，否则每次抖动完全一样
-    let real_seed = if p.seed != 0 { p.seed } else { start_ms as u64 };
-    let jitter = crate::track::buckets::make_jitter(bucket_count, 1.0, real_seed);
-    let submission = super::submit::build(&params, &out.track, &fixed, &jitter)?;
+    // 报文的桶必须来自 sim，不能在这里重新生成——否则自检、提交、明细
+    // 三处数据不一致（见 submit::build 的注释）。
+    let submission = super::submit::build(&params, &out.track, &fixed, &out.sim)?;
 
     // 7.4.01 已移除 BODY_SENSORS，报文里不许出现心率字段
     let mut body = submission.save_record.clone();
