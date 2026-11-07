@@ -395,6 +395,24 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     ));
 
     // ⑤ retime
+    //
+    // 速度上下界由**服务端策略**的配速区间反推，不再硬编码 1.0~8.0。
+    // 8.0 m/s = 2:05 配速，学生账号规则通常只给到 3~10 分/公里，
+    // 硬编码会生成超出区间的配速，自检却因为 pace_range=None 报通过。
+    let (v_floor, v_ceil) = match pol.pace_range {
+        Some((a, b)) => {
+            // 分/公里 → m/s；配速越小越快
+            let fast = a.min(b).max(0.1);
+            let slow = a.max(b).max(fast + 0.01);
+            let hi = 1000.0 / (fast * 60.0);
+            let lo = 1000.0 / (slow * 60.0);
+            log(&format!(
+                "[policy] 配速区间 {fast:.1}~{slow:.1} 分/km → 速度 {lo:.2}~{hi:.2} m/s"
+            ));
+            (lo.clamp(0.5, 10.0), hi.clamp(0.5, 10.0))
+        }
+        None => (1.0, 8.0),
+    };
     let xy: Vec<(f64, f64)> = track.points.iter().map(|q| (q.lat, q.lon)).collect();
     let (times, _speeds, real_len) = retime(
         &xy,
@@ -402,8 +420,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         start_ms,
         start_ms as u64,
         &KinParams::default(),
-        1.0,
-        8.0,
+        v_floor,
+        v_ceil,
     );
     if times.len() != xy.len() {
         return Err("时间戳生成失败".into());
@@ -458,7 +476,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         total_steps: sim.total_steps,
         start_time_ms: start_ms,
         stop_time_ms: start_ms + p.duration_sec * 1000,
-        pace_range: None,
+        pace_range: pol.pace_range,
     };
     let report = inspect(&check);
     if report.blocked() {

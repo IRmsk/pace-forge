@@ -30,6 +30,12 @@ pub struct PolicyInfo {
     pub valid_time: i64,
     /// 必经点（BD-09）。
     pub must_points: Vec<(f64, f64)>,
+    /// 允许的配速区间（分/公里，小=快）。服务端 `speedTop`/`speedBottom`。
+    ///
+    /// 之前这两个值被 `let _ =` 直接丢掉，导致 retime 用硬编码 1.0~8.0 m/s
+    /// （相当于 2:05~16:40 配速），preflight 的配速检查因为拿到 None 永远
+    /// 不执行——自检报「全部通过」，发出去却是 2 分速，必驳回。
+    pub pace_range: Option<(f64, f64)>,
 }
 
 /// 从 policy 响应里取字段，兼容 `data` 包一层和直接平铺两种情况。
@@ -55,9 +61,9 @@ pub fn parse_policy_response(biz: &Value) -> Result<PolicyInfo, String> {
         .and_then(|t| t.as_i64())
         .unwrap_or(1000);
     let valid_time = rule.get("validTime").and_then(|t| t.as_i64()).unwrap_or(0);
-    // 规则里也可能出现配速区间，一并带出来
-    let _ = rule.get("speedTop");
-    let _ = rule.get("speedBottom");
+    // 配速区间：speedTop/speedBottom 的单位是「分/公里」。
+    // 个别策略把它们放成秒或 m/s，按数量级判断：正常的分钟配速在 2~20 之间。
+    let pace_range = parse_pace_range(&rule);
 
     Ok(PolicyInfo {
         timestamp,
@@ -65,7 +71,41 @@ pub fn parse_policy_response(biz: &Value) -> Result<PolicyInfo, String> {
         min_distance,
         valid_time,
         must_points: extract_must_points(biz),
+        pace_range,
     })
+}
+
+/// 从规则里取配速区间，统一换算成「分/公里」。
+///
+/// 单位有三种可能：分/公里（常见，2~20）、秒/公里（120~1200）、m/s（1~10）。
+/// 按数值量级判定，避免把 6.0 分/km 当成 6 m/s 用。
+fn parse_pace_range(rule: &Value) -> Option<(f64, f64)> {
+    let top = rule.get("speedTop").and_then(num_of);
+    let bottom = rule.get("speedBottom").and_then(num_of);
+    let (a, b) = (top?, bottom?);
+    if a <= 0.0 || b <= 0.0 {
+        return None;
+    }
+    let to_min_per_km = |v: f64| -> f64 {
+        if v < 25.0 {
+            // 分/公里 或 m/s：4.0 分/km ≈ 4.17 m/s，两者数量级接近，
+            // 但配速不会低于 2 分/km（=30 km/h），所以 <25 一律当分/公里
+            v
+        } else if v < 1500.0 {
+            // 秒/公里
+            v / 60.0
+        } else {
+            // m/s → 分/公里
+            1000.0 / v / 60.0
+        }
+    };
+    Some((to_min_per_km(a), to_min_per_km(b)))
+}
+
+fn num_of(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|x| x as f64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 /// 从响应里防御式提取必经点。
@@ -209,5 +249,96 @@ mod tests {
     #[test]
     fn missing_timestamp_is_error() {
         assert!(parse_policy_response(&json!({"policy": 1})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pace_range_tests {
+    use super::*;
+
+    fn rule(top: Value, bottom: Value) -> Value {
+        serde_json::json!({"speedTop": top, "speedBottom": bottom})
+    }
+
+    #[test]
+    fn parses_minutes_per_km() {
+        // 学生账号常见写法：3~10 分/公里
+        let r = parse_pace_range(&rule(serde_json::json!(3.0), serde_json::json!(10.0)));
+        assert_eq!(r, Some((3.0, 10.0)));
+    }
+
+    #[test]
+    fn parses_seconds_per_km() {
+        // 180 秒 = 3 分，600 秒 = 10 分
+        let r = parse_pace_range(&rule(serde_json::json!(180), serde_json::json!(600)));
+        assert_eq!(r, Some((3.0, 10.0)));
+    }
+
+    #[test]
+    fn accepts_string_numbers() {
+        let r = parse_pace_range(&rule(
+            serde_json::json!("4.5"),
+            serde_json::json!("9.0"),
+        ));
+        assert_eq!(r, Some((4.5, 9.0)));
+    }
+
+    #[test]
+    fn missing_or_zero_is_none() {
+        assert_eq!(parse_pace_range(&rule(Value::Null, Value::Null)), None);
+        assert_eq!(
+            parse_pace_range(&rule(serde_json::json!(0), serde_json::json!(10))),
+            None
+        );
+        assert_eq!(parse_pace_range(&serde_json::json!({})), None);
+    }
+
+    /// 配速区间必须驱动 preflight 的 PACE_OUT 检查——之前它是 None，永远不跑。
+    #[test]
+    fn pace_out_of_range_is_fatal() {
+        // 必须给真实轨迹点：points 为空时 inspect 会提前 return，
+        // 后面的配速检查根本不跑（这也是它一直「通过」的原因之一）。
+        let pts: Vec<crate::track::TrackPoint> = (0..200)
+            .map(|i| crate::track::TrackPoint {
+                lat: 31.2304 + i as f64 * 10.0 / 111_320.0,
+                lon: 121.4737,
+                time_ms: 1_790_000_000_000 + i as i64 * 4000,
+            })
+            .collect();
+        // 2000m / 800s = 2.5 m/s = 6.67 分/km
+        let mut c = crate::track::Check {
+            points: &pts,
+            sim: &crate::track::SimResult {
+                speeds: vec![],
+                cadences: vec![],
+                strides: vec![],
+                total_steps: 1600,
+                avg_cadence: 160.0,
+                speed_buckets: vec![],
+                step_buckets: vec![],
+                actual_length_m: 2000.0,
+            },
+            params: &crate::track::SimParams::default(),
+            checkpoints: &[],
+            total_distance_m: 2000,
+            total_time_sec: 800,
+            total_steps: 1600,
+            start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_800_000,
+            pace_range: Some((3.0, 5.0)),
+        };
+        let r = crate::track::inspect(&c);
+        let has = r
+            .issues
+            .iter()
+            .any(|i| i.code == "PACE_OUT");
+        assert!(has, "6.67 分/km 超出 3~5 区间，必须报 PACE_OUT");
+
+        c.pace_range = Some((6.0, 8.0));
+        let r2 = crate::track::inspect(&c);
+        assert!(
+            !r2.issues.iter().any(|i| i.code == "PACE_OUT"),
+            "区间放宽到 6~8 后不该再报"
+        );
     }
 }
