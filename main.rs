@@ -52,6 +52,7 @@ fn main() {
             }
         }
         "semester" => show_semester(),
+        "logout" => do_logout(),
         "check" => {
             let dist_km = parse_num(&args, 1, 2.0, "距离(km)");
             let dur_min = parse_num(&args, 2, 12.0, "时长(min)");
@@ -294,6 +295,44 @@ fn local_check(dist_km: f64, dur_min: f64) {
         let mn = caps.iter().cloned().fold(f64::MAX, f64::min);
         let avg = caps.iter().sum::<f64>() / caps.len() as f64;
         println!("  分桶        {} 个，{:.1}~{:.1} m（均值 {:.1}）", caps.len(), mn, mx, avg);
+    }
+}
+
+/// 通知服务端注销当前账号，成功后清掉本地 token。
+///
+/// 只删本地 session 不等于退出登录——服务端的 token 仍然有效，
+/// 换台设备照样能用。这里真的打一次 logout 接口。
+fn do_logout() {
+    let book = pace_forge::api::accounts::load();
+    let acc = match book.accounts.first() {
+        Some(a) => a.clone(),
+        None => {
+            eprintln!("本地没有账号记录，无需注销");
+            return;
+        }
+    };
+    let mut client =
+        pace_forge::api::client::Client::new(pace_forge::api::client::DeviceProfile::default())
+            .with_credentials(pace_forge::api::client::Credentials {
+                token: Some(acc.token.clone()),
+                uid: Some(acc.uid.clone()),
+                unid: Some(acc.unid.clone()),
+            });
+
+    match pace_forge::api::login::logout(&mut client) {
+        Ok(true) => println!("✅ 服务端已注销 {}", acc.username),
+        Ok(false) => println!("服务端没有返回明确的注销结果，可能是 token 已失效"),
+        Err(e) => {
+            eprintln!("注销请求失败: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // 本地也要清，否则下次还会带着这枚已经作废的 token 去请求
+    if let Err(e) = pace_forge::api::accounts::clear_tokens() {
+        eprintln!("本地 token 清理失败: {e}");
+    } else {
+        println!("本地 token 已清除");
     }
 }
 

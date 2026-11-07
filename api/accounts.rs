@@ -125,7 +125,24 @@ impl Book {
     }
 
     /// 已登录且启用的账号。
-    pub fn ready(&self) -> Vec<&Account> {
+        /// 把本地所有账号的 token 清空，保留用户名/学校等信息。
+    ///
+    /// 服务端注销成功后必须调，否则本地还留着已经作废的 token，
+    /// 下次请求会拿着它去撞服务端，表现成一堆莫名其妙的鉴权失败。
+    pub fn clear_tokens(&mut self) -> usize {
+        let mut n = 0;
+        for acc in &mut self.accounts {
+            if !acc.token.is_empty() {
+                acc.token.clear();
+                acc.uid.clear();
+                acc.unid.clear();
+                n += 1;
+            }
+        }
+        n
+    }
+
+pub fn ready(&self) -> Vec<&Account> {
         self.accounts
             .iter()
             .filter(|a| a.enabled && a.logged_in())
@@ -245,6 +262,14 @@ pub fn save(book: &Book) -> Result<(), String> {
     }
     std::fs::rename(&tmp, &p).map_err(|e| format!("替换账号库失败: {e}"))?;
     Ok(())
+}
+
+/// 清掉本地所有账号的 token 并落盘。
+pub fn clear_tokens() -> Result<usize, String> {
+    let mut book = load();
+    let n = book.clear_tokens();
+    save(&book)?;
+    Ok(n)
 }
 
 #[cfg(test)]
