@@ -404,11 +404,17 @@ pub fn retime(
     }
     let wsum: f64 = w.iter().sum();
     let dts_ms: Vec<i64> = if wsum > 0.0 {
-        // 每段至少 1ms，剩余按权重分
-        let usable = (want_total - (n as i64 - 1)).max(0) as f64;
+        // 每段至少 1 秒，不是 1ms。
+        //
+        // 报文的 totalTime 字段单位是**秒**（`(time_ms - start_ms) / 1000`），
+        // 毫秒精度在报文里必然丢失。原来每段只保证 ≥1ms，慢速段落在同一秒
+        // 里 → 反解后时间戳重复 → 自检 TRACK_TIME_ORDER 致命、服务端也会
+        // 看到 0 时长段。这里直接按秒对齐。
+        let min_seg = 1000i64;
+        let usable = (want_total - (n as i64 - 1) * min_seg).max(0) as f64;
         let raw: Vec<f64> = w.iter().map(|x| usable * x / wsum).collect();
         let mut base: Vec<i64> = raw.iter().map(|x| x.floor().max(0.0) as i64).collect();
-        let mut need = (want_total - (n as i64 - 1)) - base.iter().sum::<i64>();
+        let mut need = usable as i64 - base.iter().sum::<i64>();
         if need > 0 {
             let mut rem: Vec<(f64, usize)> = raw
                 .iter()
@@ -424,9 +430,11 @@ pub fn retime(
                 need -= 1;
             }
         }
-        base.iter().map(|x| x + 1).collect()
+        base.iter().map(|x| x + min_seg).collect()
     } else {
-        vec![1; n - 1]
+        // 无权重时均分，同样保证每段 ≥1 秒
+        let each = (want_total / (n as i64 - 1)).max(1000);
+        vec![each; n - 1]
     };
 
     let mut times = Vec::with_capacity(n);
@@ -577,5 +585,48 @@ mod tests {
         let mut p = params();
         p.total_sec = 0;
         assert!(simulate(&straight_track(10, 100), &p).is_err());
+    }
+}
+
+#[cfg(test)]
+mod time_precision_tests {
+    use super::*;
+
+    /// 相邻采样点必须至少相隔 1 秒。
+    ///
+    /// 报文 totalTime 单位是秒，不足 1 秒的间隔反解后会把两个点压成同一
+    /// 时刻——自检报 TRACK_TIME_ORDER，服务端看到 0 时长段。
+    #[test]
+    fn segments_are_at_least_one_second() {
+        let n = 273;
+        let pts: Vec<(f64, f64)> = (0..n)
+            .map(|i| (31.2304 + i as f64 * 7.0 / 111_320.0, 121.4737))
+            .collect();
+        let (times, _, _) = retime(&pts, 720, 1_790_000_000_000, 42, &KinParams::default(), 1.39, 8.33);
+        assert_eq!(times.len(), n);
+        for w in times.windows(2) {
+            let dt = w[1] - w[0];
+            assert!(dt >= 1000, "间隔 {dt}ms < 1 秒，报文里会重复");
+        }
+        // 末点不能被推过总时长
+        let span = (times[n - 1] - times[0]) / 1000;
+        assert!(
+            (span - 720).abs() <= 2,
+            "总时长 {span}s 偏离目标 720s"
+        );
+    }
+
+    /// 慢速段也要满足 1 秒下限（这条最容易破）。
+    #[test]
+    fn slow_segments_still_have_one_second() {
+        let n = 400;
+        let pts: Vec<(f64, f64)> = (0..n)
+            .map(|i| (31.2304 + i as f64 * 5.0 / 111_320.0, 121.4737))
+            .collect();
+        // 2 公里跑 40 分钟 = 0.83 m/s，接近下限
+        let (times, _, _) = retime(&pts, 2400, 1_790_000_000_000, 7, &KinParams::default(), 0.5, 2.0);
+        for w in times.windows(2) {
+            assert!(w[1] - w[0] >= 1000, "慢速段间隔不足 1 秒");
+        }
     }
 }

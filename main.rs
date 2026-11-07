@@ -155,7 +155,38 @@ fn dry_run(dist_km: f64, dur_min: f64) {
             unid: Some(sess.unid.clone()),
         });
 
+    // 中心点必须从真实围栏反推。
+    //
+    // CLI 原来走 RunParams::default()，center 是 (0.0, 0.0)——赤道的几内亚湾。
+    // 围栏选择按「最近」兜底，会选中 2677 公里外的学校，再交给
+    // route_through_in_order 就算出 7640 公里、152 万个点的鬼轨迹。
+    let center: Option<(f64, f64)> = match pace_forge::api::fence::fetch_fences(&client) {
+        Ok(fs) if !fs.is_empty() => fs[0].ring.first().map(|_| {
+            let n = fs[0].ring.len() as f64;
+            let s = fs[0]
+                .ring
+                .iter()
+                .fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+            (s.0 / n, s.1 / n)
+        }),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("拉围栏失败: {e}");
+            None
+        }
+    };
+    let (clat, clng) = match center {
+        Some(c) => c,
+        None => {
+            eprintln!("拿不到围栏中心点，无法规划轨迹");
+            std::process::exit(1);
+        }
+    };
+    println!("围栏中心: ({clat:.5}, {clng:.5})");
+
     let p = flow::RunParams {
+        center_lat: clat,
+        center_lng: clng,
         distance_m: dist_km * 1000.0,
         duration_sec: (dur_min * 60.0).round() as i64,
         ..Default::default()
@@ -333,10 +364,30 @@ fn run_with_start(dist_km: f64, dur_min: f64, start_at: Option<i64>, yes: bool) 
             unid: Some(sess.unid.clone()),
         });
 
+    // 中心点同样必须从真实围栏反推，不能用默认的 (0,0)。
+    let (clat, clng) = match pace_forge::api::fence::fetch_fences(&client) {
+        Ok(fs) if !fs.is_empty() && !fs[0].ring.is_empty() => {
+            let n = fs[0].ring.len() as f64;
+            let t = fs[0]
+                .ring
+                .iter()
+                .fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+            (t.0 / n, t.1 / n)
+        }
+        _ => {
+            eprintln!("拿不到围栏中心点，无法规划轨迹");
+            std::process::exit(1);
+        }
+    };
+
     let p = flow::RunParams {
+        center_lat: clat,
+        center_lng: clng,
         distance_m: dist_km * 1000.0,
         duration_sec: (dur_min * 60.0).round() as i64,
         start_at_ms: start_at,
+        // 户外跑没有服务端时间窗口；记分跑(runMode=1)有，脚本跑容易被 11016 挡掉
+        run_mode: 2,
         ..Default::default()
     };
 

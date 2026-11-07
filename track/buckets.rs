@@ -55,25 +55,34 @@ pub struct StepBucket {
 pub fn speed_buckets(points: &[(f64, f64, i64)], start_ms: i64, total_sec: i64) -> Vec<SpeedBucket> {
     let n = (total_sec / 10).max(1) as usize;
     let mut out = Vec::with_capacity(n);
-    let mut cursor = 0usize;
+
+    // 预先算好每段的距离和起止时间，再按与桶区间的**重叠比例**分配。
+    //
+    // 原来是单指针 cursor 跨桶不重置，只在 `points[cursor+1].t >= begin`
+    // 时才累加距离——点如果已经落在桶之前，那一段距离被永久丢弃，
+    // 该桶就成了 0 位移。实测 72 个桶里 17 个是空的，服务端看到的是
+    // 「跑着跑着静止十秒」。
+    let mut segs: Vec<(f64, f64, i64, i64)> = Vec::with_capacity(points.len().saturating_sub(1));
+    for w in points.windows(2) {
+        let d = distance((w[0].0, w[0].1), (w[1].0, w[1].1));
+        segs.push((d, 0.0, w[0].2, w[1].2));
+    }
 
     for i in 0..n {
         let begin = start_ms + i as i64 * 10_000;
         let end = begin + 10_000;
         let mut dist = 0.0f64;
-        // 累加落在 [begin, end) 内的相邻点间距
-        while cursor + 1 < points.len() {
-            let t = points[cursor + 1].2;
-            if t >= end {
-                break;
+        for &(d, _, t0, t1) in &segs {
+            if t1 <= begin || t0 >= end || d <= 0.0 {
+                continue;
             }
-            if t >= begin {
-                dist += distance(
-                    (points[cursor].0, points[cursor].1),
-                    (points[cursor + 1].0, points[cursor + 1].1),
-                );
+            let span = (t1 - t0).max(1) as f64;
+            let lo = t0.max(begin);
+            let hi = t1.min(end);
+            let overlap = (hi - lo).max(0) as f64;
+            if overlap > 0.0 {
+                dist += d * overlap / span;
             }
-            cursor += 1;
         }
         out.push(SpeedBucket {
             distance: (dist * 100.0).round() / 100.0,
@@ -436,5 +445,49 @@ mod diff_not_degenerate_tests {
                 assert!(segs.iter().all(|&s| s >= 0), "不能出现负段");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod speed_bucket_coverage_tests {
+    use super::*;
+
+    /// 各桶位移之和必须等于轨迹总长（重叠比例分配不该丢距离）。
+    #[test]
+    fn bucket_distances_sum_to_total() {
+        // 273 点 / 720 秒，非均匀采样
+        let pts: Vec<(f64, f64, i64)> = (0..273)
+            .map(|i| {
+                let t = 1_790_000_000_000 + i as i64 * 2640;
+                (31.2304 + i as f64 * 7.0 / 111_320.0, 121.4737, t)
+            })
+            .collect();
+        let total: f64 = pts
+            .windows(2)
+            .map(|w| distance((w[0].0, w[0].1), (w[1].0, w[1].1)))
+            .sum();
+        let b = speed_buckets(&pts, 1_790_000_000_000, 720);
+        let sum: f64 = b.iter().map(|x| x.distance).sum();
+        assert!(
+            (sum - total).abs() < total * 0.02,
+            "桶和 {sum:.1}m 与总长 {total:.1}m 差太多"
+        );
+    }
+
+    /// 正常 720 秒轨迹不该出现大量空桶。
+    ///
+    /// 旧实现单指针跨桶不重置，落在桶前的那段距离被丢掉，实测
+    /// 72 个桶里 17 个位移为 0。
+    #[test]
+    fn no_empty_buckets_on_normal_track() {
+        let pts: Vec<(f64, f64, i64)> = (0..273)
+            .map(|i| {
+                let t = 1_790_000_000_000 + i as i64 * 2640;
+                (31.2304 + i as f64 * 7.0 / 111_320.0, 121.4737, t)
+            })
+            .collect();
+        let b = speed_buckets(&pts, 1_790_000_000_000, 720);
+        let empty = b.iter().filter(|x| x.distance < 0.5).count();
+        assert!(empty == 0, "{empty} 个桶位移为 0（共 {} 个）", b.len());
     }
 }

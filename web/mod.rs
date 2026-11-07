@@ -95,6 +95,17 @@ impl State {
             .insert(id.to_string(), make_client(&p.uid, &p.token, &p.unid));
         self.current = Some(id.to_string());
         let _ = crate::api::accounts::save(&self.book);
+        // 同步写一份 session.json，让 CLI 也能直接用（原来只有 Web 有登录态，
+        // CLI 永远报「未登录」）。
+        let mut sess = crate::api::session::Session::default();
+        sess.uid = p.uid.clone();
+        sess.token = p.token.clone();
+        sess.unid = p.unid.clone();
+        sess.name = p.name.clone();
+        sess.campus_name = p.campus_name.clone();
+        sess.depart = p.depart.clone();
+        sess.grade_class = p.grade_class.clone();
+        let _ = crate::api::session::save_session(&sess);
     }
 
     fn persist(&self) {
@@ -1292,12 +1303,17 @@ fn handle_run(
         return json_err(request, "时长需在 0~120 分钟之间（超过服务端必然驳回）");
     }
 
-    let st = state.lock().map_err(|e| e.to_string())?;
-    if !st.logged_in() {
-        return json_err(request, "请先登录");
-    }
-    let Some(client) = st.client() else {
-        return json_err(request, "当前账号没有可用会话，请重新登录");
+    // 先克隆 client 再放锁——后面 fetch_fences 是网络请求，持着 Mutex
+    // 做 IO 会让 /api/accounts 之类的请求全部排队，页面看起来像服务死了。
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
     };
 
     // 中心点：没传就用围栏中心反推
@@ -1334,7 +1350,7 @@ fn handle_run(
     let mut log = move |s: &str| logs2.borrow_mut().push(s.to_string());
     let mut confirm = |_o: &crate::api::flow::RunOutcome| true;
 
-    let result = crate::api::flow::run_full(client, &p, &mut log, &mut confirm);
+    let result = crate::api::flow::run_full(&client, &p, &mut log, &mut confirm);
     drop(log);
 
     match result {

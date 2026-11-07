@@ -571,6 +571,26 @@ pub fn route_through_in_order(
     if want_m <= 0.0 {
         return Err("目标里程必须为正".into());
     }
+    // 硬防护：必经点必须落在这个围栏附近。
+    //
+    // 踩过：CLI 没传中心点，锚点是 (0,0)，围栏兜底选了 2677 公里外的学校，
+    // 这里照样往下算，鼓出量按段长放大，最后生成 7640 公里、152 万个点。
+    for m in must {
+        if !contains(fence, m.0, m.1) {
+            let d = crate::track::geo::distance(*m, fence[0]);
+            if d > 5000.0 {
+                return Err(format!(
+                    "必经点 ({:.5},{:.5}) 距围栏起点 {d:.0}m，不在同一个校区，拒绝规划",
+                    m.0, m.1
+                ));
+            }
+        }
+    }
+    // 目标里程上限：42 公里是项目硬上限
+    if want_m > 42_000.0 {
+        return Err(format!("目标里程 {want_m:.0}m 超过 42000m 上限"));
+    }
+
     let mut rng = seed | 1;
     let mut next = || {
         rng ^= rng << 13;
@@ -612,15 +632,59 @@ pub fn route_through_in_order(
             mid.0 + ny * bulge / mlat,
             mid.1 + nx * bulge / mlng,
         );
+        // 避让：这一段弧不能从「还没轮到」的点位旁边擦过去。
+        //
+        // 真实打卡点里 P1 和 P4 只隔 106m，第一段弧鼓出来就会从 P4 边上过，
+        // 服务端按「按顺序通过所有点位」判定时会认为 P4 提前通过了，
+        // 后面的顺序全乱。检测到就反向弯曲（换另一侧），仍冲突就压平。
+        let later: Vec<(f64, f64)> = must[i + 2..].to_vec();
+        let grazes = |c: (f64, f64)| -> bool {
+            // 沿曲线采样看有没有蹭到后续点位
+            for k in 1..12 {
+                let t = k as f64 / 12.0;
+                let u = 1.0 - t;
+                let q = (
+                    u * u * a.0 + 2.0 * u * t * c.0 + t * t * b.0,
+                    u * u * a.1 + 2.0 * u * t * c.1 + t * t * b.1,
+                );
+                if later.iter().any(|m| distance(q, *m) < 30.0) {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut ctrl = ctrl;
+        if grazes(ctrl) {
+            // 换到另一侧
+            let alt = (
+                mid.0 - ny * bulge / mlat,
+                mid.1 - nx * bulge / mlng,
+            );
+            ctrl = if grazes(alt) {
+                // 两侧都蹭到，压平成直线
+                mid
+            } else {
+                alt
+            };
+        }
         let steps = ((d / 8.0) as usize).clamp(8, 400);
-        // 加一点随机偏摆，别让每条弧都一样鼓
+        // 随机偏摆：调制的是**控制点相对中点的偏移量**，不是绝对坐标。
+        //
+        // 原来写成 `u²a + 2ut·wob·ctrl + t²b`——wob 乘在绝对坐标上，
+        // 三个系数之和变成 u² + 2ut·wob + t²，t=0.5、wob=1.25 时是 1.1245，
+        // 整个点被放大 12%。对 47.386° 的纬度就是 +5.9°，一步飘到 53°N。
+        // 实测最终生成 7216 公里、49°N/129°E 的鬼轨迹。
+        //
+        // 正确做法：wob 只作用于 ctrl - mid，系数和恒为 1。
         let wob = 0.75 + (next() % 500) as f64 / 1000.0;
+        let ctrl_lat = mid.0 + (ctrl.0 - mid.0) * wob;
+        let ctrl_lng = mid.1 + (ctrl.1 - mid.1) * wob;
         for k in 1..=steps {
             let t = k as f64 / steps as f64;
             let u = 1.0 - t;
             let p = (
-                u * u * a.0 + 2.0 * u * t * ctrl.0 * wob + t * t * b.0,
-                u * u * a.1 + 2.0 * u * t * ctrl.1 * wob + t * t * b.1,
+                u * u * a.0 + 2.0 * u * t * ctrl_lat + t * t * b.0,
+                u * u * a.1 + 2.0 * u * t * ctrl_lng + t * t * b.1,
             );
             points.push(p);
         }
@@ -633,7 +697,9 @@ pub fn route_through_in_order(
     // 里程还不够：在最后一点附近绕小圈补足
     let mut total = path_len(&points);
     let mut guard = 0;
-    while total < want_m && guard < 200 {
+    // 总长一旦超过目标的 3 倍就停，防止补里程循环失控
+    let hard_cap = want_m * 3.0 + 1000.0;
+    while total < want_m && guard < 200 && total < hard_cap {
         guard += 1;
         let anchor = *points.last().unwrap();
         // 绕圈半径 40~90m，圈心朝围栏中心
@@ -1030,5 +1096,45 @@ mod tests {
         let pts = resample_with_checkpoints(&path, 5.0, &[cp], 15.0);
         let hit = pts.iter().any(|p| distance(*p, cp) < 0.1);
         assert!(hit, "打卡点应该被吸附到路径上");
+    }
+}
+
+#[cfg(test)]
+mod order_debug_tests {
+    use super::*;
+
+    /// 真实校区尺度下，按序串点不该产出公里级以外的长度。
+    #[test]
+    fn in_order_route_is_sane_for_campus_scale() {
+        let mlat = m_per_deg_lat(47.38);
+        let mlng = m_per_deg_lng(47.38);
+        let (lat0, lon0) = (47.37962, 123.95140);
+        // 1020 × 883 m 的围栏
+        let fence = vec![
+            (lat0, lon0),
+            (lat0, lon0 + 1020.0 / mlng),
+            (lat0 + 883.0 / mlat, lon0 + 1020.0 / mlng),
+            (lat0 + 883.0 / mlat, lon0),
+        ];
+        // 真实打卡点（相对围栏起点）
+        let must = vec![
+            (lat0 + 760.0 / mlat, lon0 + 730.0 / mlng),
+            (lat0 + 700.0 / mlat, lon0 + 300.0 / mlng),
+            (lat0 + 640.0 / mlat, lon0 + 200.0 / mlng),
+            (lat0 + 700.0 / mlat, lon0 + 720.0 / mlng),
+            (lat0 + 640.0 / mlat, lon0 + 600.0 / mlng),
+        ];
+        let r = route_through_in_order(&fence, 2000.0, &must, 42).unwrap();
+        println!("长度 {:.0}m 点数 {}", r.length_m, r.points.len());
+        assert!(
+            r.length_m < 8000.0,
+            "长度 {:.0}m 明显异常（应为 2000m 量级）",
+            r.length_m
+        );
+        // 每个点都该在围栏附近
+        for p in &r.points {
+            let d = distance(*p, fence[0]);
+            assert!(d < 3000.0, "点 ({:.5},{:.5}) 距围栏 {d:.0}m", p.0, p.1);
+        }
     }
 }

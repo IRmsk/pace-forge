@@ -88,11 +88,28 @@ fn try_route_on_roads(
     log(&format!("[roads] 路网 {total:.0}m，按真实道路规划"));
     let start = must.first().copied().unwrap_or(fence[0]);
     match roadnet::route_on_roads(&clipped, start, must, want_m, seed) {
-        Ok(r) => Some(crate::track::fence_route::FenceRoute {
-            points: r.points,
-            length_m: r.length_m,
-            lines: 1,
-        }),
+        Ok(r) => {
+            // 质量门槛：路网只有几百米时，凑里程会「跳」到另一段路上，
+            // 造成几十上百米的瞬移（实测 125m）。这种轨迹服务端一眼判异常，
+            // 宁可退回几何规划。
+            let max_gap = r
+                .points
+                .windows(2)
+                .map(|w| crate::track::geo::distance(w[0], w[1]))
+                .fold(0.0f64, f64::max);
+            if max_gap > 50.0 {
+                log(&format!(
+                    "[roads] 路网仅 {total:.0}m，拼接出 {max_gap:.0}m 的跳变，\
+                     改用几何规划"
+                ));
+                return None;
+            }
+            Some(crate::track::fence_route::FenceRoute {
+                points: r.points,
+                length_m: r.length_m,
+                lines: 1,
+            })
+        }
         Err(e) => {
             log(&format!("[roads] 沿路规划失败（{e}），改用几何规划"));
             None
