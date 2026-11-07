@@ -365,6 +365,10 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         .map(|(i, &(lat, lng))| Checkpoint {
             lat,
             lng,
+            // 顺带把 GCJ-02 带上：前端高德地图按这套坐标摆点位，
+            // 长度可能和 coords 不一致，取不到就退回 BD-09
+            glat: pt.gcj_coords.get(i).map(|v| v.0).unwrap_or(lat),
+            glon: pt.gcj_coords.get(i).map(|v| v.1).unwrap_or(lng),
             name: format!("P{}", i + 1),
         })
         .collect();
@@ -390,12 +394,31 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 采用，连围栏内缩和打卡点吸附都不做——点位已经在用户画的线上了。
     let track = if let Some(custom) = p.custom_path.as_ref().filter(|v| v.len() >= 2) {
         log(&format!("[track] 采用手绘轨迹 {} 个控制点", custom.len()));
+        // 不传 must：手绘的整条价值就是用户自己控制形状，把没画到的点位
+        // 强行插进去只会在原地拉出几百米的跳变（GEO_JUMP），把线撕烂。
+        // 漏了点位由前端实时提示，用户自己补笔画。
         let mut pts = crate::track::fence_route::resample_with_checkpoints(
             custom,
             p.sample_step_m,
-            &cps.iter().map(|c| (c.lat, c.lng)).collect::<Vec<_>>(),
-            12.0,
+            &[],
+            0.0,
         );
+        // 首尾离得近就接上，否则一圈画完终点回到起点会算成一次瞬移
+        if pts.len() >= 2 {
+            let (first, last) = (pts[0], pts[pts.len() - 1]);
+            let gap = crate::track::geo::distance(first, last);
+            if gap > 1.0 && gap < 120.0 {
+                let steps = ((gap / p.sample_step_m).ceil() as usize).max(2);
+                for k in 1..steps {
+                    let t = k as f64 / steps as f64;
+                    pts.push((
+                        last.0 + (first.0 - last.0) * t,
+                        last.1 + (first.1 - last.1) * t,
+                    ));
+                }
+                log(&format!("[track] 首尾相距 {gap:.0}m，已自动接上"));
+            }
+        }
         // 手画的长度和填的目标里程通常对不上，等比例缩放到目标值，
         // 保持形状不变（和 planner 里 scale_to_length 一个思路）。
         let drawn = crate::track::geo::path_length(&pts);
@@ -406,6 +429,26 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             for q in pts.iter_mut() {
                 q.0 = anchor.0 + (q.0 - anchor.0) * k;
                 q.1 = anchor.1 + (q.1 - anchor.1) * k;
+            }
+        }
+        // 缩放会把点位从线上一并拉偏（画 707m 拉到 2000m，k≈2.8，
+        // 中间的点位能飘出上百米）。这里把离点位最近的那个路径点直接
+        // 换成点位坐标——只挪一个点，不插点，所以不会撕出跳变，
+        // 但能让每个点位精确落在线上。
+        for c in &cps {
+            let target = (c.lat, c.lng);
+            let mut best = usize::MAX;
+            let mut best_d = f64::MAX;
+            for (i, q) in pts.iter().enumerate() {
+                let d = crate::track::geo::distance(*q, target);
+                if d < best_d {
+                    best_d = d;
+                    best = i;
+                }
+            }
+            // 太远说明用户压根没画到那儿，别硬拽，交给前端提示补笔画
+            if best != usize::MAX && best_d < 60.0 {
+                pts[best] = target;
             }
         }
         let n = pts.len();

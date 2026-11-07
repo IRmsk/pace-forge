@@ -364,8 +364,8 @@ mod tests {
             center_lat: 30.5,
             center_lng: 104.0,
             checkpoints: vec![
-                Checkpoint { lat: 30.5008, lng: 104.0008, name: "A".into() },
-                Checkpoint { lat: 30.5008, lng: 104.0024, name: "B".into() },
+                Checkpoint { lat: 30.5008, lng: 104.0008, glat: 30.5008, glon: 104.0008, name: "A".into() },
+                Checkpoint { lat: 30.5008, lng: 104.0024, glat: 30.5008, glon: 104.0024, name: "B".into() },
             ],
             total_distance_m: 2000.0,
             total_sec: 720,

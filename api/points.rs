@@ -28,6 +28,9 @@ pub struct PointsContext {
     pub points: Vec<Value>,
     /// 解析后的 BD-09 坐标。
     pub coords: Vec<(f64, f64)>,
+    /// 同一批点位的 GCJ-02 坐标，顺序与 `coords` 对齐。
+    /// 高德地图按 GCJ-02 网格切瓦片，前端摆点位要用这一套。
+    pub gcj_coords: Vec<(f64, f64)>,
 }
 
 /// 经纬度六位小数字符串。
@@ -112,7 +115,11 @@ pub fn parse_points(v: &Value) -> Result<PointsContext, String> {
     let payload = v.get("data").unwrap_or(v);
     let points = extract_points(payload);
     let coords = points.iter().filter_map(point_xy).collect();
-    Ok(PointsContext { points, coords })
+    let gcj_coords = points
+        .iter()
+        .filter_map(super::policy::point_gcj)
+        .collect();
+    Ok(PointsContext { points, coords, gcj_coords })
 }
 
 /// 从响应里找点位数组。

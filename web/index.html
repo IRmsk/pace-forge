@@ -505,7 +505,8 @@ function drawPreview(coords, fence, checkpoints) {
   if (checkpoints && checkpoints.length) {
     for (const c of checkpoints) {
       const color = c.passed ? '#22c55e' : '#ef4444';
-      group.addLayer(L.circleMarker([c.lat, c.lng], {
+      group.addLayer(L.circleMarker([c.gcjLat != null ? c.gcjLat : c.lat,
+                                     c.gcjLng != null ? c.gcjLng : c.lng], {
         radius: 7, color: color, fillColor: color, fillOpacity: 0.85, weight: 2
       }).bindPopup(
         `打卡点 #${c.index}<br>${c.passed ? '✓ 轨迹经过' : '✗ 未经过'}（最近 ${c.nearest}m）`
@@ -717,10 +718,32 @@ $('accBatch').onclick = async () => {
 let map, layer, marker, previewLayer;
 function initMap() {
   if (map) return;
-  map = L.map('map', { zoomControl: true }).setView([30.5, 104.0], 15);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '© OpenStreetMap'
-  }).addTo(map);
+  // 和 App 用同一套底图：App 里就是高德（DEX 里 com/amap/api/ 2564 处、
+  // autonavi 600 处，com/baidu/mapapi/ 是空的）。
+  //
+  // 关键：高德瓦片是按 GCJ-02 网格切的，Leaflet 会把传进去的经纬度直接
+  // 当作瓦片坐标算 z/x/y。所以喂给 Leaflet 的必须是 GCJ-02——点位用
+  // gcjLat/gcjLng，手绘出来的也是 GCJ-02，不能混用 BD-09。
+  map = L.map('map', { zoomControl: true }).setView([47.3842, 123.9583], 16);
+
+  const roadMap = L.tileLayer(
+    'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
+    { subdomains: '1234', maxZoom: 18, attribution: '© 高德地图' }
+  );
+  const satellite = L.tileLayer(
+    'https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+    { subdomains: '1234', maxZoom: 18, attribution: '© 高德地图' }
+  );
+  // 卫星图叠加路网标注，看着更像 App
+  const satelliteLabel = L.tileLayer(
+    'https://webst0{s}.is.autonavi.com/appmaptile?style=8&x={x}&y={y}&z={z}',
+    { subdomains: '1234', maxZoom: 18 }
+  );
+  const satLayer = L.layerGroup([satellite, satelliteLabel]);
+
+  roadMap.addTo(map);
+  L.control.layers({ '高德路网': roadMap, '高德卫星': satLayer }, null,
+    { position: 'topright' }).addTo(map);
   layer = L.layerGroup().addTo(map);
   initDrawing();
 }

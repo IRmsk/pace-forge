@@ -138,6 +138,22 @@ pub fn extract_must_points(v: &Value) -> Vec<(f64, f64)> {
 }
 
 /// 从响应里取一个点的 BD-09 坐标。
+/// 取点位的 GCJ-02 坐标。
+///
+/// 服务端点位同时给了 BD-09（lat/lon）和 GCJ-02（glat/glon）。高德地图
+/// 用的是 GCJ-02 网格，前端要按这套坐标摆放才和瓦片对齐，所以单独取一份。
+pub fn point_gcj(p: &Value) -> Option<(f64, f64)> {
+    let (ga, go) = (field_num(p, &["glat"]), field_num(p, &["glon"]));
+    match (ga, go) {
+        (Some(a), Some(o)) if !(a == 0.0 && o == 0.0) => Some((a, o)),
+        _ => {
+            // 没有 GCJ 就从 BD 反推，保证前端永远拿得到一套能用的坐标
+            let bd = point_xy(p)?;
+            Some(super::coord::bd09_to_gcj02(bd.0, bd.1))
+        }
+    }
+}
+
 pub fn point_xy(p: &Value) -> Option<(f64, f64)> {
     let lat = field_num(p, &["lat", "latitude"]);
     let lon = field_num(p, &["lon", "lng", "longitude"]);

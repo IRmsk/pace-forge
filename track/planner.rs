@@ -15,8 +15,12 @@ use super::geo::{distance, nearest_index, nudge_to, sample_along, scale_to_lengt
 /// 一个打卡点。
 #[derive(Debug, Clone)]
 pub struct Checkpoint {
+    /// BD-09（提交报文用）。
     pub lat: f64,
     pub lng: f64,
+    /// GCJ-02（高德地图展示用）。缺省时等于 BD-09，只在测试里出现。
+    pub glat: f64,
+    pub glon: f64,
     pub name: String,
 }
 
@@ -200,6 +204,8 @@ fn resolve_checkpoints(req: &PlanRequest, rng: &mut impl Rng) -> (Vec<Checkpoint
         .map(|(i, &(lat, lng))| Checkpoint {
             lat,
             lng,
+            glat: lat,
+            glon: lng,
             name: format!("FixedPoint_{}", i + 1),
         })
         .collect();
@@ -332,9 +338,9 @@ mod tests {
         let mut req = base_req();
         req.total_distance_m = 2400.0;
         req.checkpoints = vec![
-            Checkpoint { lat: 30.5008, lng: 104.0008, name: "A".into() },
-            Checkpoint { lat: 30.5008, lng: 104.0024, name: "B".into() },
-            Checkpoint { lat: 30.4992, lng: 104.0024, name: "C".into() },
+            Checkpoint { lat: 30.5008, lng: 104.0008, glat: 30.5008, glon: 104.0008, name: "A".into() },
+            Checkpoint { lat: 30.5008, lng: 104.0024, glat: 30.5008, glon: 104.0024, name: "B".into() },
+            Checkpoint { lat: 30.4992, lng: 104.0024, glat: 30.4992, glon: 104.0024, name: "C".into() },
         ];
         let res = plan(&req, &mut r).unwrap();
         for cp in &res.checkpoints {

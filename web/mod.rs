@@ -529,10 +529,20 @@ fn handle_plan(
                             .iter()
                             .map(|q| crate::track::geo::distance((a, b), *q))
                             .fold(f64::MAX, f64::min);
+                        // 高德地图按 GCJ-02 网格切瓦片，前端摆点位必须用这一套，
+                        // 否则点位会整体偏出去几百米
+                        let (ga, go) = o
+                            .points
+                            .gcj_coords
+                            .get(i)
+                            .copied()
+                            .unwrap_or((a, b));
                         json!({
                             "index": i + 1,
                             "lat": a,
                             "lng": b,
+                            "gcjLat": ga,
+                            "gcjLng": go,
                             "passed": nearest < 15.0,
                             "nearest": (nearest * 10.0).round() / 10.0,
                         })
@@ -545,7 +555,11 @@ fn handle_plan(
                     .track
                     .iter()
                     .step_by(step)
-                    .map(|t| json!([t.lat, t.lon]))
+                    // 底图是高德（GCJ-02 网格），轨迹点也要转过去才和瓦片对齐
+                    .map(|t| {
+                        let (gl, go) = crate::api::coord::bd09_to_gcj02(t.lat, t.lon);
+                        json!([gl, go])
+                    })
                     .collect();
 
                 let ac = {
@@ -1312,7 +1326,8 @@ fn handle_fences(
 
 /// 解析手绘轨迹。
 ///
-/// 前端 Leaflet 配 OSM 瓦片，坐标是 WGS84；提交报文要 BD-09，所以逐点转换。
+/// 前端底图是高德，瓦片按 GCJ-02 网格切，Leaflet 拿到手的就是 GCJ-02，
+/// 提交报文要 BD-09，所以逐点 `gcj02_to_bd09`。
 /// 少于 2 个点当作没传，退回算法规划。
 fn parse_custom_path(body: &Value) -> Option<Vec<(f64, f64)>> {
     body.get("customPath")
@@ -1327,7 +1342,7 @@ fn parse_custom_path(body: &Value) -> Option<Vec<(f64, f64)>> {
                     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
                         return None;
                     }
-                    Some(crate::api::coord::wgs84_to_bd09(lat, lng))
+                    Some(crate::api::coord::gcj02_to_bd09(lat, lng))
                 })
                 .collect::<Vec<(f64, f64)>>()
         })
