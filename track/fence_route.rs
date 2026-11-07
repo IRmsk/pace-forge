@@ -610,8 +610,21 @@ pub fn route_through_in_order(
             points.push(b);
             continue;
         }
-        // 弧的鼓出量：段长的 35%，但夹在 30~180m
-        let bulge = (d * 0.35).clamp(30.0, 180.0);
+        // 弧的鼓出量。
+        //
+        // 原来是段长的 35%、夹在 30~180m。实测打卡点全是「某栋楼的某方位」
+        // （秋实城东南、梅园2栋西、杏林3栋北…），彼此隔着一两栋楼，
+        // 180m 的鼓出量会让弧从校园正中兜过去，横穿整片建筑群。
+        //
+        // 压到段长的 18%、上限 60m：弧只做轻微避让，主体贴近两点连线，
+        // 看起来像绕开一个花坛而不是从教学楼中间穿过去。
+        // 想更直就设 PACE_BULGE_MAX=0。
+        let bulge_max = std::env::var("PACE_BULGE_MAX")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (0.0..=300.0).contains(v))
+            .unwrap_or(60.0);
+        let bulge = (d * 0.18).clamp(8.0, bulge_max.max(8.0));
         // 鼓向：朝围栏中心那一侧，别跑到围栏外面
         let cx = fence.iter().map(|p| p.0).sum::<f64>() / fence.len() as f64;
         let cy = fence.iter().map(|p| p.1).sum::<f64>() / fence.len() as f64;

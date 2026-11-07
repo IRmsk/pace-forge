@@ -53,6 +53,7 @@ fn main() {
         }
         "semester" => show_semester(),
         "logout" => do_logout(),
+        "relogin" => do_relogin(),
         "check" => {
             let dist_km = parse_num(&args, 1, 2.0, "距离(km)");
             let dur_min = parse_num(&args, 2, 12.0, "时长(min)");
@@ -295,6 +296,69 @@ fn local_check(dist_km: f64, dur_min: f64) {
         let mn = caps.iter().cloned().fold(f64::MAX, f64::min);
         let avg = caps.iter().sum::<f64>() / caps.len() as f64;
         println!("  分桶        {} 个，{:.1}~{:.1} m（均值 {:.1}）", caps.len(), mn, mx, avg);
+    }
+}
+
+/// 用本地保存的密码重新登录，刷新 token。
+///
+/// 密码在 accounts.json 里是加密存的，这里解出来直接用，不用重新输入。
+fn do_relogin() {
+    use pace_forge::api::{accounts, client, login as login_api, session};
+
+    let mut book = accounts::load();
+    let acc = match book.accounts.first().cloned() {
+        Some(a) => a,
+        None => {
+            eprintln!("本地没有账号记录");
+            std::process::exit(1);
+        }
+    };
+    if acc.password_enc.is_empty() {
+        eprintln!("账号 {} 没存密码，需要重新输入", acc.username);
+        std::process::exit(1);
+    }
+    let password = match accounts::open_password(&acc.password_enc) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("密码解密失败: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut c = client::Client::new(client::DeviceProfile::default());
+    match login_api::login(&mut c, &acc.username, &password) {
+        Ok(login_api::LoginOutcome::Ok(prof)) => {
+            let creds = &c.creds;
+            let sess = session::Session {
+                uid: creds.uid.clone().unwrap_or_default(),
+                token: creds.token.clone().unwrap_or_default(),
+                unid: creds.unid.clone().unwrap_or_default(),
+                username: acc.username.clone(),
+                name: prof.name.clone(),
+                campus_name: prof.campus_name.clone(),
+                depart: prof.depart.clone(),
+                grade_class: prof.grade_class.clone(),
+                device_id: String::new(),
+            };
+            if let Err(e) = session::save_session(&sess) {
+                eprintln!("session 写入失败: {e}");
+            }
+            if let Some(a) = book.get_mut(&acc.id) {
+                a.uid = sess.uid.clone();
+                a.token = sess.token.clone();
+                a.unid = sess.unid.clone();
+            }
+            let _ = accounts::save(&book);
+            println!("✅ 重新登录成功：{} ({})", sess.name, acc.username);
+        }
+        Ok(login_api::LoginOutcome::NeedCaptcha { message, .. }) => {
+            eprintln!("需要过滑动验证码（{message}），请在网页里登录一次");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("登录失败: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

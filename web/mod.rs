@@ -354,6 +354,14 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
         }
         (Method::Get, "/api/fences") => handle_fences(request, state, &query),
         (Method::Get, "/api/records") => handle_records(request, state, &query),
+        (Method::Post, "/api/obs/fetch") => {
+            let body = read_json(&mut request)?;
+            handle_obs_fetch(request, state, &body)
+        }
+        (Method::Post, "/api/raw") => {
+            let body = read_json(&mut request)?;
+            handle_raw(request, state, &body)
+        }
         (Method::Get, "/api/health") => json_ok(request, json!({"ok": true, "version": crate::VERSION})),
         _ => {
             if let Some(rest) = path.strip_prefix("/api/accounts/") {
@@ -1377,6 +1385,73 @@ fn handle_run(
             "logs": logs.borrow().clone(),
         })),
         Err(e) => json_err(request, &format!("{e}\n---\n{}", logs.borrow().join("\n"))),
+    }
+}
+
+/// 按 rrid 从 OBS 拉历史记录的原始轨迹。
+///
+/// 轨迹不在 `get_one_record` 里返回（那个接口的 allLocJson 永远是 null），
+/// 但记录列表带了 uuid 和 startTime，拼出 objectKey 就能直接从 OBS 取。
+fn handle_obs_fetch(
+    request: tiny_http::Request,
+    state: Shared,
+    body: &Value,
+) -> Result<(), String> {
+    let key = match body.get("key").and_then(|v| v.as_str()) {
+        Some(k) if k.starts_with("run_data/") || k.starts_with("runData/") => k.to_string(),
+        _ => return json_err(request, "key 参数缺失或格式不对"),
+    };
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
+    };
+    match crate::api::obs::fetch_object(&client, &key) {
+        Ok(v) => json_ok(request, v),
+        Err(e) => json_err(request, &e),
+    }
+}
+
+/// 透传任意业务接口，用于探测没写进代码的接口。
+///
+/// body: {"path":"/api/v670/...","body":{...},"host":"run|discovery"}
+fn handle_raw(
+    request: tiny_http::Request,
+    state: Shared,
+    body: &Value,
+) -> Result<(), String> {
+    let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if !path.starts_with("/api/") {
+        return json_err(request, "path 必须是 /api/ 开头");
+    }
+    let inner = body.get("body").cloned().unwrap_or_else(|| json!({}));
+    let host = match body.get("host").and_then(|v| v.as_str()).unwrap_or("run") {
+        "discovery" => crate::crypto::consts::hosts::DISCOVERY,
+        _ => crate::crypto::consts::hosts::RUN,
+    };
+
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
+    };
+    match client.request("POST", &format!("{host}{path}"), Some(&inner)) {
+        Ok(raw) => {
+            let v: Value = serde_json::from_str(&raw)
+                .unwrap_or_else(|_| json!({"raw_text": raw.chars().take(2000).collect::<String>()}));
+            json_ok(request, v)
+        }
+        Err(e) => json_err(request, &e),
     }
 }
 
