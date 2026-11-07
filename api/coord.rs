@@ -120,3 +120,28 @@ mod tests {
         assert_eq!(wgs84_to_gcj02(lat, lng), (lat, lng));
     }
 }
+
+#[cfg(test)]
+mod point_coord_tests {
+    use super::*;
+
+    /// 采样点位的 lat/lon 与 glat/glon 到底是什么关系。
+    #[test]
+    fn probe_bd09_gcj02_relation() {
+        // 真实点位：lon/lat 与 glon/glat
+        let (lat, lon) = (47.384686_f64, 123.961263_f64);
+        let (glat, glon) = (47.378334_f64, 123.954917_f64);
+
+        let (c_lat, c_lng) = bd09_to_gcj02(lat, lon);
+        println!("bd09_to_gcj02 -> {c_lat:.6},{c_lng:.6}  (期望接近 {glat:.6},{glon:.6})");
+
+        let (b_lat, b_lng) = gcj02_to_bd09(glat, glon);
+        println!("gcj02_to_bd09 <- {b_lat:.6},{b_lng:.6}  (期望接近 {lat:.6},{lon:.6})");
+
+        let d1 = crate::track::geo::distance((c_lat, c_lng), (glat, glon));
+        let d2 = crate::track::geo::distance((b_lat, b_lng), (lat, lon));
+        println!("往返误差 {d1:.1}m / {d2:.1}m");
+        assert!(d1 < 50.0, "bd09_to_gcj02 与 glat/glon 差 {d1:.0}m");
+        assert!(d2 < 50.0, "gcj02_to_bd09 与 lat/lon 差 {d2:.0}m");
+    }
+}

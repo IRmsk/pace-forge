@@ -334,6 +334,14 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                     .unwrap_or_default();
                 log(&format!("[points] 原始字段: {keys:?}"));
                 log(&format!("[points] 首点: {first}"));
+                // 每个点位的 isFixed / 名字都要看：服务端的 type 3
+                // 「至少通过2个普通点位」要求有 isFixed=0 的点可供通过
+                for (i, raw) in c.points.iter().enumerate() {
+                    let fixed = raw.get("isFixed").and_then(|v| v.as_i64()).unwrap_or(-1);
+                    let name = raw.get("pointName").and_then(|v| v.as_str()).unwrap_or("");
+                    log(&format!("[points]  #{i} isFixed={fixed} {name}"));
+                }
+
             }
             c
         }
@@ -618,6 +626,36 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         log(&format!("  {line}"));
     }
 
+    // 服务端「经过点位」到底比哪套坐标？BD-09 的 lat/lon 与 GCJ-02 的
+    // glat/glon 差 ~850m，选错一套整条记录的点位项就全是 False。
+    for (i, raw) in pt.points.iter().enumerate() {
+        let name = raw.get("pointName").and_then(|v| v.as_str()).unwrap_or("");
+        let bd = (
+            raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        );
+        let gcj = (
+            raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        );
+        let d_bd = view
+            .points
+            .iter()
+            .map(|p| crate::track::geo::distance((p.lat, p.lon), bd))
+            .fold(f64::MAX, f64::min);
+        let d_gcj = view
+            .points
+            .iter()
+            .map(|p| {
+                let (a, o) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
+                crate::track::geo::distance((a, o), gcj)
+            })
+            .fold(f64::MAX, f64::min);
+        log(&format!(
+            "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m"
+        ));
+    }
+
     Ok(RunOutcome {
         policy: pol,
         fence: pick,
@@ -667,6 +705,33 @@ pub fn run_full(
             crate::track::detect::PointRule::default(),
         );
         log(&format!("[detect] {}", rep.summary()));
+        // 服务端「经过点位」到底比哪套坐标？BD-09 与 GCJ-02 差 850m，
+        // 选错一套整条记录的点位项就全 False（实测两条记录都这样）。
+        for (i, raw) in out.points.points.iter().enumerate() {
+            let name = raw.get("pointName").and_then(|v| v.as_str()).unwrap_or("");
+            let bd = (
+                raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            );
+            let gcj = (
+                raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            );
+            let d_bd = xy
+                .iter()
+                .map(|p| crate::track::geo::distance(*p, bd))
+                .fold(f64::MAX, f64::min);
+            let d_gcj = xy
+                .iter()
+                .map(|p| {
+                    let (a, o) = crate::api::coord::bd09_to_gcj02(p.0, p.1);
+                    crate::track::geo::distance((a, o), gcj)
+                })
+                .fold(f64::MAX, f64::min);
+            log(&format!(
+                "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m"
+            ));
+        }
         for line in rep.lines().iter().take(5) {
             log(&format!("  · {line}"));
         }
@@ -690,15 +755,28 @@ pub fn run_full(
     let uuid = super::client::uuid_v4().to_uppercase();
     let stop_ms = start_ms + p.duration_sec * 1000;
 
+    // fivePointJson 里的点位坐标用哪套？
+    //
+    // allLocJson 的 lat/lon 是 BD-09、gLat/gLng 是 GCJ-02，两套都给了。
+    // fivePointJson 只有一个 lat/lon——服务端拿它和轨迹的哪一套比，
+    // 决定「经过点位」成败，而两套差 850m。可用 PACE_FIXED_GPS=1 切换。
+    let fixed_in_gcj = std::env::var("PACE_FIXED_GPS").map(|v| v == "1").unwrap_or(false);
     let fixed: Vec<super::submit::FixedPoint> = out
         .points
         .coords
         .iter()
         .enumerate()
-        .map(|(i, &(lat, lon))| super::submit::FixedPoint {
-            lat,
-            lon,
-            position: i as i32 + 1,
+        .map(|(i, &(lat, lon))| {
+            let (a, o) = if fixed_in_gcj {
+                crate::api::coord::bd09_to_gcj02(lat, lon)
+            } else {
+                (lat, lon)
+            };
+            super::submit::FixedPoint {
+                lat: a,
+                lon: o,
+                position: i as i32 + 1,
+            }
         })
         .collect();
 
