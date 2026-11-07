@@ -340,8 +340,8 @@ fn handle_plan(
     if distance_km <= 0.0 || distance_km > 42.0 {
         return json_err(request, "距离需在 0~42 公里之间");
     }
-    if duration_min <= 0.0 || duration_min > 300.0 {
-        return json_err(request, "时长需在 0~300 分钟之间");
+    if duration_min <= 0.0 || duration_min > 120.0 {
+        return json_err(request, "时长需在 0~120 分钟之间（超过服务端必然驳回）");
     }
 
     // ---- 已登录：走真实流程拿围栏和打卡点 ----
@@ -871,8 +871,8 @@ fn handle_batch(
     if distance_km <= 0.0 || distance_km > 42.0 {
         return json_err(request, "距离需在 0~42 公里之间");
     }
-    if duration_min <= 0.0 || duration_min > 300.0 {
-        return json_err(request, "时长需在 0~300 分钟之间");
+    if duration_min <= 0.0 || duration_min > 120.0 {
+        return json_err(request, "时长需在 0~120 分钟之间（超过服务端必然驳回）");
     }
 
     // 挑出要跑的账号
@@ -1179,8 +1179,8 @@ fn handle_run(
     if distance_km <= 0.0 || distance_km > 42.0 {
         return json_err(request, "距离需在 0~42 公里之间");
     }
-    if duration_min <= 0.0 || duration_min > 300.0 {
-        return json_err(request, "时长需在 0~300 分钟之间");
+    if duration_min <= 0.0 || duration_min > 120.0 {
+        return json_err(request, "时长需在 0~120 分钟之间（超过服务端必然驳回）");
     }
 
     let mut st = state.lock().map_err(|e| e.to_string())?;

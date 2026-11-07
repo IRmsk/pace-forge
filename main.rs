@@ -6,13 +6,46 @@
 //! - `stadium <圈数>`   生成操场轨迹并打印参数
 //! - `version` / `help`
 
+
+/// 解析必填或可缺省的数字参数。
+///
+/// 之前一律 `.and_then(parse().ok()).unwrap_or(默认值)`，于是
+/// `run 2 abc` 会被当成 12 分钟**真提交**，`check -1 12` 带着负距离跑完全程，
+/// `check 1e9 1e9` 直接 OOM abort。打错字和没写是两回事：
+/// 参数存在但解析不出来 → 报错退出；参数不存在 → 用默认值。
+fn parse_num(args: &[String], idx: usize, default: f64, name: &str) -> f64 {
+    match args.get(idx) {
+        None => default,
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(v) if v.is_finite() => v,
+            _ => {
+                eprintln!("参数错误：{name} 「{raw}」不是有效数字");
+                std::process::exit(2);
+            }
+        },
+    }
+}
+
+/// 校验公里/分钟，和库层 `RunParams::validate` 保持同一套上限。
+fn checked_km_min(dist_km: f64, dur_min: f64) -> (f64, f64) {
+    if !(dist_km > 0.0) || dist_km > 42.0 {
+        eprintln!("参数错误：距离要在 0~42 公里之间，收到 {dist_km}");
+        std::process::exit(2);
+    }
+    if !(dur_min > 0.0) || dur_min > 120.0 {
+        eprintln!("参数错误：时长要在 0~120 分钟之间，收到 {dur_min}");
+        std::process::exit(2);
+    }
+    (dist_km, dur_min)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("web");
 
     match cmd {
         "web" => {
-            let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9998".into());
+            let addr = args.get(1).cloned().unwrap_or_else(|| "127.0.0.1:9999".into());
             if let Err(e) = pace_forge::web::serve(&addr) {
                 eprintln!("启动失败: {e}");
                 std::process::exit(1);
@@ -20,26 +53,30 @@ fn main() {
         }
         "semester" => show_semester(),
         "check" => {
-            let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-            let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let dist_km = parse_num(&args, 1, 2.0, "距离(km)");
+            let dur_min = parse_num(&args, 2, 12.0, "时长(min)");
+            let (dist_km, dur_min) = checked_km_min(dist_km, dur_min);
             local_check(dist_km, dur_min);
         }
         "run" => {
-            let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-            let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let dist_km = parse_num(&args, 1, 2.0, "距离(km)");
+            let dur_min = parse_num(&args, 2, 12.0, "时长(min)");
+            let (dist_km, dur_min) = checked_km_min(dist_km, dur_min);
             let yes = args.iter().any(|a| a == "-y" || a == "--yes");
             do_run(dist_km, dur_min, yes);
         }
         "dry" => {
-            let dist_km: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-            let dur_min: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let dist_km = parse_num(&args, 1, 2.0, "距离(km)");
+            let dur_min = parse_num(&args, 2, 12.0, "时长(min)");
+            let (dist_km, dur_min) = checked_km_min(dist_km, dur_min);
             dry_run(dist_km, dur_min);
         }
         "at" => {
             // at <HH:MM> <km> <min> [--days N]
             let hhmm = args.get(1).cloned().unwrap_or_default();
-            let dist_km: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-            let dur_min: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let dist_km = parse_num(&args, 2, 2.0, "距离(km)");
+            let dur_min = parse_num(&args, 3, 12.0, "时长(min)");
+            let (dist_km, dur_min) = checked_km_min(dist_km, dur_min);
             let days: i64 = args
                 .iter()
                 .position(|a| a == "--days")
@@ -52,8 +89,9 @@ fn main() {
         "ago" => {
             // ago <分钟> <km> <min>
             let mins: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);
-            let dist_km: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2.0);
-            let dur_min: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(12.0);
+            let dist_km = parse_num(&args, 2, 2.0, "距离(km)");
+            let dur_min = parse_num(&args, 3, 12.0, "时长(min)");
+            let (dist_km, dur_min) = checked_km_min(dist_km, dur_min);
             let yes = args.iter().any(|a| a == "-y" || a == "--yes");
             do_ago(mins, dist_km, dur_min, yes);
         }

@@ -21,9 +21,9 @@ use crate::track::TrackPoint;
 /// 每公里消耗千卡。
 const CALORIE_PER_KM: f64 = 62.0;
 /// 最长允许跑步时长（秒）。
-const MAX_RUN_TIME: i64 = 7200;
+pub const MAX_RUN_TIME: i64 = 7200;
 /// 最少步数。
-const MIN_STEPS: i32 = 2000;
+pub const MIN_STEPS: i32 = 2000;
 
 /// 构建参数。
 #[derive(Debug, Clone)]

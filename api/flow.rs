@@ -58,6 +58,51 @@ pub struct RunParams {
     pub start_at_ms: Option<i64>,
 }
 
+impl RunParams {
+    /// 统一校验。CLI、Web、库调用都必须走这里。
+    ///
+    /// 之前三个入口各写一套：Web 拦到 300 分钟，CLI 什么都不拦，
+    /// `MAX_RUN_TIME`（7200 秒 = 120 分钟）这个常量定义了却从没被引用。
+    /// 结果 `run 2 200` 能一路走到提交，必然被服务端驳回，还累计风控次数。
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.distance_m.is_finite() || self.distance_m <= 0.0 {
+            return Err(format!("距离必须是正数，收到 {}", self.distance_m));
+        }
+        if self.distance_m > 42_000.0 {
+            return Err(format!(
+                "距离 {} m 超过上限 42000 m（42 公里）",
+                self.distance_m
+            ));
+        }
+        if self.duration_sec <= 0 {
+            return Err(format!("时长必须为正，收到 {} 秒", self.duration_sec));
+        }
+        if self.duration_sec > super::submit::MAX_RUN_TIME {
+            return Err(format!(
+                "时长 {} 秒超过上限 {} 秒（{} 分钟）——超过这个值服务端必然驳回",
+                self.duration_sec,
+                super::submit::MAX_RUN_TIME,
+                super::submit::MAX_RUN_TIME / 60
+            ));
+        }
+        if let Some(st) = self.steps {
+            if st < 0 {
+                return Err(format!("步数不能为负，收到 {st}"));
+            }
+        }
+        if !(-90.0..=90.0).contains(&self.center_lat) || !(-180.0..=180.0).contains(&self.center_lng) {
+            return Err(format!(
+                "定位锚点越界: ({}, {})",
+                self.center_lat, self.center_lng
+            ));
+        }
+        if self.sample_step_m <= 0.0 || self.sample_step_m > 100.0 {
+            return Err(format!("采样间距不合理: {} m", self.sample_step_m));
+        }
+        Ok(())
+    }
+}
+
 impl Default for RunParams {
     fn default() -> Self {
         Self {
@@ -107,6 +152,7 @@ pub struct RunOutcome {
 ///
 /// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
 pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, String> {
+    p.validate()?;
     let start_ms = match p.start_at_ms {
         // 补跑：时间是外部算好的，直接用它，但照样加抖动让秒数不整齐
         Some(t) => {

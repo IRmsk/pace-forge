@@ -38,8 +38,15 @@ pub mod spec {
 ///
 /// 第 1 道沿内突沿外 0.30m 计算（国际田联实测线规则），
 /// 之后每道再加一个道宽。
+/// 标准田径场道次范围。
+pub const MIN_LANE: u8 = 1;
+pub const MAX_LANE: u8 = 8;
+
 pub fn lane_radius(lane: u8) -> f64 {
-    let l = lane.max(1) as f64;
+    // 标准跑道只有 1~8 道。之前用 lane.max(1) 兜底，第 9 道会被外推成
+    // 一条不存在的跑道（单圈 461 m），第 0 道静默变成第 1 道。
+    let lane = lane.clamp(MIN_LANE, MAX_LANE);
+    let l = lane as f64;
     spec::INNER_RADIUS + 0.30 + spec::LANE_WIDTH * (l - 1.0)
 }
 

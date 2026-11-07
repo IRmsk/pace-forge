@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --lib
+      - name: 不变量 —— 报文分桶必须等于 sim 分桶
+        run: cargo test --lib single_source -- --nocapture
+
+  lint:
+    runs-on: ubuntu-latest
+    # 先观察，不阻断。警告清干净之后再摘掉 continue-on-error。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy
+        run: cargo clippy --all-targets 2>&1 | tee /tmp/clippy.log
+      - name: cargo fmt --check
+        run: cargo fmt --check || echo "格式未统一（不阻断）"
