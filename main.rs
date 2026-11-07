@@ -489,6 +489,7 @@ fn run_with_start(dist_km: f64, dur_min: f64, start_at: Option<i64>, yes: bool) 
         distance_m: dist_km * 1000.0,
         duration_sec: (dur_min * 60.0).round() as i64,
         start_at_ms: start_at,
+        custom_path: None,
         // 户外跑没有服务端时间窗口；记分跑(runMode=1)有，脚本跑容易被 11016 挡掉
         run_mode: std::env::var("PACE_RUN_MODE")
             .ok()

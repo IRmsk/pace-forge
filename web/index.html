@@ -184,6 +184,7 @@ button.danger:disabled{opacity:.5}
       </select></label>
       <label>路线<select id="rMode">
         <option value="free">自由路线</option>
+        <option value="draw">自己画（地图上手绘）</option>
         <option value="stadium">操场绕圈</option>
       </select></label>
       <label id="laneWrap" style="display:none">道次<select id="rLane">
@@ -202,6 +203,16 @@ button.danger:disabled{opacity:.5}
       <label id="wrapAt" style="display:none">时刻<input id="rAt" type="time" value="07:30"></label>
       <label id="wrapDays" style="display:none">几天前<input id="rDays" type="number" min="0" max="3" value="0" style="width:70px"></label>
       <label id="wrapAgo" style="display:none">分钟前<input id="rAgo" type="number" min="1" max="5760" value="60" style="width:80px"></label>
+      <div id="drawWrap" style="display:none;flex-basis:100%">
+        <div class="hint" style="margin:6px 0">
+          在地图上按住拖动画出路线，起点就是开跑位置。画完点“用这条轨迹”。
+        </div>
+        <button id="drawStart" class="ghost">开始绘制</button>
+        <button id="drawUndo" class="ghost">撤销上一笔</button>
+        <button id="drawClear" class="ghost">清空</button>
+        <button id="drawUse">用这条轨迹</button>
+        <span id="drawInfo" class="hint" style="margin-left:8px"></span>
+      </div>
       <button id="planBtn">生成轨迹</button>
       <button id="runBtn" class="danger">真的跑（提交）</button>
     </div>
@@ -282,7 +293,20 @@ $('logout').onclick = async () => {
 $('reload').onclick = loadRecords;
 
 $('rMode').onchange = () => {
-  $('laneWrap').style.display = $('rMode').value === 'stadium' ? '' : 'none';
+  const v = $('rMode').value;
+  $('laneWrap').style.display = v === 'stadium' ? '' : 'none';
+  $('drawWrap').style.display = v === 'draw' ? '' : 'none';
+  if (v === 'draw') {
+    // 手绘必须看得见地图，滚过去并确保地图已初始化
+    initMap();
+    setTimeout(() => {
+      initDrawing();
+      $('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
+      if (map) map.invalidateSize();
+    }, 60);
+  } else {
+    setDrawMode(false);
+  }
 };
 
 $('planBtn').onclick = async () => {
@@ -306,11 +330,15 @@ $('planBtn').onclick = async () => {
         steps: (Number.isFinite(steps) && steps > 0) ? steps : 0,
         mode: $('rMode').value, lane: parseInt($('rLane').value, 10) || 1,
         runMode: parseInt($('rRunMode').value, 10) || 1,
-        startAtMs: (st ? st.startMs : undefined)
+        startAtMs: (st ? st.startMs : undefined),
+        customPath: $('rMode').value === 'draw'
+          ? (() => { const m = useDrawing(); return m && m.length >= 2 ? m : undefined; })()
+          : undefined
       })
     });
     setOut('');
-    const modeTxt = r.mode === 'stadium' ? `操场第 ${r.lane} 道` : '自由路线';
+    const modeTxt = r.mode === 'stadium' ? `操场第 ${r.lane} 道`
+      : (r.mode === 'draw' ? '手绘轨迹' : '自由路线');
     const acTxt = r.stepAutocorr != null
       ? `${r.stepAutocorr.toFixed(3)} ${r.stepAutocorr < 0.1 ? '(偏低)' : '(正常)'}`
       : '-';
@@ -416,7 +444,14 @@ $('runBtn').onclick = async () => {
         sportType: 1,
         mode: $('rMode').value,
         lane: parseInt($('rLane').value, 10) || 1,
-        startAtMs: (st ? st.startMs : undefined)
+        startAtMs: (st ? st.startMs : undefined),
+        // 手绘模式把坐标带上；后端按 WGS84 解析并转 BD-09
+        customPath: $('rMode').value === 'draw'
+          ? (() => {
+              const m = useDrawing();
+              return m && m.length >= 2 ? m : undefined;
+            })()
+          : undefined
       })
     });
     setOut('');
@@ -442,8 +477,13 @@ function setOut(t, err) {
   const o = $('planOut');
   o.innerHTML = t ? `<div class="msg ${err ? 'err' : ''}">${t}</div>` : '';
 }
+let lastCheckpoints = [];
+let lastFence = null;
+
 function drawPreview(coords, fence, checkpoints) {
   if (!map) return;
+  if (checkpoints) lastCheckpoints = checkpoints;
+  if (fence) lastFence = fence;
   if (previewLayer) { map.removeLayer(previewLayer); previewLayer = null; }
 
   const group = L.featureGroup();
@@ -682,6 +722,160 @@ function initMap() {
     maxZoom: 19, attribution: '© OpenStreetMap'
   }).addTo(map);
   layer = L.layerGroup().addTo(map);
+  initDrawing();
+}
+
+
+/* ---------- 手绘轨迹 ---------- */
+
+// 手绘状态。strokes 是若干条独立笔画，用户可能分几次画完整个圈。
+let drawMode = false;
+let strokes = [];
+let currentStroke = null;
+let drawLayer = null;
+let isPointerDown = false;
+
+// 两点间距离（米），haversine。前端只用它显示里程，精度够。
+function metersBetween(a, b) {
+  const R = 6371000;
+  const rad = d => d * Math.PI / 180;
+  const dLat = rad(b[0] - a[0]);
+  const dLng = rad(b[1] - a[1]);
+  const x = dLng * Math.cos(rad((a[0] + b[0]) / 2));
+  return R * Math.sqrt(x * x + dLat * dLat);
+}
+function strokesLength() {
+  let m = 0;
+  for (const st of strokes) {
+    for (let i = 1; i < st.length; i++) m += metersBetween(st[i - 1], st[i]);
+  }
+  return m;
+}
+function redrawStrokes() {
+  if (!map) return;
+  if (drawLayer) map.removeLayer(drawLayer);
+  drawLayer = L.featureGroup().addTo(map);
+  for (const st of strokes) {
+    L.polyline(st, { color: '#22d3a6', weight: 4, opacity: 0.95 }).addTo(drawLayer);
+    // 起点单独标一下，用户要知道从哪开跑
+    L.circleMarker(st[0], {
+      radius: 5, color: '#0ea5e9', fillColor: '#0ea5e9', fillOpacity: 0.9, weight: 2
+    }).addTo(drawLayer).bindTooltip('起点');
+  }
+  const m = strokesLength();
+  let txt = strokes.length
+    ? `${strokes.length} 笔 · ${(m / 1000).toFixed(2)} km`
+    : '还没画';
+
+  // 记分跑要求顺序经过全部打卡点，画的时候就告诉用户漏了哪个
+  if (strokes.length && lastCheckpoints.length) {
+    const flat = [];
+    for (const st of strokes) flat.push(...st);
+    let hit = 0;
+    const missed = [];
+    for (const c of lastCheckpoints) {
+      let best = Infinity;
+      // 点位到任一采样点的距离；采样点本身就够密（3 m 一个）
+      for (const q of flat) {
+        const d = metersBetween([c.lat, c.lng], q);
+        if (d < best) best = d;
+      }
+      if (best < 25) hit++;
+      else missed.push(`#${c.index}`);
+    }
+    txt += ` · 点位 ${hit}/${lastCheckpoints.length}`;
+    if (missed.length) txt += `（漏 ${missed.join(',')}）`;
+  }
+  $('drawInfo').textContent = txt;
+}
+
+function setDrawMode(on) {
+  drawMode = on;
+  if (!map) return;
+  if (on) {
+    map.dragging.disable();
+    map.getContainer().style.cursor = 'crosshair';
+    $('drawStart').textContent = '绘制中…';
+  } else {
+    map.dragging.enable();
+    map.getContainer().style.cursor = '';
+    $('drawStart').textContent = '继续绘制';
+  }
+}
+function clearDrawing() {
+  strokes = [];
+  currentStroke = null;
+  isPointerDown = false;
+  redrawStrokes();
+}
+function useDrawing() {
+  const usable = strokes.filter(s => s.length >= 2);
+  if (!usable.length) { alert('先画一条线'); return null; }
+  // 多笔按顺序首尾拼成一条，供后端重采样
+  const merged = [];
+  for (const st of usable) {
+    if (merged.length && metersBetween(merged[merged.length - 1], st[0]) < 30) {
+      merged.push(...st.slice(1));
+    } else {
+      merged.push(...st);
+    }
+  }
+  return merged;
+}
+
+function initDrawing() {
+  if (!map || map.__drawBound) return;
+  map.__drawBound = true;
+  const el = map.getContainer();
+
+  const toLatLng = ev => {
+    const r = el.getBoundingClientRect();
+    return map.containerPointToLatLng(L.point(ev.clientX - r.left, ev.clientY - r.top));
+  };
+
+  el.addEventListener('pointerdown', ev => {
+    if (!drawMode) return;
+    ev.preventDefault();
+    isPointerDown = true;
+    el.setPointerCapture(ev.pointerId);
+    const ll = toLatLng(ev);
+    currentStroke = [[ll.lat, ll.lng]];
+    strokes.push(currentStroke);
+    redrawStrokes();
+  });
+
+  el.addEventListener('pointermove', ev => {
+    if (!drawMode || !isPointerDown || !currentStroke) return;
+    ev.preventDefault();
+    const ll = toLatLng(ev);
+    const last = currentStroke[currentStroke.length - 1];
+    // 太密的点丢掉，不然一条线几千个点，报文会爆
+    if (metersBetween(last, [ll.lat, ll.lng]) < 3) return;
+    currentStroke.push([ll.lat, ll.lng]);
+    redrawStrokes();
+  });
+
+  const finish = ev => {
+    if (!isPointerDown) return;
+    isPointerDown = false;
+    currentStroke = null;
+    try { el.releasePointerCapture(ev.pointerId); } catch (e) {}
+    redrawStrokes();
+  };
+  el.addEventListener('pointerup', finish);
+  el.addEventListener('pointercancel', finish);
+  el.addEventListener('pointerleave', finish);
+
+  $('drawStart').onclick = () => setDrawMode(!drawMode);
+  $('drawUndo').onclick = () => { strokes.pop(); redrawStrokes(); };
+  $('drawClear').onclick = clearDrawing;
+  $('drawUse').onclick = () => {
+    const merged = useDrawing();
+    if (!merged) return;
+    setDrawMode(false);
+    $('drawInfo').textContent =
+      `已采用 ${(strokesLength() / 1000).toFixed(2)} km，点“生成轨迹”或直接提交`;
+  };
 }
 
 /* ---------- 记录列表 ---------- */

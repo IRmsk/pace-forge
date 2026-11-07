@@ -493,6 +493,7 @@ fn handle_plan(
                 sport_type,
                 run_mode,
                 start_at_ms,
+                custom_path: parse_custom_path(body),
                 ..Default::default()
             };
             let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
@@ -588,7 +589,13 @@ fn handle_plan(
             // dry_run 失败就退回本地合成，但要把原因带出来——
             // 否则页面只显示「本地合成」，完全不知道服务端哪一步卡住了
             if let Err(e) = r {
-                return json_err(request, &format!("真实流程失败：{e}"));
+                // 把日志一起带出去。自检失败时日志里逐条写着哪个检查没过，
+                // 只回一句「自检未通过」等于让用户猜。
+                return json_ok(request, json!({
+                    "ok": false,
+                    "error": format!("真实流程失败：{e}"),
+                    "logs": logs.borrow().clone(),
+                }));
             }
         }
     }
@@ -1303,6 +1310,30 @@ fn handle_fences(
 
 // ---------- 真跑：提交 ----------
 
+/// 解析手绘轨迹。
+///
+/// 前端 Leaflet 配 OSM 瓦片，坐标是 WGS84；提交报文要 BD-09，所以逐点转换。
+/// 少于 2 个点当作没传，退回算法规划。
+fn parse_custom_path(body: &Value) -> Option<Vec<(f64, f64)>> {
+    body.get("customPath")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let pair = item.as_array()?;
+                    let lat = pair.first()?.as_f64()?;
+                    let lng = pair.get(1)?.as_f64()?;
+                    // 明显不是经纬度的值直接丢掉，别把脏数据带进报文
+                    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+                        return None;
+                    }
+                    Some(crate::api::coord::wgs84_to_bd09(lat, lng))
+                })
+                .collect::<Vec<(f64, f64)>>()
+        })
+        .filter(|v| v.len() >= 2)
+}
+
 fn handle_run(
     request: tiny_http::Request,
     state: Shared,
@@ -1352,6 +1383,8 @@ fn handle_run(
         }
     };
 
+    let custom_path = parse_custom_path(body);
+
     let p = crate::api::flow::RunParams {
         center_lat: clat,
         center_lng: clng,
@@ -1360,6 +1393,7 @@ fn handle_run(
         sport_type,
         run_mode,
         start_at_ms,
+        custom_path,
         ..Default::default()
     };
 
@@ -1445,7 +1479,24 @@ fn handle_raw(
         };
         c.clone()
     };
-    match client.request("POST", &format!("{host}{path}"), Some(&inner)) {
+    let method = match body.get("method").and_then(|v| v.as_str()).unwrap_or("POST") {
+        "GET" => "GET",
+        _ => "POST",
+    };
+    let full = if method == "GET" && !inner.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        let qs: Vec<String> = inner.as_object().map(|o| {
+            o.iter().filter_map(|(k, v)| match v {
+                Value::String(sv) => Some(format!("{k}={}", sv.replace(' ', "%20"))),
+                Value::Number(n) => Some(format!("{k}={n}")),
+                _ => None,
+            }).collect()
+        }).unwrap_or_default();
+        if qs.is_empty() { format!("{host}{path}") } else { format!("{host}{path}?{}", qs.join("&")) }
+    } else {
+        format!("{host}{path}")
+    };
+    let payload = if method == "GET" { None } else { Some(&inner) };
+    match client.request(method, &full, payload) {
         Ok(raw) => {
             let v: Value = serde_json::from_str(&raw)
                 .unwrap_or_else(|_| json!({"raw_text": raw.chars().take(2000).collect::<String>()}));

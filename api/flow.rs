@@ -58,6 +58,11 @@ pub struct RunParams {
     /// 补跑时由 `start_time` 模块算好传进来——那边已经保证了
     /// 「开始 + 用时 + 抖动余量 ≤ 现在」，所以这里不再二次校验。
     pub start_at_ms: Option<i64>,
+    /// 手绘轨迹（BD-09 经纬度对）。`Some` 时跳过 planner，直接采用。
+    ///
+    /// 用户清楚哪栋楼在哪，手画比算法猜靠谱——尤其 OSM 在该校区
+    /// 零建筑数据、几何规划只能凭直线连点的时候。
+    pub custom_path: Option<Vec<(f64, f64)>>,
 }
 
 /// 尝试沿 OSM 真实道路规划。任何一步失败都返回 None（静默降级）。
@@ -190,6 +195,7 @@ impl Default for RunParams {
             sample_step_m: 5.0,
             prefer_roads: true,
             start_at_ms: None,
+            custom_path: None,
         }
     }
 }
@@ -377,7 +383,48 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         })
         .unwrap_or_default();
 
-    let track = if fence_ring.len() >= 3 {
+    // 手绘轨迹优先。
+    //
+    // OSM 在该校区零建筑数据，「按序串点」只能靠弧线连点，必然从楼里穿过去。
+    // 用户知道哪栋楼在哪，手画一条绕开的路线比任何算法都准，所以这里直接
+    // 采用，连围栏内缩和打卡点吸附都不做——点位已经在用户画的线上了。
+    let track = if let Some(custom) = p.custom_path.as_ref().filter(|v| v.len() >= 2) {
+        log(&format!("[track] 采用手绘轨迹 {} 个控制点", custom.len()));
+        let mut pts = crate::track::fence_route::resample_with_checkpoints(
+            custom,
+            p.sample_step_m,
+            &cps.iter().map(|c| (c.lat, c.lng)).collect::<Vec<_>>(),
+            12.0,
+        );
+        // 手画的长度和填的目标里程通常对不上，等比例缩放到目标值，
+        // 保持形状不变（和 planner 里 scale_to_length 一个思路）。
+        let drawn = crate::track::geo::path_length(&pts);
+        if drawn > 10.0 {
+            let k = p.distance_m / drawn;
+            // 只缩不改形状：绕质心缩放会让整条线平移，所以按首点锚定
+            let anchor = pts[0];
+            for q in pts.iter_mut() {
+                q.0 = anchor.0 + (q.0 - anchor.0) * k;
+                q.1 = anchor.1 + (q.1 - anchor.1) * k;
+            }
+        }
+        let n = pts.len();
+        let times = crate::track::planner::assign_times(n, start_ms, p.duration_sec);
+        let actual = crate::track::geo::path_length(&pts);
+        log(&format!(
+            "[track] 手绘轨迹缩放后 {:.0}m（原 {drawn:.0}m），{n} 点",
+            actual
+        ));
+        crate::track::PlanResult {
+            points: pts
+                .into_iter()
+                .zip(times)
+                .map(|((lat, lng), t)| crate::track::TrackPoint { lat, lon: lng, time_ms: t })
+                .collect(),
+            checkpoints: cps.clone(),
+            actual_length_m: actual,
+        }
+    } else if fence_ring.len() >= 3 {
         log(&format!(
             "[track] 围栏内规划 {}m，{} 个必经点…",
             p.distance_m,
