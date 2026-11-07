@@ -1122,7 +1122,11 @@ pub fn detail_payload_rrid(
         "uid": gz_str(uid),
         "run_data": gz_json(&run_wrap),
         "fixed_point_json": gz_str(five_point_json),
-        "segment_json": gz_str(""),
+        // 原来给空字符串。App 的 RunData 表里这列是 `TEXT NOT NULL`，
+        // 真实记录必定有内容；`""` 不是合法 JSON，服务端解析分段时
+        // 会直接失败，点位判定（"经过必经点位"/"至少通过2个普通点位"）
+        // 就永远拿不到依据。至少给一个空数组让它能解析。
+        "segment_json": gz_json(&Value::Array(Vec::<Value>::new())),
         "speed_json": gz_json(&Value::Array(
             speed.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
         )),
