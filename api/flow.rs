@@ -51,11 +51,53 @@ pub struct RunParams {
     pub seed: u64,
     /// 采样间距（米）。
     pub sample_step_m: f64,
+    /// 是否优先沿真实道路规划（OSM）。查不到路网时自动降级。
+    pub prefer_roads: bool,
     /// 指定开始时刻（毫秒戳）。`None` 表示现在开跑。
     ///
     /// 补跑时由 `start_time` 模块算好传进来——那边已经保证了
     /// 「开始 + 用时 + 抖动余量 ≤ 现在」，所以这里不再二次校验。
     pub start_at_ms: Option<i64>,
+}
+
+/// 尝试沿 OSM 真实道路规划。任何一步失败都返回 None（静默降级）。
+fn try_route_on_roads(
+    fence: &[(f64, f64)],
+    must: &[(f64, f64)],
+    want_m: f64,
+    seed: u64,
+    log: &mut dyn FnMut(&str),
+) -> Option<crate::track::fence_route::FenceRoute> {
+    use crate::track::roadnet;
+    let bbox = roadnet::bbox_of(fence, 80.0);
+    let net = match roadnet::fetch(bbox) {
+        Ok(n) => n,
+        Err(e) => {
+            log(&format!("[roads] 拉路网失败（{e}），改用几何规划"));
+            return None;
+        }
+    };
+    let clipped = net.clip_to_fence(fence);
+    let total = clipped.total_length_m();
+    if clipped.is_empty() || total < 300.0 {
+        log(&format!(
+            "[roads] OSM 在该校区只有 {total:.0}m 可用道路，改走几何规划"
+        ));
+        return None;
+    }
+    log(&format!("[roads] 路网 {total:.0}m，按真实道路规划"));
+    let start = must.first().copied().unwrap_or(fence[0]);
+    match roadnet::route_on_roads(&clipped, start, must, want_m, seed) {
+        Ok(r) => Some(crate::track::fence_route::FenceRoute {
+            points: r.points,
+            length_m: r.length_m,
+            lines: 1,
+        }),
+        Err(e) => {
+            log(&format!("[roads] 沿路规划失败（{e}），改用几何规划"));
+            None
+        }
+    }
 }
 
 impl RunParams {
@@ -129,6 +171,7 @@ impl Default for RunParams {
             steps: None,
             seed: 0,
             sample_step_m: 5.0,
+            prefer_roads: true,
             start_at_ms: None,
         }
     }
@@ -330,7 +373,18 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         // 地理上的环形顺序（实测是锯齿）。所以骨架必须按数组顺序穿点，
         // 绕圈再漂亮也没用——顺序错一条记录就废。
         let seed = if p.seed != 0 { p.seed } else { start_ms as u64 };
-        let route = if must.len() >= 2 {
+
+        // 优先走真实道路。OSM 在部分校区完全没有数据（实测某校整个 bbox
+        // 只有 1 个 landuse 标签），所以这是「能走就走」，失败静默降级到
+        // 几何规划——不能因为查不到路网就不跑了。
+        let on_roads = if p.prefer_roads {
+            try_route_on_roads(&fence_ring, &must, p.distance_m, seed, &mut *log)
+        } else {
+            None
+        };
+        let route = if let Some(r) = on_roads {
+            r
+        } else if must.len() >= 2 {
             match crate::track::fence_route::route_through_in_order(
                 &fence_ring,
                 p.distance_m,

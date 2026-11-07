@@ -1059,3 +1059,48 @@ mod verify_roundtrip_tests {
         assert!(v.stop_time_ms > v.start_time_ms);
     }
 }
+
+#[cfg(test)]
+mod step_distance_tests {
+    use super::tests::test_sim;
+    use super::*;
+
+    /// stepDistance 必须是**局部**步幅（1.0~1.5m 量级），不是累积平均。
+    #[test]
+    fn step_distance_is_local_stride() {
+        let p = SubmitParams {
+            uid: "1".into(), unid: "1".into(),
+            uuid: "00000000-0000-4000-8000-000000000000".into(),
+            sport_type: 1, total_distance_m: 2000, total_time_sec: 720,
+            total_steps: 1800, start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_720_000, sel_distance_m: 2000,
+            sel_run_time_sec: 720, policy: "0".into(), run_area_id: 0,
+            geo_fences_json: "[]".into(), total_ascent: 0,
+        };
+        let t: Vec<TrackPoint> = (0..400).map(|i| TrackPoint {
+            lat: 31.2304 + i as f64 * 5.0 / 111_320.0,
+            lon: 121.4737,
+            time_ms: 1_790_000_000_000 + i as i64 * 1800,
+        }).collect();
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+
+        let vals: Vec<f64> = arr.iter()
+            .filter_map(|q| q.get("stepDistance").and_then(|v| v.as_f64()))
+            .collect();
+        assert!(!vals.is_empty(), "stepDistance 全缺失");
+
+        // 真实单步步幅 0.8~1.8m。旧实现是「累计里程/总步数」，
+        // 前段趋近 0、末段趋近平均值，中间的会远小于 1m。
+        let mid: Vec<f64> = vals.iter().skip(vals.len()/4).take(vals.len()/2)
+            .copied().filter(|&v| v > 0.0).collect();
+        assert!(!mid.is_empty());
+        let avg = mid.iter().sum::<f64>() / mid.len() as f64;
+        assert!(avg > 0.6 && avg < 2.5, "局部步幅均值 {avg:.2}m 不在合理区间");
+        for (i, &v) in mid.iter().enumerate().take(20) {
+            assert!(v > 0.3 && v < 4.0, "第{i}个局部步幅 {v}m 异常");
+        }
+    }
+}
