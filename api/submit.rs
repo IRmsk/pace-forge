@@ -176,8 +176,14 @@ pub fn point_json_full(
         "gLng": (glng * 1e7).round() / 1e7,
         "gainTime": "",
         "id": idx as i64 + 1,
-        "lat": -1.0,
-        "lng": -1.0,
+        // lat/lng 必须是真的 BD-09 坐标。
+        //
+        // 这里原来写死 -1.0，只有 gLat/gLng 带真坐标。服务端按点位判定时
+        // 读的是 lat/lng，拿到 -1 就等于每个采样点都不在任何打卡点附近，
+        // 「按顺序通过所有点位」永远不会成立——轨迹明明精确穿过（最近
+        // 0.1m），六条记录全是 False。
+        "lat": (p.lat * 1e7).round() / 1e7,
+        "lng": (p.lon * 1e7).round() / 1e7,
         "locType": 1,
         "locationId": "",
         "queueNum": idx as i32,
@@ -837,10 +843,22 @@ mod point_shape_tests {
         assert_eq!(arr.len(), 3);
 
         let p0 = &arr[0];
-        // 占位坐标必须是 -1
-        assert_eq!(p0["lat"], -1.0, "lat 是占位");
-        assert_eq!(p0["lng"], -1.0, "lng 是占位");
-        // 真实坐标在 gLat/gLng，且已转到 gcj02
+        // lat/lng 是真实 BD-09，不是占位符。
+        //
+        // 这个断言原来写的是 `assert_eq!(p0["lat"], -1.0)`，把 bug 当成了
+        // 规格：服务端按 lat/lng 判点位，-1 等于每个采样点都不在打卡点附近，
+        // 「按顺序通过所有点位」永远 False。
+        assert!(
+            (p0["lat"].as_f64().unwrap() - 31.2304).abs() < 1e-6,
+            "lat 应是原始 BD-09 坐标，实际 {:?}",
+            p0["lat"]
+        );
+        assert!(
+            (p0["lng"].as_f64().unwrap() - 121.4737).abs() < 1e-6,
+            "lng 应是原始 BD-09 坐标，实际 {:?}",
+            p0["lng"]
+        );
+        // 另一套坐标在 gLat/gLng，已转到 gcj02
         assert!(p0["gLat"].as_f64().unwrap() > 31.0);
         assert!(p0["gLng"].as_f64().unwrap() > 121.0);
         assert_ne!(p0["gLat"].as_f64().unwrap(), 31.2304, "应该是转换后的坐标");

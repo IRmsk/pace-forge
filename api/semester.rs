@@ -123,11 +123,28 @@ impl SemesterGoal {
 }
 
 /// 查学期汇总。
+///
+/// 空 body 拿回来的是空学期（`sname: ""`、`semesterValidDis: 0`），
+/// 而 `goal` 接口同时返回 sid=9679 和有效的学期名。服务端显然要按
+/// sid 查，所以这里先取 goal 拿 sid 再请求汇总。
 pub fn fetch_summary(client: &Client) -> Result<SemesterSummary, String> {
+    fetch_summary_for(client, None)
+}
+
+/// 按指定学期查汇总。`sid` 为 None 时先问 goal 接口。
+pub fn fetch_summary_for(client: &Client, sid: Option<i64>) -> Result<SemesterSummary, String> {
+    let sid = match sid {
+        Some(s) => Some(s),
+        None => fetch_goal(client, 1).ok().map(|g| g.sid).filter(|s| *s > 0),
+    };
+    let body = match sid {
+        Some(s) => json!({ "sid": s }),
+        None => json!({}),
+    };
     let raw = client.request(
         "POST",
         &format!("{}{}", hosts::RUN, SUMMARY_PATH),
-        Some(&json!({})),
+        Some(&body),
     )?;
     let v = expect_ok(&raw)?;
     Ok(parse_summary(&v))

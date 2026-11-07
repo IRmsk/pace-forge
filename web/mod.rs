@@ -1186,11 +1186,21 @@ fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), Str
     };
 
     let mut out = serde_json::Map::new();
-    // 原始响应也带上，字段名不对时能直接看
+    // 原始响应也带上，字段名不对时能直接看。
+    // 这里必须和 fetch_summary 一样带 sid：空 body 服务端回的是空学期
+    // （sname=""、全部 0），和下面的 summary 对不上。
+    let sid = crate::api::semester::fetch_goal(&client, 1)
+        .ok()
+        .map(|g| g.sid)
+        .filter(|s| *s > 0);
+    let raw_body = match sid {
+        Some(s) => json!({ "sid": s }),
+        None => json!({}),
+    };
     if let Ok(raw) = client.request(
         "POST",
         &format!("{}{}", crate::crypto::consts::hosts::RUN, crate::api::semester::SUMMARY_PATH),
-        Some(&json!({})),
+        Some(&raw_body),
     ) {
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
             if let Some(d) = v.get("data") {
