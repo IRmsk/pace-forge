@@ -275,11 +275,31 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
 
     // ① policy
     log(&format!("[policy] 拉取策略 runMode={}…", p.run_mode));
-    let pol = policy::fetch_policy_for(client, p.run_mode)?;
-    log(&format!(
-        "√ [policy] ts={} policy={} minDistance={} validTime={}",
-        pol.timestamp, pol.policy, pol.min_distance, pol.valid_time
-    ));
+    // 记分跑在时段外会直接 11016，连策略串都拿不到。但提交报文只要
+    // policy 这个字符串（实测恒为 "0"），timestamp 不进签名，点位又走
+    // 独立的 /api/points，所以拿不到策略不等于不能提交。
+    // PACE_STRICT_POLICY=1 可以关掉兜底，保留原来的硬失败行为。
+    let strict = std::env::var("PACE_STRICT_POLICY").ok().as_deref() == Some("1");
+    let pol = match policy::fetch_policy_for(client, p.run_mode) {
+        Ok(v) => {
+            log(&format!(
+                "√ [policy] ts={} policy={} minDistance={} validTime={}",
+                v.timestamp, v.policy, v.min_distance, v.valid_time
+            ));
+            v
+        }
+        Err(e) if !strict => {
+            let fb = policy::fallback_policy();
+            log(&format!("⚠ [policy] 拉取失败（{e}）"));
+            log(&format!(
+                "⚠ [policy] 改用兜底：policy={} minDistance={} validTime={}，\
+照常提交看服务端是否接受",
+                fb.policy, fb.min_distance, fb.valid_time
+            ));
+            fb
+        }
+        Err(e) => return Err(e),
+    };
 
     // ② fence
     log("[fence] 拉取围栏…");

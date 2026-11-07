@@ -206,6 +206,27 @@ pub fn fetch_policy_for(client: &Client, run_mode: i64) -> Result<PolicyInfo, St
     parse_policy_response(&v)
 }
 
+/// 拿不到策略时的兜底值。
+///
+/// `runModePolicy` 会按**服务器当前时间**判时段，记分跑一旦不在窗口内
+/// 就直接回 11016，连策略串都拿不到。但提交报文里只需要 `policy` 这个
+/// 字符串（实测恒为 "0"）外加 `minDistance` / `validTime` 两项阈值，
+/// `timestamp` 根本没进签名——所以拉不到策略不代表不能提交。
+///
+/// 这里给一份保守默认值：minDistance 用服务端最常见的 1500，validTime
+/// 取户外跑实测的 06:00~21:30 窗口长度。`must_points` 留空，因为点位
+/// 走的是独立的 `/api/points` 接口，不依赖策略。
+pub fn fallback_policy() -> PolicyInfo {
+    PolicyInfo {
+        timestamp: crate::crypto::envelope::now_ms() as i64,
+        policy: 0,
+        min_distance: 1500,
+        valid_time: 55_800,
+        must_points: Vec::new(),
+        pace_range: None,
+    }
+}
+
 /// 默认按校园跑拉策略。
 pub fn fetch_policy(client: &Client) -> Result<PolicyInfo, String> {
     fetch_policy_for(client, 1)
