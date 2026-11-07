@@ -183,9 +183,9 @@ button.danger:disabled{opacity:.5}
         <option value="3">室外锻炼</option>
       </select></label>
       <label>路线<select id="rMode">
-        <option value="free">自由路线</option>
-        <option value="draw">自己画（地图上手绘）</option>
-        <option value="stadium">操场绕圈</option>
+        <option value="free">自动规划（算法生成）</option>
+        <option value="draw">手绘轨迹（自己画）</option>
+        <option value="stadium">操场绕圈（算法生成）</option>
       </select></label>
       <label id="laneWrap" style="display:none">道次<select id="rLane">
         <option>1</option><option>2</option><option>3</option><option>4</option>
@@ -304,8 +304,14 @@ $('rMode').onchange = () => {
       $('map').scrollIntoView({ behavior: 'smooth', block: 'center' });
       if (map) map.invalidateSize();
     }, 60);
+    setOut('已切到手绘：在地图上按住拖动画出路线，画完点「用这条轨迹」');
   } else {
     setDrawMode(false);
+    if (v === 'stadium') {
+      setOut('已切到操场绕圈：算法按道次生成标准跑道');
+    } else {
+      setOut('已切到自动规划：算法按围栏和点位算路线');
+    }
   }
 };
 
