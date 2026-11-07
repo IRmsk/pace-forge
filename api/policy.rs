@@ -181,6 +181,12 @@ pub fn fetch_policy_for(client: &Client, run_mode: i64) -> Result<PolicyInfo, St
         Some(&body),
     )?;
     let v = expect_ok(&raw)?;
+    // 策略响应里可能有点位判定相关的字段，我们只解析了四个。
+    // 把原始 JSON 落盘，逐字段比对 runMode=1 与 runMode=2 的差异。
+    if let Ok(dir) = std::env::var("PACE_DUMP_POLICY") {
+        let path = format!("{dir}/policy-runmode{run_mode}.json");
+        let _ = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default());
+    }
     parse_policy_response(&v)
 }
 

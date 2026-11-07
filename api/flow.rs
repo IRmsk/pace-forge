@@ -651,8 +651,16 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                 crate::track::geo::distance((a, o), gcj)
             })
             .fold(f64::MAX, f64::min);
+        // 首次经过索引：服务端「按顺序通过所有点位」看的就是这个。
+        // 距离 0.1m 只说明穿过了，顺序错了一样判 False。
+        let first_bd = view
+            .points
+            .iter()
+            .position(|p| crate::track::geo::distance((p.lat, p.lon), bd) < 10.0)
+            .map(|x| x as i64)
+            .unwrap_or(-1);
         log(&format!(
-            "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m"
+            "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m / 首次经过 idx={first_bd}"
         ));
     }
 
@@ -760,22 +768,40 @@ pub fn run_full(
     // allLocJson 的 lat/lon 是 BD-09、gLat/gLng 是 GCJ-02，两套都给了。
     // fivePointJson 只有一个 lat/lon——服务端拿它和轨迹的哪一套比，
     // 决定「经过点位」成败，而两套差 850m。可用 PACE_FIXED_GPS=1 切换。
-    let fixed_in_gcj = std::env::var("PACE_FIXED_GPS").map(|v| v == "1").unwrap_or(false);
+    let pos_is_index = std::env::var("PACE_POS_MODE").map(|v| v == "idx").unwrap_or(true);
     let fixed: Vec<super::submit::FixedPoint> = out
         .points
-        .coords
+        .points
         .iter()
         .enumerate()
-        .map(|(i, &(lat, lon))| {
-            let (a, o) = if fixed_in_gcj {
-                crate::api::coord::bd09_to_gcj02(lat, lon)
-            } else {
-                (lat, lon)
-            };
+        .map(|(i, raw)| {
+            let bd = (
+                raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            );
+            // position 有两种可能语义：点位序号(1..n) 或该点位在轨迹点
+            // 数组里的首次经过索引。默认用后者——服务端要按顺序校验时，
+            // 需要知道每个打卡点落在轨迹的第几个采样点上。
+            let first_idx = out
+                .track
+                .iter()
+                .position(|t| {
+                    crate::track::geo::distance((t.lat, t.lon), bd) < 10.0
+                })
+                .map(|x| x as i32)
+                .unwrap_or(i as i32 + 1);
             super::submit::FixedPoint {
-                lat: a,
-                lon: o,
-                position: i as i32 + 1,
+                lat: bd.0,
+                lon: bd.1,
+                position: if pos_is_index { first_idx } else { i as i32 + 1 },
+                is_fixed: raw.get("isFixed").and_then(|v| v.as_i64()).unwrap_or(0),
+                point_name: raw
+                    .get("pointName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                glat: raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                glon: raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
             }
         })
         .collect();
@@ -833,11 +859,15 @@ pub fn run_full(
     // ⑨ OBS：用 rrid 重算桶 id 和 objectKey
     let rrid = out.record_id.unwrap_or(0);
     log(&format!("[obs] 用 rrid={rrid} 上传明细…"));
+    // OBS 的 fixed_point_json 要的是裸点位数组，不是主报文那层 envelope。
+    // 之前把 envelope 整个塞进来，服务端解不出点位列表。
     let five_pt = body
         .get("fivePointJson")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+        .and_then(|v| v.get("fivePointJson").cloned())
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid, &five_pt);
     let keys = vec![
         super::obs::detail_key(start_ms, &uuid),
@@ -1139,5 +1169,41 @@ mod tests {
         // 配速应该在合理区间
         let pace = 1000.0 / (p.distance_m / p.duration_sec as f64) / 60.0;
         assert!((3.0..=12.0).contains(&pace), "默认配速 {pace:.2} 不合理");
+    }
+}
+
+#[cfg(test)]
+mod fixed_point_payload_tests {
+    /// OBS 的 fixed_point_json 必须是裸点位数组。
+    ///
+    /// 之前把主报文那层 envelope（{fivePointJson, useZip, runAreaId, ...}）
+    /// 整个塞进去，服务端解不出点位列表，`按顺序通过所有点位` 永远 False。
+    #[test]
+    fn fixed_point_json_is_bare_array() {
+        let raw = r#"[{"lon":123.9,"lat":47.3,"position":1}]"#;
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(v.is_array(), "必须是数组");
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert!(v[0].get("position").is_some());
+    }
+
+    /// 从 envelope 里抽裸数组：主报文是双层，OBS 要单层。
+    #[test]
+    fn envelope_unwraps_to_bare_array() {
+        let inner = r#"[{"lon":1.0,"lat":2.0,"position":3}]"#;
+        let envelope = serde_json::json!({
+            "fivePointJson": inner,
+            "useZip": false,
+            "runAreaId": 1668,
+        })
+        .to_string();
+        let extracted = serde_json::from_str::<serde_json::Value>(&envelope)
+            .ok()
+            .and_then(|v| v.get("fivePointJson").cloned())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert_eq!(extracted, inner);
+        let arr: serde_json::Value = serde_json::from_str(&extracted).unwrap();
+        assert!(arr.is_array());
     }
 }

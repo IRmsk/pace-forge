@@ -48,11 +48,21 @@ pub struct SubmitParams {
 }
 
 /// 打卡点。
+///
+/// 字段对齐服务端 `points` 接口返回的原始结构，不是自己拼的三个字段。
+/// 点位响应是 `{lon, lat, isFixed, pointName, glon, glat}`，服务端要靠
+/// 这套字段把轨迹和它自己发的打卡点对上号；只回传 lat/lon/position 时
+/// 它认不出是同一个点，`按顺序通过所有点位` 就会判 False（实测 6 条全中）。
 #[derive(Debug, Clone)]
 pub struct FixedPoint {
     pub lat: f64,
     pub lon: f64,
     pub position: i32,
+    /// 服务端原始字段，原样回显。
+    pub is_fixed: i64,
+    pub point_name: String,
+    pub glat: f64,
+    pub glon: f64,
 }
 
 /// 构建结果。
@@ -389,12 +399,26 @@ pub fn build(
         .collect();
     let all_loc_json = serde_json::to_string(&loc_items).map_err(|e| e.to_string())?;
 
+    // 原样回显服务端的点位结构：lon/lat 是 BD-09，glon/glat 是 GCJ-02，
+    // isFixed 区分必经点与普通点，pointName 是点位标识。缺任何一个，
+    // 服务端都可能认不出这是它发的那批点。
     let fp_items: Vec<Value> = fixed
         .iter()
-        .map(|f| json!({"lat": f.lat, "lon": f.lon, "position": f.position}))
+        .map(|f| {
+            json!({
+                "lon": f.lon,
+                "lat": f.lat,
+                "isFixed": f.is_fixed,
+                "pointName": f.point_name,
+                "glon": f.glon,
+                "glat": f.glat,
+                "position": f.position,
+            })
+        })
         .collect();
-    // fivePointJson 是一层 envelope，不是裸数组：服务端要同时拿到点位列表、
-    // 围栏回显和 runAreaId 才能校验打卡合规。
+    // 主报文这一层要 envelope：改成裸数组服务端直接 -10000
+    // （成绩上传失败）。记录详情里 fivePointJson 回显 "" 是正常的，
+    // 点位数据走的是 OBS 明细里的 fixed_point_json。
     let five_envelope = json!({
         "fivePointJson": serde_json::to_string(&fp_items).map_err(|e| e.to_string())?,
         "useZip": false,
