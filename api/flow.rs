@@ -99,6 +99,20 @@ impl RunParams {
         if self.sample_step_m <= 0.0 || self.sample_step_m > 100.0 {
             return Err(format!("采样间距不合理: {} m", self.sample_step_m));
         }
+        // 报文的 totalTime 只到秒，采样间隔必须 ≥ 最快速度下的 1 秒，
+        // 否则反解后相邻点时间戳相同，服务端会看到 0 时长段。
+        // 8 m/s 上限下，1 秒 = 8 米。
+        if self.sample_step_m < 8.0 && self.duration_sec > 0 {
+            let avg_v = self.distance_m / self.duration_sec as f64;
+            let gap = self.sample_step_m / avg_v.max(0.5);
+            if gap < 1.0 {
+                return Err(format!(
+                    "采样间距 {}m 在 {avg_v:.2} m/s 下只有 {gap:.2} 秒，                     报文时间精度是秒，会画出 0 时长段；把间距调到 {:.0}m 以上",
+                    self.sample_step_m,
+                    avg_v.max(0.5)
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -464,18 +478,55 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     ));
 
     // ⑦ 自检
+    //
+    // 校验对象必须是**报文里那份数据**，不是内存里的 sim/params。
+    // 之前 preflight 吃的是 sim，而报文是 build() 另外拼的——两边一旦
+    // 分叉（历史 bug：桶被重新生成过），自检就在守一份发不出去的数据。
     let cp_tuples: Vec<(f64, f64, String)> =
         cps.iter().map(|c| (c.lat, c.lng, c.name.clone())).collect();
-    let check = Check {
-        points: &track_points,
-        sim: &sim,
-        params: &sp,
-        checkpoints: &cp_tuples,
+    // 先按真实参数把报文组装出来（纯本地计算，不联网），再把它反解成
+    // 校验视图。这一步是「自检守 A、提交发 B」的根治：检查对象从内存结构
+    // 换成报文 JSON 反解的结果，两者物理上是同一份数据。
+    // uid/unid 用占位符——校验不看身份字段。
+    let probe = super::submit::SubmitParams {
+        uid: "probe".into(),
+        unid: "0".into(),
+        uuid: "00000000-0000-4000-8000-000000000000".into(),
+        sport_type: p.sport_type,
         total_distance_m: real_len,
         total_time_sec: p.duration_sec,
         total_steps: sim.total_steps,
         start_time_ms: start_ms,
         stop_time_ms: start_ms + p.duration_sec * 1000,
+        sel_distance_m: pol.min_distance,
+        sel_run_time_sec: p.duration_sec,
+        policy: pol.policy.to_string(),
+        run_area_id: -1,
+        geo_fences_json: "[]".into(),
+        total_ascent: 0,
+    };
+    let probe_sub = super::submit::build(&probe, &track_points, &[], &sim)?;
+    let view = super::submit::verify_view(&probe_sub.save_record)?;
+    log(&format!(
+        "√ [verify] 从报文反解：{} 点 / {:.0}m / {}s / {} 步 / {} 个步数桶",
+        view.point_count,
+        view.total_distance_m,
+        view.total_time_sec,
+        view.total_steps,
+        view.step_buckets.len()
+    ));
+    let view_sim = view.as_sim();
+
+    let check = Check {
+        points: &view.points,
+        sim: &view_sim,
+        params: &sp,
+        checkpoints: &cp_tuples,
+        total_distance_m: view.total_distance_m as i64,
+        total_time_sec: view.total_time_sec,
+        total_steps: view.total_steps,
+        start_time_ms: view.start_time_ms,
+        stop_time_ms: view.stop_time_ms,
         pace_range: pol.pace_range,
     };
     let report = inspect(&check);

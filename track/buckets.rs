@@ -6,12 +6,12 @@
 //!
 //! 总量对但分桶像机器，一样判无效。所以桶里必须有自然抖动。
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::geo::distance;
 
 /// 速度桶。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedBucket {
     pub distance: f64,
     #[serde(rename = "beginTime")]
@@ -28,7 +28,7 @@ pub struct SpeedBucket {
 }
 
 /// 步频桶。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepBucket {
     #[serde(rename = "stepsNum")]
     pub steps_num: i32,

@@ -173,6 +173,143 @@ pub fn point_json_full(
     })
 }
 
+/// 从**已组装好的报文**反解出校验视图。
+///
+/// 这是「自检守 A、提交发 B」的根治手段：不再让 preflight 吃内存里的
+/// `sim`，而是先把报文 JSON 造出来、再反解回来校验。检查对象和发送对象
+/// 从此物理上是同一份数据——不管以后谁在 build() 里塞新东西，只要它进了
+/// 报文就会被检查到，进不了报文的东西也不会被误认为已检查。
+#[derive(Debug, Clone)]
+pub struct VerifyView {
+    /// 从报文点位反解出的轨迹（时间戳来自 totalTime）。
+    pub points: Vec<TrackPoint>,
+    pub total_distance_m: f64,
+    pub total_time_sec: i64,
+    pub total_steps: i32,
+    pub start_time_ms: i64,
+    pub stop_time_ms: i64,
+    /// 报文里的步数桶（原样）。
+    pub step_buckets: Vec<crate::track::StepBucket>,
+    /// 报文里的速度桶（原样）。
+    pub speed_buckets: Vec<crate::track::SpeedBucket>,
+    /// 报文声明的配速字段（分/公里 × 1000）。
+    pub speed_field: i64,
+    /// 点位条数。
+    pub point_count: usize,
+}
+
+impl VerifyView {
+    /// 包成 preflight 要的 SimResult 形状。
+    ///
+    /// 只填能从报文读到的东西；读不到的（瞬时速度、步幅）留空，
+    /// 让相关检查自己跳过，而不是拿内存里的值冒充。
+    pub fn as_sim(&self) -> crate::track::SimResult {
+        crate::track::SimResult {
+            speeds: Vec::new(),
+            cadences: Vec::new(),
+            strides: Vec::new(),
+            total_steps: self.total_steps,
+            avg_cadence: if self.total_time_sec > 0 {
+                self.total_steps as f64 / (self.total_time_sec as f64 / 60.0)
+            } else {
+                0.0
+            },
+            speed_buckets: self.speed_buckets.clone(),
+            step_buckets: self.step_buckets.clone(),
+            actual_length_m: self.total_distance_m,
+        }
+    }
+}
+
+/// 从提交报文反解出校验视图。字段名和 `point_json_full` / `build` 一一对应。
+pub fn verify_view(body: &Value) -> Result<VerifyView, String> {
+    let start_ms = body
+        .get("startTime")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            body.get("allLocJson")
+                .and_then(|v| v.as_str())
+                .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
+                .and_then(|a| a.first().and_then(|p| p.get("flag")).and_then(|f| f.as_i64()))
+        })
+        .ok_or("报文缺 startTime")?;
+    let stop_ms = body.get("stopTime").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    let raw = body
+        .get("allLocJson")
+        .and_then(|v| v.as_str())
+        .ok_or("报文缺 allLocJson")?;
+    let arr: Vec<Value> = serde_json::from_str(raw).map_err(|e| format!("allLocJson 解析失败: {e}"))?;
+    if arr.is_empty() {
+        return Err("allLocJson 为空".into());
+    }
+
+    let mut points: Vec<TrackPoint> = Vec::with_capacity(arr.len());
+    for (i, q) in arr.iter().enumerate() {
+        // 真实坐标在 gLat/gLng（GCJ-02）；lat/lng 是 -1 占位
+        let glat = q.get("gLat").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let glng = q.get("gLng").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if glat == 0.0 || glng == 0.0 {
+            return Err(format!("第 {i} 个点缺 gLat/gLng"));
+        }
+        let (lat, lon) = crate::api::coord::gcj02_to_bd09(glat, glng);
+        let total_time = q.get("totalTime").and_then(|v| v.as_i64()).unwrap_or(0);
+        points.push(TrackPoint {
+            lat,
+            lon,
+            time_ms: start_ms + total_time * 1000,
+        });
+    }
+
+    let last = arr.last().unwrap();
+    let total_distance_m = last
+        .get("totalDis")
+        .and_then(|v| v.as_f64())
+        .ok_or("末点缺 totalDis")?;
+    let total_time_sec = last
+        .get("totalTime")
+        .and_then(|v| v.as_i64())
+        .ok_or("末点缺 totalTime")?;
+    let total_steps = last
+        .get("steps")
+        .and_then(|v| v.as_i64())
+        .ok_or("末点缺 steps")? as i32;
+
+    let parse_buckets = |key: &str| -> Vec<Value> {
+        match body.get(key) {
+            Some(Value::Array(a)) => a.clone(),
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    };
+
+    let step_buckets: Vec<crate::track::StepBucket> = parse_buckets("stepsPerTenSec")
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+    let speed_buckets: Vec<crate::track::SpeedBucket> = parse_buckets("speedPerTenSec")
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect();
+
+    Ok(VerifyView {
+        point_count: points.len(),
+        points,
+        total_distance_m,
+        total_time_sec,
+        total_steps,
+        start_time_ms: start_ms,
+        stop_time_ms: if stop_ms > 0 {
+            stop_ms
+        } else {
+            start_ms + total_time_sec * 1000
+        },
+        step_buckets,
+        speed_buckets,
+        speed_field: body.get("speed").and_then(|v| v.as_i64()).unwrap_or(0),
+    })
+}
+
 /// 计算 `speed` 字段：配速（分/公里）× 1000。
 pub fn speed_field(distance_m: f64, time_sec: i64) -> i64 {
     if distance_m <= 0.0 || time_sec <= 0 {
@@ -815,5 +952,95 @@ mod single_source_tests {
                 .unwrap_or(-1);
             assert!(v > 0, "第 {i} 桶步数是 {v}，会出现静止断点");
         }
+    }
+}
+
+#[cfg(test)]
+mod verify_roundtrip_tests {
+    use super::tests::test_sim;
+    use super::*;
+
+    fn params() -> SubmitParams {
+        SubmitParams {
+            uid: "1".into(),
+            unid: "1".into(),
+            uuid: "00000000-0000-4000-8000-000000000000".into(),
+            sport_type: 1,
+            total_distance_m: 2000,
+            total_time_sec: 720,
+            total_steps: 1800,
+            start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_720_000,
+            sel_distance_m: 2000,
+            sel_run_time_sec: 720,
+            policy: "0".into(),
+            run_area_id: 0,
+            geo_fences_json: "[]".into(),
+            total_ascent: 0,
+        }
+    }
+
+    fn track() -> Vec<TrackPoint> {
+        (0..400)
+            .map(|i| TrackPoint {
+                lat: 31.2304 + i as f64 * 5.0 / 111_320.0,
+                lon: 121.4737,
+                time_ms: 1_790_000_000_000 + i as i64 * 1800,
+            })
+            .collect()
+    }
+
+    /// 报文 → 反解 → 视图，桶必须原样回来。
+    /// 这条保证 preflight 校验的对象就是发出去的那份。
+    #[test]
+    fn verify_view_roundtrips_buckets() {
+        let p = params();
+        let t = track();
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let v = verify_view(&sub.save_record).unwrap();
+
+        assert_eq!(v.step_buckets.len(), sim.step_buckets.len());
+        for (a, b) in v.step_buckets.iter().zip(sim.step_buckets.iter()) {
+            assert_eq!(a.steps_num, b.steps_num, "反解后步数桶变了");
+        }
+        assert_eq!(v.point_count, t.len());
+        assert_eq!(v.total_steps, sim.total_steps);
+    }
+
+    /// 反解出来的坐标必须是 BD-09，并且和原轨迹对得上（±1m）。
+    #[test]
+    fn verify_view_roundtrips_coords() {
+        let p = params();
+        let t = track();
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let v = verify_view(&sub.save_record).unwrap();
+        assert_eq!(v.points.len(), t.len());
+        for (got, want) in v.points.iter().zip(t.iter()) {
+            let d = crate::track::geo::distance((got.lat, got.lon), (want.lat, want.lon));
+            assert!(d < 1.0, "第 {} 点偏移 {d:.2}m（BD→GCJ→BD 往返误差过大）", got.lat);
+            // 报文 totalTime 的单位是**秒**，毫秒精度在这里必然丢失。
+            // 这也意味着采样间隔必须 ≥1 秒，否则反解后会出现时间戳重复的
+            // 0 时长段（RunParams::validate 里有对应的下限检查）。
+            assert!(
+                (got.time_ms - want.time_ms).abs() < 1000,
+                "时间戳反解误差超过 1 秒：got {} want {}",
+                got.time_ms,
+                want.time_ms
+            );
+        }
+    }
+
+    /// 时间轴端点必须精确等于报文的 startTime/stopTime。
+    #[test]
+    fn verify_view_time_matches_payload() {
+        let p = params();
+        let t = track();
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let v = verify_view(&sub.save_record).unwrap();
+        assert_eq!(v.start_time_ms, p.start_time_ms);
+        assert!(v.stop_time_ms > v.start_time_ms);
     }
 }
