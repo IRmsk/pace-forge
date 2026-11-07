@@ -186,9 +186,9 @@ fn dry_run(dist_km: f64, dur_min: f64) {
 /// 完全离线的轨迹体检：不登录、不联网，只看本地合成的数据像不像真跑。
 fn local_check(dist_km: f64, dur_min: f64) {
     use pace_forge::track::{
-        buckets::{make_jitter, speed_buckets, step_buckets},
+        buckets::{make_jitter, speed_buckets},
         detect::{inspect, PointRule},
-        plan, simulate, KinParams, PlanRequest, SimParams, StadiumSpec,
+        simulate, KinParams, SimParams, StadiumSpec,
     };
 
     let total_m = dist_km * 1000.0;
@@ -219,8 +219,9 @@ fn local_check(dist_km: f64, dur_min: f64) {
 
     // 分桶
     let sb = speed_buckets(&pts3, start_ms, total_sec);
-    let jit = make_jitter(sb.len().max(1), 1.0, start_ms as u64);
-    let stb = step_buckets(start_ms, total_sec, 180, &jit);
+    // 这里原来还造了一份 step_buckets(..., 180, &jit) 赋给 stb 却从没用过
+    // （clippy 一直报 unused variable）——分桶由 simulate() 产出。
+    let _ = make_jitter(sb.len().max(1), 1.0, start_ms as u64);
 
     // 合成
     let sp = SimParams {

@@ -61,7 +61,18 @@ fn read_json<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
 fn write_json<T: Serialize>(name: &str, value: &T) -> Result<(), String> {
     let path = data_dir().join(name);
     let json = serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    // 会话文件含 token，权限收紧到 0600
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+    let mut f = std::fs::File::create(&path)
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    use std::io::Write;
+    f.write_all(json.as_bytes())
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))
 }
 
 /// 读取会话。没有或损坏时返回空会话。

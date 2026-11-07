@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 use super::client::Client;
 
 use crate::crypto::sign::{sport_signature, SignFields};
-use crate::track::buckets::{speed_buckets, step_buckets, StepBucket};
 use crate::track::TrackPoint;
 
 /// 每公里消耗千卡。
@@ -77,7 +76,7 @@ pub fn point_json_full(
     idx: usize,
     n: usize,
     start_ms: i64,
-    start_pt: (f64, f64),
+    _start_pt: (f64, f64),
     prev: &mut (f64, f64),
     cum: &mut (f64, i64, i64),
     prev_time: &mut i64,
@@ -93,9 +92,15 @@ pub fn point_json_full(
     } else {
         crate::track::geo::distance(*prev, (p.lat, p.lon))
     };
+    let prev_cum = *cum; // 本段的起点累计量，供局部步幅计算
     cum.0 += step_m;
     cum.1 = (p.time_ms - start_ms) / 1000;
     *prev = (p.lat, p.lon);
+
+    // 本段步数：累计步数按点序线性分配后取差
+    let cum_steps_now = ((total_steps as f64) * (idx as f64 + 1.0) / n as f64).round() as i64;
+    let cum_steps_prev = ((total_steps as f64) * idx as f64 / n as f64).round() as i64;
+    let seg_steps = cum_steps_now - cum_steps_prev;
 
     // 瞬时速度用真实采样间隔，不是固定 5 秒
     let gap_sec = if idx == 0 {
@@ -136,6 +141,16 @@ pub fn point_json_full(
     let h2 = (p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
     let radius = 1.5 + ((h2 >> 40) % 150) as f64 / 100.0;
 
+    // 局部步幅：本段位移 / 本段步数。原来那个表达式化简后是
+    // 「累计里程 / 全程步数」，单调递增的累积平均值，不是即时步幅。
+    let d_seg = cum.0 - prev_cum.0;
+    let step_distance = if d_seg > 0.5 && seg_steps >= 1 {
+        let s_seg = seg_steps as f64;
+        ((d_seg / s_seg) * 10000.0).round() / 10000.0
+    } else {
+        0.0
+    };
+
     json!({
         "avgSpeed": (avg_speed * 10000.0).round() / 10000.0,
         // 海拔三兄弟不能是 0：服务端按它们算累计爬升，全 0 等于「在海底跑」
@@ -160,11 +175,13 @@ pub fn point_json_full(
         "speed": (inst * 10000.0).round() / 10000.0,
         "state": if idx == 0 { 1 } else { 0 },
         "steps": ((total_steps as f64) * (idx as f64 + 1.0) / n as f64).round() as i64,
-        "stepDistance": if cum.0 > 1.0 {
-            ((cum.0 / cum.0.max(1.0)) * (cum.0 / (total_steps as f64).max(1.0)) * 10000.0).round() / 10000.0
-        } else {
-            0.0
-        },
+        // 局部步幅 = 本段位移 / 本段步数。
+        //
+        // 原来是 ((cum.0 / cum.0.max(1.0)) * (cum.0 / total_steps) ...)——
+        // 进这分支的前提就是 cum.0 > 1.0，所以第一个因子恒等于 1.0，
+        // 整个表达式化简成「累计里程 / 全程步数」，是个随点序单调增长的
+        // 累积平均值，不是采样点的即时步幅。真实 App 这里是局部量。
+        "stepDistance": step_distance,
         "totalDis": (cum.0 * 10000.0).round() / 10000.0,
         "totalTime": cum.1,
         "type": ptype,
@@ -345,8 +362,6 @@ pub fn build(
     let calorie = (params.total_distance_m as f64 / 1000.0 * CALORIE_PER_KM) as i64;
 
     // 轨迹点带瞬时速度（中心差分），服务端画图会用到
-    let pts: Vec<(f64, f64, i64)> =
-        points.iter().map(|p| (p.lat, p.lon, p.time_ms)).collect();
     // 单一数据源：直接用 simulate() 产出的桶。
     //
     // 之前这里拿 make_jitter(amp=1.0) **重新生成**了一套桶写进报文，而自检

@@ -19,15 +19,13 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
-    # 先观察，不阻断。警告清干净之后再摘掉 continue-on-error。
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: cargo clippy
-        run: cargo clippy --all-targets 2>&1 | tee /tmp/clippy.log
+      - name: cargo clippy（零警告，-D warnings）
+        run: cargo clippy --all-targets -- -D warnings
       - name: cargo fmt --check
         run: cargo fmt --check || echo "格式未统一（不阻断）"

@@ -30,6 +30,7 @@ struct State {
 }
 
 impl State {
+    #[allow(dead_code)]
     fn new() -> Self {
         Self {
             book: crate::api::accounts::Book::default(),
@@ -136,11 +137,113 @@ fn device_scope(id_or_username: &str) -> String {
 }
 
 /// 启动 Web 控制台。
+/// 控制台口令。设置环境变量 `PACE_FORGE_TOKEN` 后，所有 `/api/*` 请求
+/// 必须带 `X-Pace-Token` 或 `?token=`，否则 401。
+///
+/// 不设置时只允许本机访问——绑 0.0.0.0 又没有口令，等于把「登录/提交/删账号」
+/// 暴露给同网段任意主机，密码还是明文 HTTP 传的。
+fn auth_token() -> Option<String> {
+    std::env::var("PACE_FORGE_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+/// 请求来源是否本机。
+fn is_loopback(remote: &str) -> bool {
+    let r = remote.trim();
+    r.starts_with("127.")
+        || r.starts_with("::1")
+        || r.starts_with("[::1]")
+        || r == "::ffff:127.0.0.1"
+}
+
+/// 鉴权通过返回 Ok，否则返回 Err(要回给客户端的话)。
+fn check_auth(request: &tiny_http::Request, path: &str, query: &str) -> Result<(), String> {
+    // 静态页不拦，否则连页面都打不开
+    if path == "/" || path == "/index.html" {
+        return Ok(());
+    }
+    match auth_token() {
+        Some(want) => {
+            let from_header = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("X-Pace-Token"))
+                .map(|h| h.value.as_str().to_string());
+            let from_query = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("token="))
+                .map(|v| url_decode(v));
+            let got = from_header.or(from_query).unwrap_or_default();
+            if got == want {
+                Ok(())
+            } else {
+                Err("缺少或错误的口令（X-Pace-Token）".into())
+            }
+        }
+        None => {
+            let remote = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            if is_loopback(&remote) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "拒绝来自 {remote} 的访问：控制台默认只允许本机，\
+                     远程使用请设置 PACE_FORGE_TOKEN 并在请求头带 X-Pace-Token"
+                ))
+            }
+        }
+    }
+}
+
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| -> Option<u8> {
+                    match c {
+                        b'0'..=b'9' => Some(c - b'0'),
+                        b'a'..=b'f' => Some(c - b'a' + 10),
+                        b'A'..=b'F' => Some(c - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(a), Some(c)) => {
+                        out.push(a * 16 + c);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
 pub fn serve(addr: &str) -> Result<(), String> {
     let server = Server::http(addr).map_err(|e| format!("监听 {addr} 失败: {e}"))?;
     let state: Shared = Arc::new(Mutex::new(State::restore()));
 
     println!("Web 控制台已启动: http://{addr}");
+    match auth_token() {
+        Some(_) => println!("已启用口令（PACE_FORGE_TOKEN），远程访问需在请求头带 X-Pace-Token"),
+        None => println!(
+            "未设置 PACE_FORGE_TOKEN：只接受本机访问。\
+             要让同网段设备访问，请先 `export PACE_FORGE_TOKEN=你的口令`"
+        ),
+    }
     println!("按 Ctrl+C 停止");
 
     for request in server.incoming_requests() {
@@ -164,6 +267,12 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
     let path = url.split('?').next().unwrap_or("/").to_string();
     let query = url.split('?').nth(1).unwrap_or("").to_string();
     let method = request.method().clone();
+
+    if path.starts_with("/api/") {
+        if let Err(msg) = check_auth(&request, &path, &query) {
+            return json_err(request, &msg);
+        }
+    }
 
     match (method.clone(), path.as_str()) {
         (Method::Get, "/") => respond_html(request, INDEX_HTML),
@@ -988,7 +1097,7 @@ fn handle_starttimes(request: tiny_http::Request) -> Result<(), String> {
     use crate::api::start_time as st;
 
     let q = request.url().split_once('?').map(|x| x.1).unwrap_or("");
-    let mut get = |k: &str| -> Option<String> {
+    let get = |k: &str| -> Option<String> {
         q.split('&').find_map(|kv| {
             let (a, b) = kv.split_once('=')?;
             if a == k {
@@ -1183,7 +1292,7 @@ fn handle_run(
         return json_err(request, "时长需在 0~120 分钟之间（超过服务端必然驳回）");
     }
 
-    let mut st = state.lock().map_err(|e| e.to_string())?;
+    let st = state.lock().map_err(|e| e.to_string())?;
     if !st.logged_in() {
         return json_err(request, "请先登录");
     }

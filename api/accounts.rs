@@ -198,6 +198,22 @@ pub fn open_password(enc: &str) -> Result<String, String> {
 }
 
 /// 读账号库。文件不存在返回空库（不是错误）。
+/// 写文件并收紧权限到 0600（仅属主可读写）。
+///
+/// `fs::write` 用默认 umask（通常 0644），同机其他用户能读到加密后的
+/// 密码和 token。machine_key 只是混淆，但没有理由让它更差。
+fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(data)?;
+    f.flush()
+}
+
 pub fn load() -> Book {
     let p = book_path();
     let Ok(text) = std::fs::read_to_string(&p) else {
@@ -221,7 +237,7 @@ pub fn save(book: &Book) -> Result<(), String> {
 
     // 先写临时文件再改名，避免写一半断电把库毁了
     let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, &text).map_err(|e| format!("写账号库失败: {e}"))?;
+    write_private(&tmp, text.as_bytes()).map_err(|e| format!("写账号库失败: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

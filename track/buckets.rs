@@ -112,11 +112,41 @@ pub fn step_buckets(
         *w /= wsum;
     }
 
-    let mut counts: Vec<i32> = weights.iter().map(|w| (w * total_steps as f64).round() as i32).collect();
-    // 舍入误差补到最后一个桶，保证总和精确
-    let diff: i32 = total_steps - counts.iter().sum::<i32>();
-    if let Some(last) = counts.last_mut() {
-        *last += diff;
+    // 最大余数法分配：每桶先取整，剩下的按小数部分从大到小补 1。
+    //
+    // 原来用 `round()` 再「把误差全补到最后一个桶」——1843 步 / 72 桶时
+    // 每项四舍五入成 26，总和 1872，误差 -29 全压到末桶，末桶变成 **-3**。
+    // 报文里出现负步数是硬伤，服务端一眼就能看到。
+    let exact: Vec<f64> = weights.iter().map(|w| w * total_steps as f64).collect();
+    let mut counts: Vec<i32> = exact.iter().map(|v| v.floor() as i32).collect();
+    let mut remain: i32 = total_steps - counts.iter().sum::<i32>();
+    if remain > 0 {
+        // 小数部分大的先补
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            let fa = exact[a] - exact[a].floor();
+            let fb = exact[b] - exact[b].floor();
+            fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut k = 0usize;
+        while remain > 0 && k < order.len() * 4 {
+            counts[order[k % order.len()]] += 1;
+            remain -= 1;
+            k += 1;
+        }
+    } else if remain < 0 {
+        // 浮点误差导致 floor 之和偏大：从最小项开始减
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| counts[i]);
+        let mut k = 0usize;
+        while remain < 0 && k < order.len() * 4 {
+            let idx = order[k % order.len()];
+            if counts[idx] > 0 {
+                counts[idx] -= 1;
+                remain += 1;
+            }
+            k += 1;
+        }
     }
 
     counts
@@ -124,9 +154,17 @@ pub fn step_buckets(
         .enumerate()
         .map(|(i, &steps)| {
             let begin = start_ms + i as i64 * 10_000;
-            // 桶内步频波动：以 3 秒为单位切 3 段，算相邻差值统计
-            let per3 = (steps as f64 / 3.0).round() as i32;
-            let diffs: Vec<i32> = vec![per3, per3, steps - 2 * per3]
+            // 桶内步频波动：切成 3 段（约 3.3 秒一段），算相邻差值统计。
+            //
+            // 原来是 vec![per3, per3, steps - 2*per3]——前两段完全相同，
+            // 于是相邻差的第一项恒为 0，minDiff **永远等于 0**，maxDiff 也
+            // 只有余数（≤3）。三个本该体现波动的字段结构性地退化成常量，
+            // 是比总量更好抓的机器指纹。
+            //
+            // 现在用桶内的自然起伏：三段按真实步频的呼吸节律分配，
+            // 用 steps 本身做确定性伪随机，同一桶重放结果一致。
+            let segs = split_into_segments(steps, 3, i as u64 ^ start_ms as u64);
+            let diffs: Vec<i32> = segs
                 .windows(2)
                 .map(|w| (w[1] - w[0]).abs())
                 .collect();
@@ -151,6 +189,44 @@ pub fn step_buckets(
             }
         })
         .collect()
+}
+
+/// 把 `total` 步切成 `n` 段，每段带自然起伏，总和精确等于 `total`。
+///
+/// 真人步频有呼吸节律（约 3~5 秒一个周期），桶内三段不会均匀。
+/// 这里按 ±12% 的确定性扰动分配，余数补给最大的那段保证总和不变。
+fn split_into_segments(total: i32, n: usize, seed: u64) -> Vec<i32> {
+    if n == 0 || total <= 0 {
+        return vec![0; n];
+    }
+    let mut st = seed | 1;
+    let mut raw: Vec<f64> = Vec::with_capacity(n);
+    let base = total as f64 / n as f64;
+    for _ in 0..n {
+        st ^= st >> 12;
+        st ^= st << 25;
+        st ^= st >> 27;
+        let r = (st.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64;
+        // ±12%，真实步频不会在一个 10 秒窗口里抖动超过这个量级
+        raw.push(base * (0.88 + r * 0.24));
+    }
+    let sum: f64 = raw.iter().sum();
+    let mut segs: Vec<i32> = raw.iter().map(|v| (v / sum * total as f64).round() as i32).collect();
+    // 最大余数法修正，保证总和精确
+    let mut diff = total - segs.iter().sum::<i32>();
+    let mut idx = 0usize;
+    while diff != 0 {
+        let step = if diff > 0 { 1 } else { -1 };
+        if segs[idx % n] + step >= 0 {
+            segs[idx % n] += step;
+            diff -= step;
+        }
+        idx += 1;
+        if idx > n * 8 {
+            break;
+        }
+    }
+    segs
 }
 
 /// 生成长度 `n` 的固定抖动序列（±`amp`），值域 [0.85, 1.15] 之外会被夹住。
@@ -304,5 +380,61 @@ mod id_tests {
         let pts: Vec<(f64, f64, i64)> = vec![(30.5, 104.0, 1_700_000_000_000), (30.5001, 104.0, 1_700_000_010_000)];
         let sp = speed_buckets(&pts, 1_700_000_000_000, 10);
         assert_eq!(sp[0].flag, 1_700_000_000_000);
+    }
+}
+
+#[cfg(test)]
+mod diff_not_degenerate_tests {
+    use super::*;
+
+    /// maxDiff/minDiff/avgDiff 必须真的体现波动。
+    ///
+    /// 原来用 vec![per3, per3, rest]，前两段相同 → 第一对差值恒为 0，
+    /// minDiff 永远是 0，maxDiff 只有余数（≤3）。这三个字段本该是
+    /// 桶内步频起伏的证据，退化成常量后比总量更好抓。
+    #[test]
+    fn diff_fields_are_not_always_zero() {
+        let j = vec![1.0; 72];
+        let b = step_buckets(0, 720, 1843, &j);
+        let mut nonzero_min = 0;
+        let mut max_seen = 0;
+        for x in &b {
+            assert!(x.steps_num > 0, "不该有空桶");
+            assert!(x.max_diff >= x.min_diff, "max 不能小于 min");
+            assert!(x.avg_diff >= 0);
+            if x.min_diff > 0 {
+                nonzero_min += 1;
+            }
+            max_seen = max_seen.max(x.max_diff);
+        }
+        // 10 秒 25 步切成三段约 8 步/段，两段相等是正常的，
+        // 所以只要求「有一部分桶的 minDiff > 0」——旧实现是 **恒等于 0**。
+        assert!(
+            nonzero_min > b.len() / 10,
+            "minDiff 应该有起伏，实际只有 {nonzero_min}/{} 个桶 > 0",
+            b.len()
+        );
+        // maxDiff 的真实量级就是 2~3（25 步切三段，每段 8 步左右），
+        // 但**分布不能是常量**——旧实现里 maxDiff 恒等于余数。
+        let uniq: std::collections::HashSet<i32> = b.iter().map(|x| x.max_diff).collect();
+        assert!(
+            uniq.len() > 1,
+            "maxDiff 退化成了常量 {max_seen}，应该有起伏"
+        );
+        // avgDiff 同样不能恒定
+        let uniq_avg: std::collections::HashSet<i32> = b.iter().map(|x| x.avg_diff).collect();
+        assert!(uniq_avg.len() > 1, "avgDiff 退化成了常量");
+    }
+
+    /// 三段步数之和必须精确等于桶步数。
+    #[test]
+    fn segments_sum_to_total() {
+        for total in [1, 7, 22, 25, 29, 100] {
+            for seed in 0..8u64 {
+                let segs = split_into_segments(total, 3, seed);
+                assert_eq!(segs.iter().sum::<i32>(), total, "total={total} seed={seed}");
+                assert!(segs.iter().all(|&s| s >= 0), "不能出现负段");
+            }
+        }
     }
 }

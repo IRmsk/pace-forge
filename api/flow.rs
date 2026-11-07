@@ -317,6 +317,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         ));
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
+        let _ = &mut rng;
 
         let must: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
         // 路线优先级：
@@ -371,12 +372,16 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             &must,
             15.0,
         );
-        // 逐点补时间戳，和围栏规划是两件事
-        let times = crate::track::assign_times(sampled.len(), start_ms, p.duration_sec);
+        // 时间戳先占位：⑤ 的 retime 会按速度剖面重算并整体覆盖，
+        // 这里算一遍是白算（原来 assign_times 的结果直接被丢弃，
+        // 还让人误以为时间来自两处）。占位填 start_ms 即可。
         let pts: Vec<TrackPoint> = sampled
             .iter()
-            .zip(times.iter())
-            .map(|(&(lat, lng), &t)| TrackPoint { lat, lon: lng, time_ms: t })
+            .map(|&(lat, lng)| TrackPoint {
+                lat,
+                lon: lng,
+                time_ms: start_ms,
+            })
             .collect();
         let actual = crate::track::geo::path_length(&sampled);
         PlanResult {
@@ -398,6 +403,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         };
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(if p.seed != 0 { p.seed } else { start_ms as u64 });
+        let _ = &mut rng;
         plan(&req, &mut rng)?
     };
     log(&format!(
@@ -780,7 +786,7 @@ pub fn detail_payload(
 pub fn detail_payload_rrid(
     points: &[crate::track::TrackPoint],
     sim: &crate::track::SimResult,
-    p: &RunParams,
+    _p: &RunParams,
     uid: &str,
     rrid: i64,
     start_ms: i64,
