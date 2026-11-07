@@ -166,6 +166,29 @@ pub fn seal_full(
     Ok(Envelope { wire, session })
 }
 
+
+/// 当前毫秒时间戳。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 带自定义 IV 的 AES-128-CBC 加密（PKCS#7）。
+///
+/// 业务信封固定用全零 IV，但极验的 `w` 参数要求 IV 为 ASCII `"0000000000000000"`，
+/// 所以单独暴露一个通用入口，别把两种用途混在一起。
+pub fn aes128_cbc_encrypt_iv(
+    key: &[u8],
+    iv: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    Aes128CbcEnc::new_from_slices(key, iv)
+        .map_err(|e| format!("AES 初始化失败: {e}"))
+        .map(|c| c.encrypt_padded_vec_mut::<Pkcs7>(plaintext))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,26 +243,4 @@ mod tests {
         assert_eq!(va["h"].as_str().unwrap().len(), 32);
         assert_eq!(vb["h"].as_str().unwrap().len(), 32);
     }
-}
-
-/// 当前毫秒时间戳。
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// 带自定义 IV 的 AES-128-CBC 加密（PKCS#7）。
-///
-/// 业务信封固定用全零 IV，但极验的 `w` 参数要求 IV 为 ASCII `"0000000000000000"`，
-/// 所以单独暴露一个通用入口，别把两种用途混在一起。
-pub fn aes128_cbc_encrypt_iv(
-    key: &[u8],
-    iv: &[u8],
-    plaintext: &[u8],
-) -> Result<Vec<u8>, String> {
-    Aes128CbcEnc::new_from_slices(key, iv)
-        .map_err(|e| format!("AES 初始化失败: {e}"))
-        .map(|c| c.encrypt_padded_vec_mut::<Pkcs7>(plaintext))
 }

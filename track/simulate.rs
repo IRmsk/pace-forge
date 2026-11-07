@@ -150,9 +150,9 @@ pub fn simulate(points: &[(f64, f64, i64)], p: &SimParams) -> Result<SimResult, 
 
     // ④ 逐段步数，累加得总步数
     let mut steps_f = Vec::with_capacity(dts.len());
-    for i in 0..dts.len() {
+    for (i, &dt) in dts.iter().enumerate() {
         let cad = cadences.get(i).copied().unwrap_or(150.0);
-        steps_f.push(cad * dts[i] / 60.0);
+        steps_f.push(cad * dt / 60.0);
     }
     let model_steps: f64 = steps_f.iter().sum();
 
@@ -398,9 +398,9 @@ pub fn retime(
     // 用权重 + 最大余数法，Σdt 从构造上就等于目标，不存在累积误差。
     let want_total = total_sec * 1000;
     let mut w = Vec::with_capacity(n - 1);
-    for i in 0..n - 1 {
+    for (i, &seg) in d_seg.iter().take(n - 1).enumerate() {
         let v = speeds.get(i).copied().unwrap_or(v0).max(1e-3);
-        w.push(d_seg[i] / v * 1000.0); // 毫秒
+        w.push(seg / v * 1000.0); // 毫秒
     }
     let wsum: f64 = w.iter().sum();
     let dts_ms: Vec<i64> = if wsum > 0.0 {

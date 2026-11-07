@@ -6,6 +6,12 @@
 //! 三段式：`byte_hash` → `feistel_transform` → `final_mix`。
 //! 位运算细节必须逐位对齐，任何一处差异都会导致响应解不出来（表现为 JSON 解析失败）。
 
+// 下面这些 `& 0xFFFF_FFFF` 在 u32 上没有实际作用，是照抄 Java 原实现留下的：
+// Java 的位运算会自动提升到 int，原作者显式截断回 32 位以保语义。删掉它们
+// 结果完全一样，但会和反编译出来的实现失去逐字对照，改动时更容易看漏。
+// 所以保留写法，用 allow 关掉这条 lint。
+#![allow(clippy::identity_op)]
+
 /// 自定义滚动哈希。与 FNV/Pearson 都不同，是易盾自己的构造。
 fn byte_hash(data: &[u8]) -> u32 {
     let mut h: u32 = 0;

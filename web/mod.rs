@@ -97,14 +97,16 @@ impl State {
         let _ = crate::api::accounts::save(&self.book);
         // 同步写一份 session.json，让 CLI 也能直接用（原来只有 Web 有登录态，
         // CLI 永远报「未登录」）。
-        let mut sess = crate::api::session::Session::default();
-        sess.uid = p.uid.clone();
-        sess.token = p.token.clone();
-        sess.unid = p.unid.clone();
-        sess.name = p.name.clone();
-        sess.campus_name = p.campus_name.clone();
-        sess.depart = p.depart.clone();
-        sess.grade_class = p.grade_class.clone();
+        let sess = crate::api::session::Session {
+            uid: p.uid.clone(),
+            token: p.token.clone(),
+            unid: p.unid.clone(),
+            name: p.name.clone(),
+            campus_name: p.campus_name.clone(),
+            depart: p.depart.clone(),
+            grade_class: p.grade_class.clone(),
+            ..Default::default()
+        };
         let _ = crate::api::session::save_session(&sess);
     }
 
@@ -182,7 +184,7 @@ fn check_auth(request: &tiny_http::Request, path: &str, query: &str) -> Result<(
             let from_query = query
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("token="))
-                .map(|v| url_decode(v));
+                .map(url_decode);
             let got = from_header.or(from_query).unwrap_or_default();
             if got == want {
                 Ok(())
@@ -443,7 +445,7 @@ fn handle_plan(
     if lat == 0.0 || lng == 0.0 {
         let st = state.lock().map_err(|e| e.to_string())?;
         if let Some(client) = st.client() {
-            if let Ok(fs) = crate::api::fence::fetch_fences(&client) {
+            if let Ok(fs) = crate::api::fence::fetch_fences(client) {
                 if let Some(f) = fs.first() {
                     if !f.ring.is_empty() {
                         let n = f.ring.len() as f64;

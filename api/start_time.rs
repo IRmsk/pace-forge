@@ -93,7 +93,7 @@ pub fn check_days_ago(days_ago: i64) -> Result<i64, String> {
 pub fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as i64; // [0, 399]
+    let yoe = y - era * 400; // [0, 399]
     let mp = ((m as i64) + 9) % 12; // 3月=0
     let doy = (153 * mp + 2) / 5 + (d as i64) - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
@@ -310,7 +310,7 @@ mod tests {
             let st = random_ago(now(), 600, r);
             let back = (now() - st.ms) / 60_000;
             assert!(
-                back >= DEFAULT_AGO_MIN && back <= DEFAULT_AGO_MAX + 15,
+                (DEFAULT_AGO_MIN..=DEFAULT_AGO_MAX + 15).contains(&back),
                 "r={r} 回溯 {back} 分钟，超出 30~300 窗口"
             );
             assert!(st.stop_ms(600) <= now(), "结束时间不能在未来");

@@ -28,11 +28,11 @@ fn parse_num(args: &[String], idx: usize, default: f64, name: &str) -> f64 {
 
 /// 校验公里/分钟，和库层 `RunParams::validate` 保持同一套上限。
 fn checked_km_min(dist_km: f64, dur_min: f64) -> (f64, f64) {
-    if !(dist_km > 0.0) || dist_km > 42.0 {
+    if !(0.0..=42.0).contains(&dist_km) {
         eprintln!("参数错误：距离要在 0~42 公里之间，收到 {dist_km}");
         std::process::exit(2);
     }
-    if !(dur_min > 0.0) || dur_min > 120.0 {
+    if !(0.0..=120.0).contains(&dur_min) {
         eprintln!("参数错误：时长要在 0~120 分钟之间，收到 {dur_min}");
         std::process::exit(2);
     }

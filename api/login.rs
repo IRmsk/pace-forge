@@ -177,31 +177,6 @@ pub fn login(
 
 use super::client::uuid_v4;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn profile_maps_fields() {
-        let d = json!({
-            "uid": 123, "unid": 88, "token": "tk", "name": "张三",
-            "username": "13800000000", "campusName": "某大学",
-            "campusId": "c1", "depart": "计算机", "gradeClass": "2024级1班", "sex": 1
-        });
-        let p = UserProfile::from_data(&d);
-        assert_eq!(p.uid, "123");
-        assert_eq!(p.name, "张三");
-        assert_eq!(p.sex, "男");
-        assert_eq!(p.campus_name, "某大学");
-    }
-
-    #[test]
-    fn profile_handles_missing() {
-        let p = UserProfile::from_data(&json!({}));
-        assert_eq!(p.uid, "");
-        assert_eq!(p.sex, "未知");
-    }
-}
 
 /// 调服务端登出接口，让当前 token 失效。
 ///
@@ -238,5 +213,31 @@ pub fn logout(client: &mut Client) -> Result<bool, String> {
             Ok(ok)
         }
         Err(_) => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_maps_fields() {
+        let d = json!({
+            "uid": 123, "unid": 88, "token": "tk", "name": "张三",
+            "username": "13800000000", "campusName": "某大学",
+            "campusId": "c1", "depart": "计算机", "gradeClass": "2024级1班", "sex": 1
+        });
+        let p = UserProfile::from_data(&d);
+        assert_eq!(p.uid, "123");
+        assert_eq!(p.name, "张三");
+        assert_eq!(p.sex, "男");
+        assert_eq!(p.campus_name, "某大学");
+    }
+
+    #[test]
+    fn profile_handles_missing() {
+        let p = UserProfile::from_data(&json!({}));
+        assert_eq!(p.uid, "");
+        assert_eq!(p.sex, "未知");
     }
 }

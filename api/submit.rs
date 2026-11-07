@@ -651,8 +651,8 @@ mod tests {
         // 早先按 allLocJson 的模式一起套了，提交回来 -10000。
         assert!(v["speedPerTenSec"].is_array(), "speedPerTenSec 应为数组");
         assert!(v["stepsPerTenSec"].is_array(), "stepsPerTenSec 应为数组");
-        assert!(v["speedPerTenSec"].as_array().unwrap().len() > 0);
-        assert!(v["stepsPerTenSec"].as_array().unwrap().len() > 0);
+        assert!(!v["speedPerTenSec"].as_array().unwrap().is_empty());
+        assert!(!v["stepsPerTenSec"].as_array().unwrap().is_empty());
     }
 
     /// 签名里的 bool 必须是小写。

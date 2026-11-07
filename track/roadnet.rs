@@ -189,7 +189,7 @@ fn cache_get(bbox: (f64, f64, f64, f64)) -> Option<RoadNet> {
     let path = cache_path(bbox);
     let meta = std::fs::metadata(&path).ok()?;
     // 超过 7 天就重拉
-    if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(|e| std::io::Error::other(e))) {
+    if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
         if age.as_secs() > 7 * 86400 {
             return None;
         }
@@ -557,13 +557,12 @@ mod tests {
         // 一个直角路口：东西向 + 南北向各一段
         let lat0 = 31.2304;
         let lon0 = 121.4737;
-        let mut segs = Vec::new();
-        segs.push(RoadSegment {
+        let mut segs = vec![RoadSegment {
             points: (0..=20)
                 .map(|i| (lat0, lon0 + i as f64 * 10.0 / m_per_deg_lng(lat0)))
                 .collect(),
             kind: "footway".into(),
-        });
+        }];
         segs.push(RoadSegment {
             points: (0..=20)
                 .map(|i| (lat0 + i as f64 * 10.0 / m_per_deg_lat(lat0), lon0 + 200.0 / m_per_deg_lng(lat0)))

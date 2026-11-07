@@ -962,6 +962,10 @@ pub fn detail_payload(
 }
 
 /// 带 rrid 的明细载荷（OBS 用，桶 id 走 `(rrid%100000)*1000+endSec`）。
+// OBS 明细要 10 个字段，每个都来自不同的数据源（轨迹、模拟结果、
+// 账号标识、时间窗口、uuid、点位 JSON），拆结构体只会把这些东西
+// 再包一层而不会减少耦合，所以这里保持平铺。
+#[allow(clippy::too_many_arguments)]
 pub fn detail_payload_rrid(
     points: &[crate::track::TrackPoint],
     sim: &crate::track::SimResult,

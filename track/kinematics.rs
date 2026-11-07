@@ -241,14 +241,14 @@ fn fit_capped(w: &mut [f64], dts: &[f64], target: f64, floor: f64, caps: &[f64])
             break;
         }
         let k = target / cur;
-        for i in 0..w.len() {
+        for (i, wi) in w.iter_mut().enumerate() {
             let cap = caps.get(i).copied().unwrap_or(f64::INFINITY);
-            w[i] = (w[i] * k).clamp(floor, cap);
+            *wi = (*wi * k).clamp(floor, cap);
         }
     }
-    for i in 0..w.len() {
+    for (i, wi) in w.iter_mut().enumerate() {
         let cap = caps.get(i).copied().unwrap_or(f64::INFINITY);
-        w[i] = w[i].clamp(floor, cap);
+        *wi = wi.clamp(floor, cap);
     }
 }
 
@@ -430,8 +430,10 @@ mod tests {
             .map(|i| (30.5, 104.0 + i as f64 * 5.0 / m_per_deg_lng(30.5)))
             .collect();
         let dts = vec![1.8; 199];
-        let mut p = KinParams::default();
-        p.kick_m = 0.0;
+        let p = KinParams {
+            kick_m: 0.0,
+            ..Default::default()
+        };
         let w = pace_profile(&pts, 2.8, &dts, 1000.0, 11, &p, 1.0, 8.0);
         let n = w.len();
         let mid: f64 = w[n / 3..n * 2 / 3].iter().sum::<f64>() / (n / 3) as f64;

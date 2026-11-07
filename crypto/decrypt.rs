@@ -109,7 +109,7 @@ fn verify_signature(plaintext: &[u8], sig_b64: &str) -> Result<bool, String> {
         .map_err(|e| format!("响应公钥解析失败: {e}"))?;
 
     let sig = B64.decode(sig_b64).map_err(|e| format!("s 不是合法 base64: {e}"))?;
-    let block_size = (pubkey.n().bits() + 7) / 8;
+    let block_size = pubkey.n().bits().div_ceil(8);
     if sig.len() != block_size {
         return Err(format!(
             "签名长度 {} 与模数 {} 字节不匹配",

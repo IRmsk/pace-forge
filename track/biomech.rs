@@ -106,9 +106,9 @@ pub fn ou_cadence_series(
     let mut out = Vec::with_capacity(targets.len());
     let mut c = targets.first().copied().unwrap_or(150.0);
 
-    for i in 0..targets.len() {
+    for (i, &target) in targets.iter().enumerate() {
         let dt = dts.get(i).copied().unwrap_or(1.0);
-        c += theta * (targets[i] - c) * dt + sigma * dt.sqrt() * normal_sample(&mut rng);
+        c += theta * (target - c) * dt + sigma * dt.sqrt() * normal_sample(&mut rng);
         c = c.clamp(floor, ceil);
         out.push(c);
     }

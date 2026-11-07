@@ -190,7 +190,7 @@ pub fn fetch_points_cached(
     lng: f64,
     run_area_id: Option<&str>,
 ) -> Result<PointsContext, String> {
-    let key = format!("{}:{}", run_area_id.unwrap_or("-"), format!("{lat:.4},{lng:.4}"));
+    let key = format!("{}:{lat:.4},{lng:.4}", run_area_id.unwrap_or("-"));
 
     if let Ok(g) = CACHE.lock() {
         if let Some(ref entry) = *g {

@@ -93,29 +93,27 @@ pub fn point_at(s: f64, radius: f64, heading: f64) -> (f64, f64) {
     let half_straight = spec::STRAIGHT / 2.0;
     let curve = std::f64::consts::PI * radius;
     let lap = 2.0 * spec::STRAIGHT + 2.0 * curve;
-    let mut t = s.rem_euclid(lap);
+    let t = s.rem_euclid(lap);
 
     // 局部坐标：x 沿直道方向，y 垂直直道
+    // 四段：直道、弯道、直道、弯道。用长度阈值分段，避免在 if 条件里
+    // 写带副作用的块（clippy::blocks_in_conditions）。
     let (x, y) = if t < spec::STRAIGHT {
         // 第一直道：从 (-half, -r) 到 (+half, -r)，y 固定 -r
         (-half_straight + t, -radius)
-    } else if {
-        t -= spec::STRAIGHT;
-        t < curve
-    } {
+    } else if t < spec::STRAIGHT + curve {
         // 第一个弯道：右侧半圆，从 (+half, -r) 绕到 (+half, +r)
-        let ang = -std::f64::consts::FRAC_PI_2 + (t / radius);
+        let local = t - spec::STRAIGHT;
+        let ang = -std::f64::consts::FRAC_PI_2 + (local / radius);
         (half_straight + radius * ang.cos(), radius * ang.sin())
-    } else if {
-        t -= curve;
-        t < spec::STRAIGHT
-    } {
+    } else if t < spec::STRAIGHT * 2.0 + curve {
         // 第二直道：从 (+half, +r) 到 (-half, +r)
-        (half_straight - t, radius)
+        let local = t - spec::STRAIGHT - curve;
+        (half_straight - local, radius)
     } else {
-        t -= spec::STRAIGHT;
         // 第二个弯道：左侧半圆
-        let ang = std::f64::consts::FRAC_PI_2 + (t / radius);
+        let local = t - spec::STRAIGHT * 2.0 - curve;
+        let ang = std::f64::consts::FRAC_PI_2 + (local / radius);
         (-half_straight + radius * ang.cos(), radius * ang.sin())
     };
 
@@ -229,11 +227,11 @@ mod tests {
         let mut low = 0;
         let mut high = 0;
         for (i, &kk) in k.iter().enumerate() {
-            if s[i] > 5.0 && s[i] < 80.0 {
-                if kk.abs() < 0.005 { low += 1; }
+            if s[i] > 5.0 && s[i] < 80.0 && kk.abs() < 0.005 {
+                low += 1;
             }
-            if s[i] > 90.0 && s[i] < 190.0 {
-                if kk.abs() > 0.01 { high += 1; }
+            if s[i] > 90.0 && s[i] < 190.0 && kk.abs() > 0.01 {
+                high += 1;
             }
         }
         assert!(low > 10, "直道应有大量低曲率点，实测 {low}");

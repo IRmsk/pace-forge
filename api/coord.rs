@@ -14,7 +14,7 @@ const X_PI: f64 = std::f64::consts::PI * 3000.0 / 180.0;
 /// GCJ-02 用的克拉索夫斯基椭球长半轴。
 const WGS_A: f64 = 6378245.0;
 /// 第一偏心率平方。
-const WGS_EE: f64 = 0.00669342162296594323;
+const WGS_EE: f64 = 0.006_693_421_622_965_94;
 
 /// 是否在中国境外（境外不做偏移）。
 fn out_of_china(lat: f64, lng: f64) -> bool {
