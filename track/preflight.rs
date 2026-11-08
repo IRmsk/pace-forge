@@ -111,6 +111,11 @@ pub struct Check<'a> {
     pub stop_time_ms: i64,
     /// 服务端规则允许的配速区间（分/公里），`None` 表示不校验。
     pub pace_range: Option<(f64, f64)>,
+    /// 服务端规则允许的步频区间（步/分钟），`None` 表示不校验。
+    ///
+    /// 原来这里硬编码 [100, 230]，而服务端实发 60~250。拿着一把更窄的
+    /// 假尺子量自己，会误拦合法步频，也放过了真正越界的区间。
+    pub step_range: Option<(i64, i64)>,
 }
 
 /// 执行全部检查。
@@ -304,10 +309,11 @@ pub fn inspect(c: &Check) -> Report {
     }
 
     let avg_cad = c.total_steps as f64 * 60.0 / c.total_time_sec.max(1) as f64;
-    if !(100.0..=230.0).contains(&avg_cad) {
+    let (cad_lo, cad_hi) = c.step_range.unwrap_or((100, 230));
+    if !((cad_lo as f64)..=(cad_hi as f64)).contains(&avg_cad) {
         issues.push(Issue::fatal(
             "CADENCE_OUT",
-            format!("平均步频 {avg_cad:.0} 步/分 超出人體范围 [100, 230]"),
+            format!("平均步频 {avg_cad:.0} 步/分 超出服务端区间 [{cad_lo}, {cad_hi}]"),
         ));
     }
 
@@ -407,6 +413,7 @@ mod tests {
             start_time_ms: 1_730_000_000_000,
             stop_time_ms: 1_730_000_720_000,
             pace_range: None,
+            step_range: None,
         }
     }
 

@@ -709,6 +709,7 @@ fn handle_plan(
         start_time_ms: start_ms,
         stop_time_ms: start_ms + total_sec * 1000,
         pace_range: None,
+        step_range: None,
     };
     let report = crate::track::inspect(&check);
 

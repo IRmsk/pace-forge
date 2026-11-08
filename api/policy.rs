@@ -36,6 +36,15 @@ pub struct PolicyInfo {
     /// （相当于 2:05~16:40 配速），preflight 的配速检查因为拿到 None 永远
     /// 不执行——自检报「全部通过」，发出去却是 2 分速，必驳回。
     pub pace_range: Option<(f64, f64)>,
+    /// 步频上下限（步/分钟）。服务端 `stepTop`/`stepBottom`。
+    ///
+    /// 之前完全没解析，simulate 按自己的 biomech 包络生成步频，服务端
+    /// 却按它下发的区间判。实测下发值是 60~250，比 preflight 里硬编码的
+    /// [100,230] 宽得多——拿着一个更窄的假区间做自检，等于用错的尺子
+    /// 量自己。
+    pub step_range: Option<(i64, i64)>,
+    /// 最短有效时长（秒）。服务端 `minRunTime`。
+    pub min_run_time: i64,
 }
 
 /// 从 policy 响应里取字段，兼容 `data` 包一层和直接平铺两种情况。
@@ -72,7 +81,22 @@ pub fn parse_policy_response(biz: &Value) -> Result<PolicyInfo, String> {
         valid_time,
         must_points: extract_must_points(biz),
         pace_range,
+        step_range: parse_steo_range(&rule),
+        min_run_time: rule.get("minRunTime").and_then(|t| t.as_i64()).unwrap_or(0),
     })
+}
+
+/// 步频区间。
+///
+/// 两个值都可能是整数或浮点，也见过倒序下发的，统一成 (小, 大)。
+fn parse_steo_range(rule: &Value) -> Option<(i64, i64)> {
+    let top = rule.get("stepTop").and_then(|v| v.as_f64())?;
+    let bottom = rule.get("stepBottom").and_then(|v| v.as_f64())?;
+    let (a, b) = (bottom.round() as i64, top.round() as i64);
+    if a <= 0 || b <= 0 {
+        return None;
+    }
+    Some(if a <= b { (a, b) } else { (b, a) })
 }
 
 /// 从规则里取配速区间，统一换算成「分/公里」。
@@ -224,6 +248,9 @@ pub fn fallback_policy() -> PolicyInfo {
         valid_time: 55_800,
         must_points: Vec::new(),
         pace_range: None,
+        // 兜底按实测下发值：记分跑 stepTop=250 / stepBottom=60
+        step_range: Some((60, 250)),
+        min_run_time: 0,
     }
 }
 
@@ -366,6 +393,7 @@ mod pace_range_tests {
             total_distance_m: 2000,
             total_time_sec: 800,
             total_steps: 1600,
+            step_range: None,
             start_time_ms: 1_790_000_000_000,
             stop_time_ms: 1_790_000_800_000,
             pace_range: Some((3.0, 5.0)),

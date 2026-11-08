@@ -148,8 +148,11 @@ pub fn point_json_full(
         0
     } else if idx + 1 == n {
         6
-    } else if checkpoint_idxs.contains(&idx) {
-        // 命中的打卡点位置给最高分的类型分，服务端「经过点位」才有依据
+    } else if checkpoint_idxs.iter().any(|&c| idx.abs_diff(c) <= 2) {
+        // 真机经过打卡点时，连续几个采样点都会被标成打卡点类型——GPS
+        // 定位是连续的，一个点位不可能只对应孤零零一个采样点。只标一个
+        // 点的话，服务端按范围找点位时看到的密度太低，validPoint 打分
+        // 过不了 65 的及格线，这次经过就不作数。
         1
     } else {
         let h = (p.lat.to_bits() ^ p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
@@ -202,7 +205,22 @@ pub fn point_json_full(
         "queueNum": idx as i32,
         "radius": (radius * 100.0).round() / 100.0,
         "speed": (inst * 10000.0).round() / 10000.0,
-        "state": if idx == 0 { 1 } else { 0 },
+        // state 是速度合规三态（0=合规 / 1=慢于下限 / 2=快于上限）。
+        // 原来首点硬编码成 1，理由是"起步速度 0 必然慢于下限"。但 state
+        // 不是纯展示字段——它参与「这个采样点算不算有效经过」的判定，
+        // 而起点往往就是 0 号打卡点，于是 0 号点带着 state=1 被跳过，
+        // 「按顺序通过所有点位」永远拼不齐。
+        //
+        // 真机首点 GPS 速度记 0 但 state 标 0（定位刚锁定，还没进速度
+        // 判定窗口）。这里跟随：首点记 0，其余按瞬时速度与允许区间比。
+        "state": if idx == 0 {
+            0
+        } else {
+            let lo = 1.39;
+            let hi = 8.33;
+            let v = step_m / gap_sec;
+            if v < lo { 1 } else if v > hi { 2 } else { 0 }
+        },
         "steps": ((total_steps as f64) * (idx as f64 + 1.0) / n as f64).round() as i64,
         // 局部步幅 = 本段位移 / 本段步数。
         //
@@ -782,11 +800,22 @@ mod tests {
 /// 成功码是 **10000**，不是 0。这一点很容易踩：接口在顶层 `error` 里回
 /// `{"error":10000,"message":"成功"}`，照「err != 0 就是失败」判断就会把
 /// 一次成功的提交当成驳回，用户看到「提交被驳回 error=10000: 成功」。
-pub fn save_record(client: &Client, body: &Value) -> Result<Value, String> {
-    let raw = client.request(
+pub fn save_record(
+    client: &Client,
+    body: &Value,
+    runes: &str,
+    runef: &str,
+) -> Result<Value, String> {
+    // 真机提交会额外带 runes / runef 两个关联头：
+    //   runes = 策略时间戳 + uid      （这条记录基于哪一次策略下发）
+    //   runef = 运行 uuid + startTime （这份轨迹属于哪一次运行）
+    // 缺了它们提交照样能成，但风控侧少了把「策略→运行→成绩」串起来的
+    // 线索，关联性更弱。见 Miempire src/api/submit.rs:228-237。
+    let raw = client.request_with_headers(
         "POST",
         &format!("{}/api/v70260/runnings/save/record", crate::crypto::consts::hosts::RUN),
         Some(body),
+        &[("runes", runes), ("runef", runef)],
     )?;
     let v = crate::api::client::expect_ok(&raw)?;
     let err = v.get("error").and_then(|e| e.as_i64()).unwrap_or(0);

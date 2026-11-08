@@ -735,6 +735,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         start_time_ms: view.start_time_ms,
         stop_time_ms: view.stop_time_ms,
         pace_range: pol.pace_range,
+        step_range: pol.step_range,
     };
     let report = inspect(&check);
     if report.blocked() {
@@ -750,6 +751,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
 
     // 服务端「经过点位」到底比哪套坐标？BD-09 的 lat/lon 与 GCJ-02 的
     // glat/glon 差 ~850m，选错一套整条记录的点位项就全是 False。
+    let mut order_seen: Vec<(usize, i64, String)> = Vec::new();
     for (i, raw) in pt.points.iter().enumerate() {
         let name = raw.get("pointName").and_then(|v| v.as_str()).unwrap_or("");
         let bd = (
@@ -784,6 +786,40 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         log(&format!(
             "[point-dist] #{i} {name}: BD-09 {d_bd:.1}m / GCJ-02 {d_gcj:.1}m / 首次经过 idx={first_bd}"
         ));
+        // 记录每个点位"首次经过"的索引，下面统一检查顺序
+        if first_bd >= 0 {
+            order_seen.push((i, first_bd, name.to_string()));
+        }
+    }
+
+    // 点位顺序自检。
+    //
+    // 服务端的「按顺序通过所有点位」不是看 `fixed_point_json` 里的
+    // position，而是自己从轨迹里找出每个点位被经过的位置，再检查这个
+    // 序列是否和点位数组同序。也就是说：**position 传得再对也没用，
+    // 轨迹本身必须按顺序穿过它们**。
+    //
+    // 实测踩过的坑：从 #0 到 #1 的那段路径向外扩得太远，中途擦过了 #4。
+    // 轨迹实际经过顺序变成 0,4,1,2,3,4,0，服务端直接判 false，而日志里
+    // 五个点位距离全是 0.1m、detect 满分区 100%，看起来毫无问题。
+    if order_seen.len() >= 2 {
+        let mut sorted = order_seen.clone();
+        sorted.sort_by_key(|x| x.1);
+        let bad: Vec<String> = sorted
+            .windows(2)
+            .filter(|w| w[1].0 < w[0].0)
+            .map(|w| format!("#{} {} 在 #{} {} 之前被经过", w[1].0, w[1].2, w[0].0, w[0].2))
+            .collect();
+        if bad.is_empty() {
+            let seq: Vec<String> = sorted.iter().map(|x| format!("#{}@{}", x.0, x.1)).collect();
+            log(&format!("[point-order] 顺序正确：{}", seq.join(" → ")));
+        } else {
+            log(&format!(
+                "[point-order] 顺序错误，服务端会判「按顺序通过所有点位」失败：{}",
+                bad.join("；")
+            ));
+            log("[point-order] 重新规划或调整手绘轨迹，让轨迹只按点位次序穿过每个点");
+        }
     }
 
     Ok(RunOutcome {
@@ -973,7 +1009,10 @@ pub fn run_full(
     ));
 
     log("[submit] 提交成绩…");
-    let data = super::submit::save_record(client, &body)?;
+    // runes/runef 关联头：策略下发时刻+uid、运行uuid+开始时刻
+    let runes = format!("{}{}", out.policy.timestamp, uid);
+    let runef = format!("{}{}", uuid, start_ms);
+    let data = super::submit::save_record(client, &body, &runes, &runef)?;
     out.submitted = true;
     out.record_id = super::submit::extract_record_id(&data);
     log(&format!("√ [submit] 提交成功，记录 id={:?}", out.record_id));
