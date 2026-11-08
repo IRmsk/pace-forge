@@ -92,6 +92,7 @@ pub fn point_json_full(
     prev_time: &mut i64,
     total_steps: i64,
     seed: u64,
+    checkpoint_idxs: &[usize],
 ) -> Value {
     // BD-09 → GCJ-02（原点是 BD-09，服务端要 gcj02）
     let (glat, glng) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
@@ -130,20 +131,32 @@ pub fn point_json_full(
         (step_m / gap_sec).clamp(1.9, 6.3) * 3.6
     };
 
-    // 点位类型：起点 0，途中以 0/3 为主，偶发 1/2
+    // 点位类型是有语义的，不是装饰。
+    //
+    // 老版本按概率瞎填（38% 得 3、54% 得 0、3% 得 1、2% 得 2），纯粹凑分布。
+    // 真机的 isValidPoint（libswsport.so@0x10e84，XXXXBully 反汇编还原成
+    // isvalidpoint.py:130-181）对它打分：type=1 得 30 分、type=2 得 20 分、
+    // 其他得 15 分，及格线 65。也就是说「这个采样点算不算有效打卡点」直接
+    // 由 type 决定，瞎填等于每个点都拿不到类型分。
+    //
+    //   0  起跑
+    //   1  有效打卡点（最高分）
+    //   2  次一级打卡点
+    //   6  终点
+    //   7  / -1  灰点：GPS 弱，跳变检查豁免
     let ptype = if idx == 0 {
         0
     } else if idx + 1 == n {
         6
+    } else if checkpoint_idxs.contains(&idx) {
+        // 命中的打卡点位置给最高分的类型分，服务端「经过点位」才有依据
+        1
     } else {
-        // 用坐标做确定性伪随机，同一轨迹重放结果一致
         let h = (p.lat.to_bits() ^ p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
+        // 途中普通采样只允许 0 / 2，不再随机撒 3 和 8
         match (h >> 33) % 100 {
-            0..=38 => 3,
-            39..=92 => 0,
-            93..=95 => 1,
-            96..=97 => 2,
-            _ => 8,
+            0..=11 => 2,
+            _ => 0,
         }
     };
 
@@ -393,6 +406,13 @@ pub fn build(
     let mut cum = (0.0f64, 0i64, 0i64);
     let seed = params.start_time_ms as u64 ^ 0x9E3779B97F4A7C15;
     let mut prev_time = points.first().map(|p| p.time_ms).unwrap_or(params.start_time_ms);
+    // 打卡点落在轨迹的哪几个采样点上：position 是首次经过索引
+    let cp_idxs: Vec<usize> = fixed
+        .iter()
+        .filter(|f| f.position >= 0)
+        .map(|f| f.position as usize)
+        .filter(|&i| i < points.len())
+        .collect();
     let loc_items: Vec<Value> = points
         .iter()
         .enumerate()
@@ -400,6 +420,7 @@ pub fn build(
             point_json_full(
                 p, i, points.len(), params.start_time_ms, start_pt,
                 &mut prev, &mut cum, &mut prev_time, params.total_steps as i64, seed,
+                &cp_idxs,
             )
         })
         .collect();

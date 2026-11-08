@@ -1100,13 +1100,26 @@ pub fn detail_payload_rrid(
         let start_pt = prev;
         let mut cum = (0.0f64, 0i64, 0i64);
         let mut prev_time = points.first().map(|q| q.time_ms).unwrap_or(start_ms);
+        // 打卡点索引从同一个 fixed_point_json 里取，保证提交和明细两处
+        // 对「哪个点是打卡点」的判断一致
+        let cp_idxs: Vec<usize> = serde_json::from_str::<Value>(five_point_json)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|f| f.get("position").and_then(|x| x.as_i64()))
+                    .filter(|&x| x >= 0 && (x as usize) < n)
+                    .map(|x| x as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
         points
             .iter()
             .enumerate()
             .map(|(i, q)| {
                 super::submit::point_json_full(
                     q, i, n, start_ms, start_pt, &mut prev, &mut cum, &mut prev_time,
-                    sim.total_steps as i64, start_ms as u64,
+                    sim.total_steps as i64, start_ms as u64, &cp_idxs,
                 )
             })
             .collect()
@@ -1134,6 +1147,11 @@ pub fn detail_payload_rrid(
             steps.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
         )),
         "laps_json": gz_json(&Value::Array(Vec::<Value>::new())),
+        // 真机是 11 个键，多这一个。Inverx 的 7.3.92 builder.py:276-288
+        // 和 ydsj-auto 的 gen_sw.py 两处独立实现对拍都确认 OBS_OBJECT_KEYS
+        // 含 extension_json；键数本身是服务端 schema 校验项，少一个可能
+        // 在详情页或审核链被静默丢弃。
+        "extension_json": gz_json(&Value::Object(Default::default())),
         "runFaceCheck": gz_str(""),
     })
 }
@@ -1196,7 +1214,7 @@ mod obs_tests {
     /// 之前传的是明文 JSON，键名也不同，服务端读不出轨迹，详情页显示
     /// 「这条记录没有轨迹坐标」。
     #[test]
-    fn obs_payload_is_ten_gzipped_keys() {
+    fn obs_payload_is_eleven_gzipped_keys() {
         use flate2::read::GzDecoder;
         use std::io::Read;
 
@@ -1221,7 +1239,7 @@ mod obs_tests {
         let v = detail_payload_rrid(&pts, &sim, &p, "123", 99, 1_793_966_000_000, "U", "[]");
 
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 10, "必须是 10 个键，实际 {keys:?}");
+        assert_eq!(keys.len(), 11, "必须是 11 个键，实际 {keys:?}");
         for k in ["rrid", "uuid", "uid", "run_data", "fixed_point_json",
                   "segment_json", "speed_json", "step_freq_json", "laps_json", "runFaceCheck"] {
             assert!(v.get(k).is_some(), "缺 key: {k}");
