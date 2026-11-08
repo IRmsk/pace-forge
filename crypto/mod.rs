@@ -10,6 +10,7 @@
 pub mod consts;
 pub mod decrypt;
 pub mod envelope;
+pub mod geetoken;
 pub mod kdf;
 pub mod sign;
 

@@ -482,6 +482,20 @@ pub fn build(
     let speed_arr = serde_json::to_value(&sb).map_err(|e| e.to_string())?;
     let step_arr = serde_json::to_value(&stb).map_err(|e| e.to_string())?;
 
+    // ---- geeToken ----
+    //
+    // 真机的 geeToken 是本地算的（AES-256-CBC 套 GEE\0 帧），不依赖极验
+    // 回调，所以离线也能生成。原来两处都发空串。
+    //
+    // 发空串的后果不是直接报错拒单，而是服务端把整次 run 的所有采样点
+    // 统一打上「未通过校验」的兜底类型标记——表现就是里程、时长、步频、
+    // 配速四项全过，只有「通过点位」那一项永远 false，而轨迹怎么调都是
+    // 干净的。这条线很容易把排查带到轨迹上去。
+    //
+    // 签名侧和 body 侧必须引用同一个 String，否则签名串和回执体里的
+    // token 不一致，服务端直接 10501。
+    let gee_token = crate::crypto::geetoken::token_for_run(&params.uid, &params.uuid);
+
     // ---- 签名（31 字段）----
     let sign_fields: SignFields = vec![
         ("address".into(), Some(String::new())),
@@ -491,7 +505,7 @@ pub fn build(
         ("complete".into(), Some(complete.to_string())),
         ("errorCode".into(), Some("0".into())),
         ("faceCheck".into(), Some("0".into())),
-        ("geeToken".into(), Some(String::new())),
+        ("geeToken".into(), Some(gee_token.clone())),
         // Android 的 String.valueOf(false) 是小写；写成 "False" 签名必然不过（10501）
         ("getPrize".into(), Some("false".into())),
         // 签名侧固定字符串 "null"，body 侧才是 JSON null
@@ -531,7 +545,7 @@ pub fn build(
         "errorCode": 0,
         "faceCheck": 0,
         "fivePointJson": five_pt_json,
-        "geeToken": "",
+        "geeToken": gee_token,
         "getPrize": false,
         "goalId": Value::Null,
         "isUpload": false,

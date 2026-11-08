@@ -14,6 +14,7 @@
 use serde_json::Value;
 
 use crate::crypto::envelope::{seal, SessionKeys};
+use sha2::{Digest, Sha256};
 use crate::crypto::{decrypt, sign::token_sign, SignFields};
 
 /// 设备指纹。首次运行随机生成后应持久化，否则容易被判为异常设备。
@@ -29,6 +30,26 @@ pub struct DeviceProfile {
     pub device_id: String,
     pub os_version: String,
     pub user_agent: String,
+    /// 安卓安装 ID：真机是 16 位小写 hex。
+    ///
+    /// 原来一个都没有。真机这八项是从系统 API 直接读的，服务端把它们当
+    /// 设备指纹的一部分；缺失时不会直接拒单，而是在采样点维度打上
+    /// 「来源可疑」的兜底标记——排查时很容易一路追到轨迹上去。
+    pub android_id: String,
+    /// 蓝牙 MAC（大写下划线分隔以外的常见形式）。
+    pub bl_mac: String,
+    /// Wi-Fi MAC。
+    pub wifi_mac: String,
+    /// 设备 IMEI。协议允许空串，但真机读得到。
+    pub imei: String,
+    /// 网卡 MAC（登录 body 里的 `mac_address`）。
+    pub mac_address: String,
+    /// App 安装时间（毫秒）。必须跨请求稳定，每次变等于自报改机。
+    pub app_install_time: i64,
+    /// App 上次更新时间（毫秒）。
+    pub app_update_time: i64,
+    /// 厂商自定义设备 ID。
+    pub custom_device_id: String,
 }
 
 impl DeviceProfile {
@@ -37,7 +58,54 @@ impl DeviceProfile {
     /// `scope` 传账号 uid（或手机号）：同一个账号永远拿到同一个 device_id，
     /// 不同账号拿到不同的，避免被按设备聚合。
     pub fn for_account(scope: &str) -> Self {
-        Self { device_id: persistent_device_id(scope), ..Self::base() }
+        let device_id = persistent_device_id(scope);
+        let mut d = Self { device_id: device_id.clone(), ..Self::base() };
+        d.fill_derived_identity(&device_id);
+        d
+    }
+
+    /// 由 device_id 派生其余设备标识。
+    ///
+    /// 全部是对 device_id 的确定性派生，所以同一账号每次跑都完全一致——
+    /// 真机这些值从系统 API 读，一年都不会变；每次提交都换一茬等于自报
+    /// 改机。安装时间用一个落在合理区间的固定值，也不用当前时间。
+    fn fill_derived_identity(&mut self, seed: &str) {
+        let h = |salt: &str| -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(seed.as_bytes());
+            hasher.update(salt.as_bytes());
+            hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        };
+        // 安卓 android_id 是 16 位小写 hex
+        self.android_id = h("android_id")[..16].to_string();
+        self.custom_device_id = h("custom")[..32].to_string();
+        // MAC 用本地管理位（第二字节 bit1 置 1），不对应真实网卡
+        let mac = |salt: &str, sep: &str| -> String {
+            let x = h(salt);
+            let bytes: Vec<String> = (0..6)
+                .map(|i| format!("{:02x}", u8::from_str_radix(&x[i * 2..i * 2 + 2], 16).unwrap_or(0)))
+                .collect();
+            let mut b = bytes.clone();
+            if let Ok(v) = u8::from_str_radix(&b[0], 16) {
+                b[0] = format!("{:02x}", v | 0x02);
+            }
+            b.join(sep)
+        };
+        self.wifi_mac = mac("wifi", ":");
+        self.bl_mac = mac("bt", ":");
+        self.mac_address = mac("nic", ":");
+        // IMEI 十五位数字，TAC 前缀取常见值
+        let digits: String = h("imei")
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .take(15)
+            .collect();
+        self.imei = format!("86{digits:0<13}");
+        // 安装/更新时间：从 device_id 派生一个落在 2023-2024 的固定时刻
+        let base = 1_690_000_000_000i64; // 2023-07
+        let off: i64 = u32::from_str_radix(&h("inst")[..8], 16).unwrap_or(0) as i64;
+        self.app_install_time = base + off % (180 * 86_400_000);
+        self.app_update_time = self.app_install_time + off % (7 * 86_400_000);
     }
 
     /// 不隔离的默认构造（单账号 / CLI 用）。
@@ -53,13 +121,24 @@ impl DeviceProfile {
             device_name: "Android Device".into(),
             os_version: "13".into(),
             user_agent: "okhttp/4.12.0".into(),
+            android_id: String::new(),
+            bl_mac: String::new(),
+            wifi_mac: String::new(),
+            imei: String::new(),
+            mac_address: "02:00:00:00:00:00".into(),
+            app_install_time: 0,
+            app_update_time: 0,
+            custom_device_id: String::new(),
         }
     }
 }
 
 impl Default for DeviceProfile {
     fn default() -> Self {
-        Self { device_id: persistent_device_id(""), ..Self::base() }
+        let device_id = persistent_device_id("");
+        let mut d = Self { device_id: device_id.clone(), ..Self::base() };
+        d.fill_derived_identity(&device_id);
+        d
     }
 }
 
@@ -205,6 +284,15 @@ impl Client {
             ("User-Agent".into(), self.device.user_agent.clone()),
             ("timeStamp".into(), now_ms.to_string()),
             ("nonce".into(), nonce),
+            // 真机从系统 API 读的八项设备指纹。缺这些不会直接拒单，但服务
+            // 端会把整次 run 的采样点打上「来源可疑」的兜底标记。
+            ("androidId".into(), self.device.android_id.clone()),
+            ("blMac".into(), self.device.bl_mac.clone()),
+            ("wifiMac".into(), self.device.wifi_mac.clone()),
+            ("IMEI".into(), self.device.imei.clone()),
+            ("appInstallTime".into(), self.device.app_install_time.to_string()),
+            ("appUpdateTime".into(), self.device.app_update_time.to_string()),
+            ("CustomDeviceId".into(), self.device.custom_device_id.clone()),
         ];
         if let Some(uid) = &self.creds.uid {
             headers.push(("uid".into(), uid.clone()));

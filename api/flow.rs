@@ -808,7 +808,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         let bad: Vec<String> = sorted
             .windows(2)
             .filter(|w| w[1].0 < w[0].0)
-            .map(|w| format!("#{} {} 在 #{} {} 之前被经过", w[1].0, w[1].2, w[0].0, w[0].2))
+            // w[0] 是索引更小的那个，所以是它抢在了 w[1] 前面
+            .map(|w| format!("#{} {} 先于 #{} {} 被经过", w[0].0, w[0].2, w[1].0, w[1].2))
             .collect();
         if bad.is_empty() {
             let seq: Vec<String> = sorted.iter().map(|x| format!("#{}@{}", x.0, x.1)).collect();
@@ -1202,7 +1203,13 @@ pub fn detail_payload_rrid(
         // 和 ydsj-auto 的 gen_sw.py 两处独立实现对拍都确认 OBS_OBJECT_KEYS
         // 含 extension_json；键数本身是服务端 schema 校验项，少一个可能
         // 在详情页或审核链被静默丢弃。
-        "extension_json": gz_json(&Value::Object(Default::default())),
+        // extension_json 是**空串**的 gzip，不是 `{}` 的 gzip。
+        //
+        // gzip.compress(b"{}") 和 gzip.compress(b"") 差好几个字节，服务端
+        // OBS 侧 schema 校验按长度/内容做比对时对不上，整条 run_data 会被
+        // 判成「来源不明」，采样点连带被统一打上「未通过校验」的标记。
+        // Inverx 7.3.92 running/builder.py:276-288 给的就是空串。
+        "extension_json": gz(b""),
         "runFaceCheck": gz_str(""),
     })
 }

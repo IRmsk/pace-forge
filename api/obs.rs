@@ -103,9 +103,27 @@ pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("OBS 对象解析失败: {e}"))
 }
 
+/// 服务端所在时区偏移（秒）。
+///
+/// objectKey 里的小时段是**本地时区**，不是 UTC。真机用
+/// `time.strftime("%Y%m%d%H", time.localtime(...))`，即按设备本地时间。
+/// 中国校区是 UTC+8，用 UTC 拼 key 会整整早 8 小时，服务端按本地时区
+/// 去 OBS 取对象时直接取空——轨迹「不存在」，依赖轨迹的所有判定项
+/// （比如按顺序通过点位）自然全假，而提交本身返回成功、里程时长步频
+/// 配速四项全过，很容易把排查带到别处。
+///
+/// 跨时区部署时用 `PACE_TZ_OFFSET_SEC` 覆盖，别硬编码。
+fn tz_offset_sec() -> i64 {
+    std::env::var("PACE_TZ_OFFSET_SEC")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| (-72_000..=72_000).contains(v))
+        .unwrap_or(8 * 3600)
+}
+
 /// 生成 objectKey（详情页格式）。
 pub fn detail_key(now_ms: i64, uuid: &str) -> String {
-    let secs = now_ms / 1000;
+    let secs = now_ms / 1000 + tz_offset_sec();
     let days = secs / 86_400;
     let (y, m, d, h) = civil_from_days(days, (secs % 86_400) / 3600);
     format!("run_data/{y:04}{m:02}{d:02}{h:02}/{uuid}.json")
