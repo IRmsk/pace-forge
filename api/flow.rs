@@ -439,36 +439,48 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                 log(&format!("[track] 首尾相距 {gap:.0}m，已自动接上"));
             }
         }
-        // 手画的长度和填的目标里程通常对不上，等比例缩放到目标值，
-        // 保持形状不变（和 planner 里 scale_to_length 一个思路）。
+        // 手绘轨迹不缩放到目标里程。
+        //
+        // 缩放看着很省事，但它会破坏手绘唯一的优点。用户画的时候地图上
+        // 摆着 5 个点位，他是照着点位划的，所以**原尺度下点位天然就在
+        // 线上**。一旦按 目标/实际 等比放大（常到 2.5~3 倍），路径整体
+        // 放大而点位坐标是固定的，这个性质当场失效：点位会飘出几十米，
+        // 之后无论怎么吸附都是打补丁——
+        //
+        //   · 吸附后 position 乱序 → 服务端「按顺序通过」false
+        //   · 按顺序吸附 + 阈值收紧 → 靠后的点位直接 CP_MISS
+        //   · 阈值放大到 250m → 能命中，但单点被拽 83m，detect 判异常
+        //   · 缩放后重采样 → 点距回到 3m 了，点位又飘出去了
+        //
+        // 而且围栏是 1020×883m，绕一圈本来就有 3km 以上，正常照着点位
+        // 画一圈绝不会短于 1.5km 的下限。真画短了，如实报错让用户补笔，
+        // 比偷偷拉伸成一条穿过建筑物的假线要好。
         let drawn = crate::track::geo::path_length(&pts);
-        if drawn > 10.0 {
-            let k = p.distance_m / drawn;
-            // 只缩不改形状：绕质心缩放会让整条线平移，所以按首点锚定
-            let anchor = pts[0];
-            for q in pts.iter_mut() {
-                q.0 = anchor.0 + (q.0 - anchor.0) * k;
-                q.1 = anchor.1 + (q.1 - anchor.1) * k;
-            }
+        if drawn < p.distance_m * 0.75 {
+            log(&format!(
+                "[track] 手绘 {drawn:.0}m，明显短于目标 {:.0}m；不自动拉伸（拉伸会让点位脱离轨迹），\
+请在地图上画得更长一些",
+                p.distance_m
+            ));
         }
-        // 缩放会把点位从线上一并拉偏（画 707m 拉到 2000m，k≈2.8，
-        // 中间的点位能飘出上百米）。这里把离点位最近的那个路径点直接
-        // 换成点位坐标——只挪一个点，不插点，所以不会撕出跳变，
-        // 但能让每个点位精确落在线上。
+
+        // 原尺度下点位就在线边，按顺序取最近点即可精确命中
+        let mut search_from = 0usize;
         for c in &cps {
             let target = (c.lat, c.lng);
             let mut best = usize::MAX;
             let mut best_d = f64::MAX;
-            for (i, q) in pts.iter().enumerate() {
+            for (i, q) in pts.iter().enumerate().skip(search_from) {
                 let d = crate::track::geo::distance(*q, target);
                 if d < best_d {
                     best_d = d;
                     best = i;
                 }
             }
-            // 太远说明用户压根没画到那儿，别硬拽，交给前端提示补笔画
-            if best != usize::MAX && best_d < 60.0 {
+            // 原尺度下 40m 内就算画到了；超出的交给前端提示补笔画
+            if best != usize::MAX && best_d < 40.0 {
                 pts[best] = target;
+                search_from = best + 1;
             }
         }
         let n = pts.len();
