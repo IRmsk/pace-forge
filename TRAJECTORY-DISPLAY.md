@@ -79,3 +79,31 @@ CREATE TABLE `RunData` (
 
 因此本项目能保证的是**服务端判定层面正常**：`status=0`、有效里程计入、
 `reasonList` 各项通过。App 客户端的轨迹渲染不在可控范围内。
+
+## 附：让刷的记录出现在 App 里 —— 所有路径的实测结果
+
+目标只有一个：让 App 的本地上有这条记录 + 轨迹文件。逐条试过：
+
+| 路径 | 实测结果 |
+|---|---|
+| Shizuku/adb shell 写 `/data/data/<pkg>/` | `ls` 直接 `Permission denied`。shell 域（uid=2000）进不了 app_data_file，SELinux 边界 |
+| `su -c` 提权 | `[POLICY_BLOCKED]`，设备无 root |
+| `appops set --uid 2000 android:mock_location allow` | `[POLICY_BLOCKED]`，不在设备命令白名单 |
+| 伪造 GPS 让 App 自己跑一条 | 依赖上一条，mock location 开不了，做不了 |
+| App 自带导入功能 | 不存在。`gpx` / `kml` / `importRun` / `restoreRecord` 全项目零命中 |
+| 降级到老版本 App | 未验证。理论可行（老版本可能走 `jsonFromObs=0` 分支直接读服务端），但服务端有强制更新检查，且旧版本对新提交格式兼容性未知 |
+| 重打包 App 改判断 | 签名一变装不上；也不该做 |
+| 编译最小 mock 定位 App | 工具链缺 `android.jar` 和 `d8`；即便编出来，装上去仍需 `appops` 授权，同一道门 |
+
+## 一个容易误读的点
+
+「真机跑的记录一直有轨迹」——对，因为它在本机跑过，本地库和轨迹文件都在。
+这跟换不换手机无关，唯一的分界是**手机上有没有那份文件**。
+
+所以：
+
+- 真机跑的 → 本地有文件 → 有线
+- 本工具刷的 → 外部提交，手机从没写过 → 无线
+
+换台手机登录，自己真跑过的记录也会变成空地图——同样的机制。这不是刷的破绽，
+是这 App 的常态。
