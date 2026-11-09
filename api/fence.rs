@@ -19,6 +19,23 @@ use crate::crypto::consts::hosts;
 /// 围栏接口路径。
 pub const FENCE_PATH: &str = "/api/v1/getGeoFenceForRun";
 
+/// 围栏里下发的必经打卡点。
+///
+/// 有的学校**只**在围栏响应里下发必经点，点位接口返回空数组——这时如果
+/// 只看点位接口，就会得到「这个学校没有打卡点」的错误结论。字段与服务端
+/// 原始 `passPoints[]` 对齐，提交时要原样回显。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PassPoint {
+    /// BD-09。
+    pub lat: f64,
+    pub lon: f64,
+    /// GCJ-02（有的响应只给这一套）。
+    pub glat: f64,
+    pub glon: f64,
+    pub is_fixed: i64,
+    pub point_name: String,
+}
+
 /// 单个围栏。
 #[derive(Debug, Clone)]
 pub struct Fence {
@@ -27,6 +44,80 @@ pub struct Fence {
     pub name: String,
     /// 闭合环，(lat, lon)，BD-09。
     pub ring: Vec<(f64, f64)>,
+    /// 围栏下发的必经点（可能为空）。
+    pub pass_points: Vec<PassPoint>,
+}
+
+/// 解析 `passPoints[]`。
+///
+/// 宽容处理：坐标可能在 `lat/lon`（BD-09）或 `glat/glon`（GCJ-02），也可能
+/// 两者都有但其中一套是 0。只有两套都拿不到的条目才丢弃。
+pub fn parse_pass_points(v: &Value) -> Vec<PassPoint> {
+    let arr = match v.get("passPoints") {
+        Some(Value::Array(a)) => a.clone(),
+        Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_default(),
+        _ => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|p| {
+            let num = |k: &str| p.get(k).and_then(|x| x.as_f64());
+            let (mut lat, mut lon) = (num("lat").unwrap_or(0.0), num("lon").unwrap_or(0.0));
+            let (glat, glon) = (num("glat").unwrap_or(0.0), num("glon").unwrap_or(0.0));
+            // 只有 GCJ 坐标时反推 BD-09，交给 coord 统一处理
+            if (lat == 0.0 || lon == 0.0) && glat != 0.0 && glon != 0.0 {
+                let (a, b) = super::coord::gcj02_to_bd09(glat, glon);
+                lat = a;
+                lon = b;
+            }
+            if lat == 0.0 && lon == 0.0 {
+                return None;
+            }
+            Some(PassPoint {
+                lat,
+                lon,
+                glat,
+                glon,
+                is_fixed: p.get("isFixed").and_then(value_as_i64).unwrap_or(1),
+                point_name: p
+                    .get("pointName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// `pass_point_items` 的返回：原始对象 + BD-09 坐标 + GCJ-02 坐标。
+pub type PassPointItems = (Vec<Value>, Vec<(f64, f64)>, Vec<(f64, f64)>);
+
+/// 把必经点转成点位接口同形状的原始对象 + 两套坐标。
+///
+/// 返回 `(items, bd_coords, gcj_coords)`：`items` 可直接进 `fixed_point_json`，
+/// 两套坐标给规划器用（路网是 WGS84→BD09，展示层是 GCJ-02）。
+pub fn pass_point_items(points: &[PassPoint]) -> PassPointItems {
+    let mut items = Vec::with_capacity(points.len());
+    let mut bd = Vec::with_capacity(points.len());
+    let mut gcj = Vec::with_capacity(points.len());
+    for p in points {
+        let (glat, glon) = if p.glat != 0.0 && p.glon != 0.0 {
+            (p.glat, p.glon)
+        } else {
+            super::coord::bd09_to_gcj02(p.lat, p.lon)
+        };
+        items.push(json!({
+            "lat": p.lat,
+            "lon": p.lon,
+            "glat": glat,
+            "glon": glon,
+            "isFixed": p.is_fixed,
+            "pointName": p.point_name,
+            "position": -1,
+        }));
+        bd.push((p.lat, p.lon));
+        gcj.push((glat, glon));
+    }
+    (items, bd, gcj)
 }
 
 /// 按锚点选中校区后的结果。
@@ -40,6 +131,8 @@ pub struct SelectedFence {
     pub name: String,
     /// 命中的围栏在原始列表里的下标。
     pub index: usize,
+    /// 选中围栏下发的必经点（点位接口为空时的唯一来源）。
+    pub pass_points: Vec<PassPoint>,
 }
 
 /// 选择结果 + 兜底信息。
@@ -97,6 +190,7 @@ pub fn parse_fences(v: &Value) -> Result<Vec<Fence>, String> {
                     .or_else(|| f.get("areaId").and_then(value_as_i64)),
                 name: f.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                 ring,
+                pass_points: parse_pass_points(f),
             });
         }
     }
@@ -143,6 +237,20 @@ pub fn select_by_anchor(
                 fence_id: fences[first].id,
                 name: fences[first].name.clone(),
                 index: first,
+                // 重叠围栏合并时取所有命中围栏的必经点（去重后按名字稳定排序）
+                pass_points: {
+                    let mut all: Vec<PassPoint> = containing
+                        .iter()
+                        .flat_map(|&i| fences[i].pass_points.clone())
+                        .collect();
+                    all.sort_by(|a, b| {
+                        a.point_name
+                            .cmp(&b.point_name)
+                            .then(a.lat.total_cmp(&b.lat))
+                    });
+                    all.dedup();
+                    all
+                },
             },
             fallback: false,
             distance_m: 0.0,
@@ -163,6 +271,7 @@ pub fn select_by_anchor(
             fence_id: fence.id,
             name: fence.name.clone(),
             index,
+            pass_points: fence.pass_points.clone(),
         },
         fallback: true,
         distance_m,
@@ -180,6 +289,7 @@ pub fn pick_from_polygons(
             id: None,
             name: String::new(),
             ring: ring.clone(),
+            pass_points: Vec::new(),
         })
         .collect();
     let pick = select_by_anchor(&fences, anchor, -1).ok()?;
@@ -261,11 +371,13 @@ mod tests {
                 id: Some(1774),
                 name: "东校区".into(),
                 ring: square(39.90, 116.40, 0.01),
+                pass_points: Vec::new(),
             },
             Fence {
                 id: Some(1775),
                 name: "西校区".into(),
                 ring: square(39.90, 116.30, 0.01),
+                pass_points: Vec::new(),
             },
         ]
     }
@@ -289,6 +401,7 @@ mod tests {
             id: Some(1800),
             name: "东区扩展".into(),
             ring: square(39.905, 116.405, 0.01),
+            pass_points: Vec::new(),
         });
         let pick = select_by_anchor(&fences, (39.907, 116.407), 0).unwrap();
         assert!(!pick.fallback);
@@ -359,5 +472,71 @@ mod tests {
         assert!(ring_contains(&ring, (5.0, 5.0)));
         assert!(!ring_contains(&ring, (15.0, 5.0)));
         assert!(!ring_contains(&ring, (-1.0, 5.0)));
+    }
+
+    #[test]
+    fn parses_pass_points_with_bd09() {
+        let v = serde_json::json!({
+            "passPoints": [
+                {"lat": 30.5, "lon": 104.0, "glat": 30.501, "glon": 104.002,
+                 "isFixed": 1, "pointName": "P1"},
+                {"lat": 30.6, "lon": 104.1, "isFixed": 0, "pointName": "P2"}
+            ]
+        });
+        let pps = parse_pass_points(&v);
+        assert_eq!(pps.len(), 2);
+        assert_eq!(pps[0].point_name, "P1");
+        assert_eq!(pps[0].is_fixed, 1);
+        assert!((pps[0].glat - 30.501).abs() < 1e-9);
+        // 第二条没有 glat，输出时要现算
+        let (items, bd, gcj) = pass_point_items(&pps);
+        assert_eq!(items.len(), 2);
+        assert_eq!(bd.len(), 2);
+        assert_eq!(gcj.len(), 2);
+        assert!((items[1]["glat"].as_f64().unwrap() - pps[1].glat).abs() > 1e-9,
+            "缺 GCJ 坐标时必须由 BD-09 反算出来");
+    }
+
+    #[test]
+    fn pass_points_only_glat_are_recovered() {
+        let v = serde_json::json!({
+            "passPoints": "[{\"glat\": 30.5, \"glon\": 104.0, \"isFixed\": 1, \"pointName\": \"X\"}]"
+        });
+        let pps = parse_pass_points(&v);
+        assert_eq!(pps.len(), 1, "字符串化数组必须能解析");
+        assert!(pps[0].lat != 0.0 && pps[0].lon != 0.0, "只有 GCJ 时要反算出 BD-09");
+        assert_eq!(pps[0].point_name, "X");
+    }
+
+    #[test]
+    fn pass_points_empty_and_garbage() {
+        assert!(parse_pass_points(&serde_json::json!({})).is_empty());
+        assert!(parse_pass_points(&serde_json::json!({"passPoints": []})).is_empty());
+        assert!(parse_pass_points(&serde_json::json!({
+            "passPoints": [{"lat": 0, "lon": 0}, {"pointName": "无坐标"}]
+        })).is_empty());
+    }
+
+    #[test]
+    fn fences_carry_pass_points() {
+        let v = serde_json::json!({
+            "data": {"geoFences": [{
+                "id": 1864,
+                "name": "主校区",
+                "points": [
+                    {"lat": 30.50, "lon": 104.00},
+                    {"lat": 30.50, "lon": 104.02},
+                    {"lat": 30.52, "lon": 104.02},
+                    {"lat": 30.52, "lon": 104.00}
+                ],
+                "passPoints": [{"lat": 30.51, "lon": 104.01, "isFixed": 1, "pointName": "必经"}]
+            }]}
+        });
+        let fs = parse_fences(&v).unwrap();
+        assert_eq!(fs.len(), 1);
+        assert_eq!(fs[0].pass_points.len(), 1);
+        let pick = select_by_anchor(&fs, (30.51, 104.01), -1).unwrap();
+        assert_eq!(pick.selected.pass_points.len(), 1);
+        assert_eq!(pick.selected.pass_points[0].point_name, "必经");
     }
 }

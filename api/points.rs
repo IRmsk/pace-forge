@@ -15,8 +15,17 @@ use super::policy::point_xy;
 use crate::crypto::consts::{hosts, SIGN_SALT};
 use crate::crypto::envelope::{now_ms, seal_with_order, OuterOrder};
 
-/// 点位接口路径。
+/// 点位接口路径（默认形态：`distance/1`）。
 pub const POINTS_PATH: &str = "/api/v560/get/1/distance/1";
+
+/// 按目标距离生成点位路径。
+///
+/// 路径末段是**目标距离（米）**，不是固定 `1`。有的学校只在带真实距离时
+/// 才下发点位，写死 `distance/1` 会拿到空集——表现就是「这个学校的打卡点
+/// 拉不起来」，而返回 200 不带错误码，很难往请求上想。
+pub fn points_path(distance_m: i64) -> String {
+    format!("/api/v560/get/1/distance/{}", distance_m.max(1))
+}
 
 /// 缓存有效期（毫秒）。服务端 5 分钟 3 次，取 5 分钟做保守值。
 pub const POINTS_TTL_MS: i64 = 300_000;
@@ -69,6 +78,20 @@ pub fn fetch_points(
     lon: f64,
     run_area_id: Option<&str>,
 ) -> Result<PointsContext, String> {
+    fetch_points_at_distance(client, lat, lon, run_area_id, 1)
+}
+
+/// 带目标距离的点位拉取。
+///
+/// `distance_m` 会进 URL 末段；服务端按这个距离挑点位，所以距离给错
+/// 等于让服务端按另一条路线出点。
+pub fn fetch_points_at_distance(
+    client: &Client,
+    lat: f64,
+    lon: f64,
+    run_area_id: Option<&str>,
+    distance_m: i64,
+) -> Result<PointsContext, String> {
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return Err(format!("锚点越界: ({lat}, {lon})"));
     }
@@ -87,7 +110,7 @@ pub fn fetch_points(
         .cloned()
         .unwrap_or_else(|| "0".into());
 
-    let url = format!("{}{}", hosts::RUN, POINTS_PATH);
+    let url = format!("{}{}", hosts::RUN, points_path(distance_m));
     let start_ms = now_ms() as i64;
     let runec_plain = runec_plain(&uid, lon, lat, start_ms);
     let env = seal_with_order(&runec_plain, OuterOrder::Observed)?;
@@ -197,21 +220,58 @@ pub fn fetch_points_cached(
     lng: f64,
     run_area_id: Option<&str>,
 ) -> Result<PointsContext, String> {
-    let key = format!("{}:{lat:.4},{lng:.4}", run_area_id.unwrap_or("-"));
+    fetch_points_cached_at(client, lat, lng, run_area_id, None)
+}
 
-    if let Ok(g) = CACHE.lock() {
-        if let Some(ref entry) = *g {
-            if entry.0 == key && entry.1.elapsed().as_secs() < CACHE_TTL_SECS {
-                return Ok(entry.2.clone());
-            }
+/// 带「空点位重试」的缓存拉取。
+///
+/// 先按 `distance/1` 拉；拿到空集且给了 `fallback_distance_m` 时，再按真实
+/// 目标距离拉一次。两次用不同的缓存 key（距离不同 = 不同请求），但仍然
+/// 受 5 分钟 3 次限流约束——所以只在**空集**时才多打一发，正常学校不加请求。
+pub fn fetch_points_cached_at(
+    client: &super::client::Client,
+    lat: f64,
+    lng: f64,
+    run_area_id: Option<&str>,
+    fallback_distance_m: Option<i64>,
+) -> Result<PointsContext, String> {
+    let key = |d: i64| format!("{}:{lat:.4},{lng:.4}:d{d}", run_area_id.unwrap_or("-"));
+    let read = |k: &str| -> Option<PointsContext> {
+        CACHE.lock().ok().and_then(|g| {
+            g.as_ref().and_then(|entry| {
+                if entry.0 == k && entry.1.elapsed().as_secs() < CACHE_TTL_SECS {
+                    Some(entry.2.clone())
+                } else {
+                    None
+                }
+            })
+        })
+    };
+    let write = |k: &str, ctx: &PointsContext| {
+        if let Ok(mut g) = CACHE.lock() {
+            *g = Some((k.to_string(), std::time::Instant::now(), ctx.clone()));
         }
-    }
+    };
 
-    let ctx = fetch_points(client, lat, lng, run_area_id)?;
-    if let Ok(mut g) = CACHE.lock() {
-        *g = Some((key, std::time::Instant::now(), ctx.clone()));
+    let k1 = key(1);
+    if let Some(c) = read(&k1) {
+        return Ok(c);
     }
-    Ok(ctx)
+    let ctx = fetch_points_at_distance(client, lat, lng, run_area_id, 1)?;
+    write(&k1, &ctx);
+    if !ctx.points.is_empty() {
+        return Ok(ctx);
+    }
+    let Some(d) = fallback_distance_m.filter(|d| *d > 1) else {
+        return Ok(ctx);
+    };
+    let k2 = key(d);
+    if let Some(c) = read(&k2) {
+        return Ok(c);
+    }
+    let ctx2 = fetch_points_at_distance(client, lat, lng, run_area_id, d)?;
+    write(&k2, &ctx2);
+    Ok(ctx2)
 }
 
 /// 手动清缓存（换围栏时用）。
@@ -312,5 +372,16 @@ mod tests {
         let pts = vec![(30.5, 104.0)];
         let g = to_gcj(&pts);
         assert!((g[0].0 - 30.5).abs() > 1e-6, "BD→GCJ 应有偏移");
+    }
+
+    #[test]
+    fn path_uses_target_distance() {
+        assert_eq!(points_path(1), "/api/v560/get/1/distance/1");
+        assert_eq!(points_path(2000), "/api/v560/get/1/distance/2000");
+        // 0/负数统一钳到 1，避免发出 distance/0
+        assert_eq!(points_path(0), "/api/v560/get/1/distance/1");
+        assert_eq!(points_path(-5), "/api/v560/get/1/distance/1");
+        // 默认常量必须与 distance/1 一致，否则缓存 key 与真实请求会对不上
+        assert_eq!(points_path(1), POINTS_PATH);
     }
 }

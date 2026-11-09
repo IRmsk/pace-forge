@@ -233,6 +233,19 @@ pub struct RunOutcome {
 /// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
 pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutcome, String> {
     p.validate()?;
+    // 校时：之后所有时间戳都必须落在服务器时间轴上。
+    // 「开始时间 + 时长 ≤ 服务器现在」是服务端硬判据，本机时钟偏十几分钟
+    // 就直接驳回，而本地自检用同一个时钟，永远发现不了这个偏差。
+    let (server_now, skew) = super::gmttime::server_now_ms(client);
+    match skew {
+        Some(off) if off.abs() >= 1000 => log(&format!(
+            "√ [clock] 已校时：服务器比本机{}{}ms",
+            if off > 0 { "快" } else { "慢" },
+            off.abs()
+        )),
+        Some(_) => log("√ [clock] 已校时：与本机一致"),
+        None => log("· [clock] 校时失败，按本机时钟继续"),
+    }
     let start_ms = match p.start_at_ms {
         // 补跑：时间是外部算好的，直接用它，但照样加抖动让秒数不整齐
         Some(t) => {
@@ -244,7 +257,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         None => {
             use rand::Rng;
             let mut r = rand::thread_rng();
-            crate::crypto::envelope::now_ms() as i64 + r.gen_range(0..5_000i64)
+            server_now + r.gen_range(0..5_000i64)
         }
     };
 
@@ -261,8 +274,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                     "√ [goal] 学期目标 {:.1}km / {} 次{}",
                     left,
                     g.target_count,
-                    if g.days_left(crate::crypto::envelope::now_ms() as i64) >= 0 {
-                        format!("，还剩 {} 天", g.days_left(crate::crypto::envelope::now_ms() as i64))
+                    if g.days_left(server_now) >= 0 {
+                        format!("，还剩 {} 天", g.days_left(server_now))
                     } else {
                         String::new()
                     }
@@ -340,12 +353,34 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
 
     // ③ points
     log("[points] 拉取打卡点…");
-    let pt = match points::fetch_points_cached(
+    // 目标距离要传给点位接口：有的学校只在带真实距离时才下发点位。
+    // 先按 distance/1 拉，空集才用目标距离重试（见 points::fetch_points_cached_at）。
+    let pt = match points::fetch_points_cached_at(
         client,
         p.center_lat,
         p.center_lng,
         pick.as_ref().map(|k| k.selected.run_area_id.to_string()).as_deref(),
+        Some(p.distance_m.round() as i64),
     ) {
+        // 点位接口返回 200 但空数组：有的学校把必经点只放在围栏里，
+        // 这时点位接口本来就是空的，不是「这个校区没有打卡点」。
+        Ok(c) if c.points.is_empty() => {
+            match pick.as_ref().filter(|k| !k.selected.pass_points.is_empty()) {
+                Some(k) => {
+                    let (items, bd, gcj) = fence::pass_point_items(&k.selected.pass_points);
+                    log(&format!(
+                        "√ [points] 点位接口为空，改用围栏「{}」下发的 {} 个必经点",
+                        k.selected.name,
+                        items.len()
+                    ));
+                    PointsContext { points: items, coords: bd, gcj_coords: gcj }
+                }
+                None => {
+                    log("· [points] 点位接口为空，且所选围栏未下发必经点");
+                    c
+                }
+            }
+        }
         Ok(c) => {
             log(&format!(
                 "√ [points] {} 个点位，分布跨度 {:.0}m",
@@ -1004,6 +1039,17 @@ pub fn run_full(
     if !dropped.is_empty() {
         log(&format!("[detect] 已剔除不该有的字段: {}", dropped.join(", ")));
     }
+    // 派生字段互校：爬升 / 卡路里 / 功率 / 配速 / 圈数据必须与点位列自洽。
+    // 这些都是「填错了也能提交成功」的字段，回退成常量只会让服务端把整条
+    // 记录判成来源可疑，所以宁可在这里拦下。
+    let derived_problems = super::submit::audit_derived(&body);
+    if !derived_problems.is_empty() {
+        return Err(format!(
+            "报文派生字段自检失败（未提交）：{}",
+            derived_problems.join("；")
+        ));
+    }
+    log("√ [selfcheck] 派生字段与点位列自洽（爬升/卡路里/功率/配速/圈）");
     log(&format!(
         "√ [submit] 报文已组装，{} 个轨迹点",
         out.track.len()
@@ -1179,6 +1225,10 @@ pub fn detail_payload_rrid(
             })
             .collect()
     };
+    // 圈数据：真机每 1000m 切一圈（末圈 isFullLap=false）。原来发空数组，
+    // 等于告诉服务端「这条轨迹没有分段信息」——而圈配速、分段审核都读它。
+    // 与点位同源：直接从即将上传的 pts 反解 totalDis/totalTime/steps/bdA。
+    let laps = super::submit::build_laps_from_points(&pts, start_ms);
     let run_wrap = json!({
         "allLocJson": Value::Array(pts).to_string(),
         "useZip": false,
@@ -1201,7 +1251,7 @@ pub fn detail_payload_rrid(
         "step_freq_json": gz_json(&Value::Array(
             steps.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
         )),
-        "laps_json": gz_json(&Value::Array(Vec::<Value>::new())),
+        "laps_json": gz_json(&Value::Array(laps)),
         // 真机是 11 个键，多这一个。Inverx 的 7.3.92 builder.py:276-288
         // 和 ydsj-auto 的 gen_sw.py 两处独立实现对拍都确认 OBS_OBJECT_KEYS
         // 含 extension_json；键数本身是服务端 schema 校验项，少一个可能

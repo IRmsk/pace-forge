@@ -17,8 +17,14 @@ use super::client::Client;
 use crate::crypto::sign::{sport_signature, SignFields};
 use crate::track::TrackPoint;
 
-/// 每公里消耗千卡。
-const CALORIE_PER_KM: f64 = 62.0;
+/// 默认体重（kg）。
+///
+/// 官方卡路里不是「每公里固定千卡」，而是 MET × 体重 × 时长：
+/// 配速越慢，单位时间消耗越低，但单位距离消耗反而更高。用固定 62 kcal/km
+/// 会让「慢跑 3 公里」和「快跑 3 公里」报出同一个卡路里，与同时上报的
+/// 配速、步频自相矛盾（Neko/LightWhite520 的 `track/calorie.rs` 用的是
+/// 官方分档公式，pace 这里对齐）。
+pub const DEFAULT_WEIGHT_KG: f64 = 68.0;
 /// 最长允许跑步时长（秒）。
 pub const MAX_RUN_TIME: i64 = 7200;
 /// 最少步数。
@@ -409,6 +415,237 @@ pub fn speed_field(distance_m: f64, time_sec: i64) -> i64 {
     (pace_min * 1000.0).round() as i64
 }
 
+/// 官方卡路里分档：由配速（分/公里）取 MET。
+///
+/// 三个分段来自运动世界官方换算（Neko 家族 `LightWhite520/src/track/calorie.rs`
+/// 与 `blackpineapple` 两处独立实现一致）：
+///
+/// | 配速 p（分/公里） | MET |
+/// |---|---|
+/// | p < 10（快于 6:00/km） | 33/p + 4.1 |
+/// | 10 ≤ p < 12 | 102/p − 3.7 |
+/// | p ≥ 12（慢于 5:00/km） | 33.6/p + 1 |
+pub fn met_for_pace(pace_min_per_km: f64) -> f64 {
+    if !(pace_min_per_km.is_finite()) || pace_min_per_km <= 0.0 {
+        return 0.0;
+    }
+    if pace_min_per_km < 10.0 {
+        33.0 / pace_min_per_km + 4.1
+    } else if pace_min_per_km < 12.0 {
+        102.0 / pace_min_per_km - 3.7
+    } else {
+        33.6 / pace_min_per_km + 1.0
+    }
+}
+
+/// 卡路里（千卡）= 体重 × MET × 小时数。
+pub fn calorie_for(distance_m: f64, time_sec: i64, weight_kg: f64) -> i64 {
+    if distance_m <= 0.0 || time_sec <= 0 || weight_kg <= 0.0 {
+        return 0;
+    }
+    let pace = (time_sec as f64 / 60.0) / (distance_m / 1000.0);
+    let met = met_for_pace(pace);
+    let hours = time_sec as f64 / 3600.0;
+    (weight_kg * met * hours).round() as i64
+}
+
+/// 平均功率（W）= 1.1 × 体重 × 速度(m/s)，保留一位小数。
+///
+/// 真机有这个字段且非零；发 `0` 等于自称「全程不做功」，与 pace、步频、
+/// 卡路里三项都对不上。乘 1.1 是官方的体重→功率经验系数。
+pub fn avg_power_for(distance_m: f64, time_sec: i64, weight_kg: f64) -> f64 {
+    if distance_m <= 0.0 || time_sec <= 0 || weight_kg <= 0.0 {
+        return 0.0;
+    }
+    let v = distance_m / time_sec as f64;
+    ((1.1 * weight_kg * v) * 10.0).round() / 10.0
+}
+
+/// 从**已组装好的点位数组**算累计爬升（米）。
+///
+/// 必须用报文里的 `bdA` 序列而不是另算一套海拔：服务端按相邻采样点的
+/// 海拔差累计爬升，若上报值与点位序列不一致，`totalAscent` 与轨迹直接
+/// 互相矛盾——而 pace 原来恒定发 0，等于「一条有起伏的轨迹零爬升」。
+pub fn total_ascent_from_points(pts: &[Value]) -> i32 {
+    let mut prev: Option<f64> = None;
+    let mut sum = 0.0f64;
+    for p in pts {
+        let a = p.get("bdA").and_then(|v| v.as_f64());
+        let Some(a) = a else { continue };
+        if let Some(before) = prev {
+            let d = a - before;
+            if d > 0.0 {
+                sum += d;
+            }
+        }
+        prev = Some(a);
+    }
+    sum.round() as i32
+}
+
+/// 从已组装好的点位数组切圈（每 1000m 一圈，末圈 `isFullLap=false`）。
+///
+/// 结构对齐真机 OBS `laps_json`（13 个字段，见 Neko `track/wire.rs::build_laps`）：
+/// `avgPace` 用十进制分钟/公里、`avgStride` 用厘米、`elevationGain` 按圈内
+/// 正增量累计、`endAltRel` 相对首点海拔。
+///
+/// pace 原来发空数组。真机跑 2 公里必有 2 圈，空数组等于「这条轨迹没有
+/// 分段信息」，而服务端的分段审核、圈配速展示都读这一列。
+pub fn build_laps_from_points(pts: &[Value], start_ms: i64) -> Vec<Value> {
+    let mut laps: Vec<Value> = Vec::new();
+    let Some(last) = pts.last() else { return laps };
+    let last_dis = last.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let alt0 = pts
+        .first()
+        .and_then(|p| p.get("bdA"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    if pts.len() < 2 || last_dis <= 0.0 {
+        return laps;
+    }
+
+    let num = |q: &Value, k: &str| q.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
+    let r4 = |x: f64| (x * 10000.0).round() / 10000.0;
+
+    let (mut prev_d, mut prev_t, mut prev_steps, mut prev_gain) = (0.0f64, 0i64, 0i64, 0.0f64);
+    // 上限防止异常数据把循环卡死（每圈至少 1m 才继续）
+    let mut guard = 0usize;
+    while prev_d < last_dis && guard < 10_000 {
+        guard += 1;
+        let d_now = (prev_d + 1000.0).min(last_dis);
+        let (mut t_now, mut steps, mut altitude) = (
+            num(last, "totalTime") as i64,
+            num(last, "steps") as i64,
+            num(last, "bdA"),
+        );
+        let mut gain = 0.0f64;
+        for pair in pts.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            let climb = (num(b, "bdA") - num(a, "bdA")).max(0.0);
+            let (da, db) = (num(a, "totalDis"), num(b, "totalDis"));
+            if d_now < last_dis && db >= d_now && db > da {
+                let k = (d_now - da) / (db - da);
+                t_now = (num(a, "totalTime") + (num(b, "totalTime") - num(a, "totalTime")) * k).round() as i64;
+                steps = (num(a, "steps") + (num(b, "steps") - num(a, "steps")) * k).round() as i64;
+                altitude = num(a, "bdA") + (num(b, "bdA") - num(a, "bdA")) * k;
+                gain += climb * k;
+                break;
+            }
+            gain += climb;
+        }
+        let lap_d = d_now - prev_d;
+        let lap_t = t_now - prev_t;
+        let lap_steps = steps - prev_steps;
+        let idx = laps.len() as i64 + 1;
+        laps.push(json!({
+            "avgCadence": if lap_t > 0 { json!(r2(lap_steps as f64 / (lap_t as f64 / 60.0))) } else { Value::Null },
+            "avgPace": if lap_t > 0 && lap_d > 0.0 { json!(r4(lap_t as f64 / 60.0 / (lap_d / 1000.0))) } else { Value::Null },
+            "avgStride": if lap_steps > 0 { json!(r2(lap_d / lap_steps as f64 * 100.0)) } else { Value::Null },
+            "cumulativeDuration": t_now,
+            "distance": r4(lap_d),
+            "duration": lap_t,
+            "elevationGain": r2(gain - prev_gain),
+            "endAltAbs": r2(altitude),
+            "endAltRel": r2(altitude - alt0),
+            "flag": start_ms,
+            "id": idx,
+            "isFullLap": lap_d >= 1000.0,
+            "lapIndex": idx,
+            "step": lap_steps,
+        }));
+        prev_d = d_now;
+        prev_t = t_now;
+        prev_steps = steps;
+        prev_gain = gain;
+        // 末圈已到终点，避免 last_dis 恰好是整数倍时再切一个 0 长度圈
+        if d_now >= last_dis {
+            break;
+        }
+    }
+    laps
+}
+
+/// 派生字段互校：报文里由轨迹派生出来的几个数必须与点位自洽。
+///
+/// 这一层存在的理由：`totalAscent`、`calorie`、`avgPower`、`speed` 都是
+/// 「看着报文体随便填也不会报错」的字段，一旦哪个分支回退成常量
+/// （0 爬升、62 kcal/km、0 功率），报文仍然能提交成功，只在服务端那边
+/// 表现为「这项数据来源可疑」。所以每次提交前，用**已组装好的报文体**
+/// 反算一遍，跟声明值比——检查对象与发送对象是同一份。
+///
+/// 返回空 vec 表示自洽；非空表示必须拦下（不是提示）。
+pub fn audit_derived(body: &Value) -> Vec<String> {
+    let mut probs: Vec<String> = Vec::new();
+    let Some(raw) = body.get("allLocJson").and_then(|v| v.as_str()) else {
+        return vec!["报文缺 allLocJson".into()];
+    };
+    let pts: Vec<Value> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => return vec![format!("allLocJson 解析失败: {e}")],
+    };
+    let dis = body.get("totalDis").and_then(|v| v.as_i64()).unwrap_or(0);
+    let time_sec = body.get("totalTime").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    // 1) 累计爬升 = 点位 bdA 正增量之和
+    let expect_ascent = total_ascent_from_points(&pts) as i64;
+    let declared_ascent = body
+        .get("totalAscent")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(i64::MIN);
+    if (declared_ascent - expect_ascent).abs() > 1 {
+        probs.push(format!(
+            "totalAscent 声明 {declared_ascent} 与点位反算 {expect_ascent} 不符"
+        ));
+    }
+
+    // 2) 卡路里必须走 MET 折算，不能是固定 kcal/km
+    let expect_cal = calorie_for(dis as f64, time_sec, DEFAULT_WEIGHT_KG);
+    let declared_cal = body.get("calorie").and_then(|v| v.as_i64()).unwrap_or(i64::MIN);
+    if (declared_cal - expect_cal).abs() > 2 {
+        probs.push(format!(
+            "calorie 声明 {declared_cal} 与 MET 折算 {expect_cal} 不符"
+        ));
+    }
+
+    // 3) 平均功率非零且与速度成比例
+    let expect_pow = avg_power_for(dis as f64, time_sec, DEFAULT_WEIGHT_KG);
+    let declared_pow = body.get("avgPower").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+    if (declared_pow - expect_pow).abs() > 0.15 {
+        probs.push(format!(
+            "avgPower 声明 {declared_pow} 与折算 {expect_pow} 不符"
+        ));
+    }
+
+    // 4) speed 是配速×1000，不是速度×1000
+    let expect_speed = speed_field(dis as f64, time_sec);
+    let declared_speed = body.get("speed").and_then(|v| v.as_i64()).unwrap_or(i64::MIN);
+    if declared_speed != expect_speed {
+        probs.push(format!(
+            "speed 声明 {declared_speed} 与配速换算 {expect_speed} 不符"
+        ));
+    }
+
+    // 5) 圈数据存在时，圈里程和 / 圈时长和必须与总量一致
+    let laps = build_laps_from_points(&pts, body.get("startTime").and_then(|v| v.as_i64()).unwrap_or(0));
+    if !laps.is_empty() {
+        let sum_d: f64 = laps.iter().filter_map(|l| l["distance"].as_f64()).sum();
+        if (sum_d - dis as f64).abs() > 1.5 {
+            probs.push(format!("圈里程和 {sum_d:.1}m 与 totalDis {dis}m 不符"));
+        }
+        let sum_t: i64 = laps.iter().filter_map(|l| l["duration"].as_i64()).sum();
+        if (sum_t - time_sec).abs() > laps.len() as i64 {
+            probs.push(format!("圈时长和 {sum_t}s 与 totalTime {time_sec}s 不符"));
+        }
+        let last_ok = laps.last().map(|l| l["isFullLap"].as_bool() == Some(false)
+            || (dis % 1000 == 0));
+        if last_ok == Some(false) {
+            probs.push("末圈标注为整圈，但总里程不是 1000m 的整数倍".into());
+        }
+    }
+
+    probs
+}
 /// 构建完整提交报文。
 pub fn build(
     params: &SubmitParams,
@@ -432,7 +669,22 @@ pub fn build(
         0
     };
     let speed_val = speed_field(params.total_distance_m as f64, params.total_time_sec);
-    let calorie = (params.total_distance_m as f64 / 1000.0 * CALORIE_PER_KM) as i64;
+    // 卡路里与功率用官方折算，不再用固定 62 kcal/km、也不再恒发 0 功率
+    let calorie = calorie_for(
+        params.total_distance_m as f64,
+        params.total_time_sec,
+        DEFAULT_WEIGHT_KG,
+    );
+    let avg_power = avg_power_for(
+        params.total_distance_m as f64,
+        params.total_time_sec,
+        DEFAULT_WEIGHT_KG,
+    );
+    // 签名串和报文体的这个数字必须是**同一段文本**：Rust 的 f64 Display 去尾零
+    // （写 "207.8"），而 serde 的 f64 序列化在整数值时会补 ".0"（写 "0.0"），
+    // 两边一旦不同，tokenSign/signature 立刻对不上。统一以 Display 文本为准。
+    let avg_power_str = format!("{avg_power}");
+    let avg_power_val: Value = serde_json::from_str(&avg_power_str).unwrap_or(json!(0));
 
     // 轨迹点带瞬时速度（中心差分），服务端画图会用到
     // 单一数据源：直接用 simulate() 产出的桶。
@@ -469,6 +721,11 @@ pub fn build(
         })
         .collect();
     let all_loc_json = serde_json::to_string(&loc_items).map_err(|e| e.to_string())?;
+
+    // 累计爬升必须从**已生成的点位**反算，与 allLocJson 里的 bdA 物理同源。
+    // 原来恒发 0：点位有起伏、总爬升却是 0，服务端按两点海拔差累计时立刻
+    // 得到与上报值冲突的两套数字。
+    let total_ascent = total_ascent_from_points(&loc_items);
 
     // 原样回显服务端的点位结构：lon/lat 是 BD-09，glon/glat 是 GCJ-02，
     // isFixed 区分必经点与普通点，pointName 是点位标识。缺任何一个，
@@ -525,7 +782,7 @@ pub fn build(
     // ---- 签名（31 字段）----
     let sign_fields: SignFields = vec![
         ("address".into(), Some(String::new())),
-        ("avgPower".into(), Some("0".into())),
+        ("avgPower".into(), Some(avg_power_str.clone())),
         ("avgStepFreq".into(), Some(avg_step_freq.to_string())),
         ("calorie".into(), Some(calorie.to_string())),
         ("complete".into(), Some(complete.to_string())),
@@ -546,7 +803,7 @@ pub fn build(
         ("status".into(), Some("0".into())),
         ("stopTime".into(), Some(params.stop_time_ms.to_string())),
         ("themeId".into(), Some("0".into())),
-        ("totalAscent".into(), Some(params.total_ascent.to_string())),
+        ("totalAscent".into(), Some(total_ascent.to_string())),
         ("totalDis".into(), Some(params.total_distance_m.to_string())),
         ("totalSteps".into(), Some(params.total_steps.to_string())),
         ("totalTime".into(), Some(params.total_time_sec.to_string())),
@@ -564,7 +821,7 @@ pub fn build(
     let save_record = json!({
         "address": "",
         "allLocJson": all_loc_json,
-        "avgPower": 0,
+        "avgPower": avg_power_val.clone(),
         "avgStepFreq": avg_step_freq,
         "calorie": calorie,
         "complete": complete,
@@ -599,7 +856,7 @@ pub fn build(
         "stepsPerTenSec": step_arr,
         "stopTime": params.stop_time_ms,
         "themeId": 0,
-        "totalAscent": params.total_ascent,
+        "totalAscent": total_ascent,
         "totalDis": params.total_distance_m,
         "totalSteps": params.total_steps,
         "totalTime": params.total_time_sec,
@@ -1289,5 +1546,223 @@ mod step_distance_tests {
         for (i, &v) in mid.iter().enumerate().take(20) {
             assert!(v > 0.3 && v < 4.0, "第{i}个局部步幅 {v}m 异常");
         }
+    }
+
+    // ---- 官方折算：卡路里 / 功率 ----
+
+    #[test]
+    fn met_follows_official_segments() {
+        // 官方是三段拟合而非连续函数：阈值 10 和 12 处各有一个约 1 MET 的
+        // 台阶（33/10+4.1=7.4 对 102/10−3.7=6.5）。这里固定住三段各自的
+        // 取值与段内单调性，防止有人「顺手改成连续函数」。
+        assert!((met_for_pace(6.0) - 9.6).abs() < 0.01, "p<10 段公式变了");
+        assert!((met_for_pace(10.0) - 6.5).abs() < 0.01, "10≤p<12 段公式变了");
+        assert!((met_for_pace(12.0) - 3.8).abs() < 0.01, "p≥12 段公式变了");
+        // 段内单调：配速越快（p 越小）MET 越高
+        assert!(met_for_pace(5.0) > met_for_pace(9.0));
+        assert!(met_for_pace(10.5) > met_for_pace(11.5));
+        assert!(met_for_pace(12.0) > met_for_pace(20.0));
+        // 非法输入不产生 NaN/负值
+        assert_eq!(met_for_pace(0.0), 0.0);
+        assert_eq!(met_for_pace(-1.0), 0.0);
+        assert_eq!(met_for_pace(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn calorie_uses_met_not_fixed_per_km() {
+        // 同一个 3km：快跑 18min vs 慢跑 36min。固定 62 kcal/km 会给出同一个
+        // 186 kcal；MET 折算下两者必须不同，且慢跑单位时间消耗更低。
+        let fast = calorie_for(3000.0, 18 * 60, DEFAULT_WEIGHT_KG);
+        let slow = calorie_for(3000.0, 36 * 60, DEFAULT_WEIGHT_KG);
+        assert!(fast > 0 && slow > 0);
+        assert_ne!(fast, slow, "快慢跑卡路里相同，说明还在用固定 kcal/km");
+        let fast_per_h = fast as f64 / 0.3;
+        let slow_per_h = slow as f64 / 0.6;
+        assert!(fast_per_h > slow_per_h, "快跑单位时间消耗应更高");
+        // 量级检查：68kg 跑 3km 大约 150~260 kcal
+        assert!((140..=280).contains(&fast), "3km 卡路里 {fast} 量级异常");
+    }
+
+    #[test]
+    fn avg_power_is_nonzero_and_scales_with_speed() {
+        let slow = avg_power_for(3000.0, 1200, DEFAULT_WEIGHT_KG);
+        let fast = avg_power_for(3000.0, 600, DEFAULT_WEIGHT_KG);
+        assert!(slow > 0.0, "慢跑功率不应为 0");
+        assert!(fast > slow, "速度翻倍功率应更高");
+        // 1.1 * 68 * 2.5 m/s = 187 W
+        let expect = (1.1 * DEFAULT_WEIGHT_KG * 2.5 * 10.0).round() / 10.0;
+        assert!((avg_power_for(2500.0, 1000, DEFAULT_WEIGHT_KG) - expect).abs() < 0.01);
+    }
+
+    // ---- 圈与爬升 ----
+
+    fn rich_points(n: usize, total_m: f64, total_s: i64) -> Vec<TrackPoint> {
+        let lat0 = 31.2304;
+        (0..n).map(|i| TrackPoint {
+            lat: lat0 + (i as f64) * (total_m / (n - 1) as f64) / 111_320.0,
+            lon: 121.4737,
+            time_ms: 1_790_000_000_000 + (i as i64) * (total_s * 1000 / (n - 1) as i64),
+        }).collect()
+    }
+
+    #[test]
+    fn laps_split_every_1000m() {
+        let p = SubmitParams {
+            uid: "1".into(), unid: "1".into(),
+            uuid: "00000000-0000-4000-8000-000000000002".into(),
+            sport_type: 1, total_distance_m: 2400, total_time_sec: 840,
+            total_steps: 2400, start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_840_000, sel_distance_m: 2000,
+            sel_run_time_sec: 700, policy: "0".into(), run_area_id: 0,
+            geo_fences_json: "[]".into(), total_ascent: 0,
+        };
+        let t = rich_points(400, 2400.0, 840);
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+        let laps = build_laps_from_points(&arr, p.start_time_ms);
+
+        assert_eq!(laps.len(), 3, "2400m 应切 3 圈，实际 {}", laps.len());
+        let sum_d: f64 = laps.iter().map(|l| l["distance"].as_f64().unwrap()).sum();
+        assert!((sum_d - 2400.0).abs() < 0.05, "圈里程和 {sum_d} != 2400");
+        assert_eq!(laps[0]["isFullLap"], true);
+        assert_eq!(laps[1]["isFullLap"], true);
+        assert_eq!(laps[2]["isFullLap"], false, "末圈必须标 isFullLap=false");
+        // 圈时长累加必须等于总时长（切圈点按比例 round，允许每圈 1s 误差）
+        let sum_t: i64 = laps.iter().map(|l| l["duration"].as_i64().unwrap()).sum();
+        assert!((sum_t - 840).abs() <= laps.len() as i64,
+            "圈时长和 {sum_t} 偏离总时长 840 超过切圈舍入误差");
+        // 圈步数累加必须等于总步数分配后的末值
+        let last_steps = arr.last().unwrap()["steps"].as_i64().unwrap();
+        let sum_steps: i64 = laps.iter().map(|l| l["step"].as_i64().unwrap()).sum();
+        assert_eq!(sum_steps, last_steps);
+        assert_eq!(laps[0]["lapIndex"], 1);
+        assert_eq!(laps[2]["lapIndex"], 3);
+    }
+
+    #[test]
+    fn total_ascent_follows_bd_a_series() {
+        let p = SubmitParams {
+            uid: "1".into(), unid: "1".into(),
+            uuid: "00000000-0000-4000-8000-000000000003".into(),
+            sport_type: 1, total_distance_m: 2000, total_time_sec: 720,
+            total_steps: 2000, start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_720_000, sel_distance_m: 2000,
+            sel_run_time_sec: 720, policy: "0".into(), run_area_id: 0,
+            geo_fences_json: "[]".into(), total_ascent: 0,
+        };
+        let t = rich_points(300, 2000.0, 720);
+        let sim = test_sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+
+        let expect = total_ascent_from_points(&arr);
+        let declared = sub.save_record["totalAscent"].as_i64().unwrap();
+        assert_eq!(declared, expect as i64, "报文的 totalAscent 与点位反算值不一致");
+        // pace 的地点派生海拔自带缓坡，2000m 上必须有非零爬升
+        assert!(expect > 0, "2000m 轨迹爬升为 0，海拔序列是平的");
+        // 圈上的 elevationGain 之和要与总爬升同量级（差值来自切圈插值）
+        let laps = build_laps_from_points(&arr, p.start_time_ms);
+        let lap_sum: f64 = laps.iter().map(|l| l["elevationGain"].as_f64().unwrap()).sum();
+        // 总爬升 round 到整米、圈爬升保留 2 位且切圈点按比例分摊，
+        // 两者只能同量级（差 < 圈数 米），不要求逐分相等。
+        assert!((lap_sum - expect as f64).abs() <= laps.len() as f64 + 0.5,
+            "圈爬升和 {lap_sum} 与总爬升 {expect} 差太多");
+        // 上报值也必须出现在签名参与字段里（否则服务端算签名会不一致）
+        assert!(sub.canonical.contains(&format!("totalAscent={expect}")),
+            "签名串里的 totalAscent 不是点位反算值: {}", sub.canonical);
+        assert!(sub.canonical.contains("avgPower="),
+            "签名串缺 avgPower");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    fn params() -> SubmitParams {
+        SubmitParams {
+            uid: "1".into(),
+            unid: "2".into(),
+            uuid: "00000000-0000-4000-8000-000000000009".into(),
+            sport_type: 1,
+            total_distance_m: 2000,
+            total_time_sec: 720,
+            total_steps: 2000,
+            start_time_ms: 1_790_000_000_000,
+            stop_time_ms: 1_790_000_720_000,
+            sel_distance_m: 2000,
+            sel_run_time_sec: 720,
+            policy: "0".into(),
+            run_area_id: 0,
+            geo_fences_json: "[]".into(),
+            total_ascent: 0,
+        }
+    }
+
+    fn sim(p: &SubmitParams, pts: &[TrackPoint]) -> crate::track::SimResult {
+        crate::track::SimResult {
+            speeds: vec![2.8; pts.len()],
+            cadences: vec![160.0; pts.len()],
+            strides: vec![1.05; pts.len()],
+            total_steps: p.total_steps,
+            avg_cadence: 160.0,
+            speed_buckets: Vec::new(),
+            step_buckets: Vec::new(),
+            actual_length_m: p.total_distance_m as f64,
+        }
+    }
+
+    fn track() -> Vec<TrackPoint> {
+        let n = 300;
+        (0..n)
+            .map(|i| TrackPoint {
+                lat: 31.2304 + i as f64 * 2000.0 / (n - 1) as f64 / 111_320.0,
+                lon: 121.4737,
+                time_ms: 1_790_000_000_000 + i as i64 * 720_000 / (n - 1) as i64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn audit_passes_on_freshly_built_body() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let probs = audit_derived(&sub.save_record);
+        assert!(probs.is_empty(), "新建报文不该有派生字段问题: {probs:?}");
+    }
+
+    #[test]
+    fn audit_catches_constant_fallbacks() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let mut body = sub.save_record.clone();
+        // 退回三种常量填法
+        body["totalAscent"] = json!(0);
+        body["calorie"] = json!(124); // 2km × 62
+        body["avgPower"] = json!(0);
+        let probs = audit_derived(&body);
+        assert!(probs.iter().any(|s| s.contains("totalAscent")), "{probs:?}");
+        assert!(probs.iter().any(|s| s.contains("calorie")), "{probs:?}");
+        assert!(probs.iter().any(|s| s.contains("avgPower")), "{probs:?}");
+    }
+
+    #[test]
+    fn audit_catches_wrong_speed_unit() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let mut body = sub.save_record.clone();
+        // 把 m/s 当 speed 发（常见错误：速度 ×1000 而不是配速 ×1000）
+        body["speed"] = json!((2000.0 / 720.0 * 1000.0) as i64);
+        let probs = audit_derived(&body);
+        assert!(probs.iter().any(|s| s.contains("speed")), "{probs:?}");
     }
 }
