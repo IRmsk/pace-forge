@@ -167,6 +167,22 @@ pub fn point_json_full(
     let h2 = (p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
     let radius = 1.5 + ((h2 >> 40) % 150) as f64 / 100.0;
 
+    // 海拔。
+    //
+    // 原来写死 1.0，注释理由是「不能是 0，否则等于在海底跑」。但恒 1.0
+    // 同样不真实——服务端按相邻两点海拔差累计爬升，全程零爬升、且亮度
+    // 停在 1 米，是「这个点没有海拔数据」的典型特征。
+    //
+    // 用围栏中心纬经度派生一个基础海拔（同一校区稳定），再叠一层缓慢
+    // 漂移：相邻点之间变化很小（真实 GPS 高程是连续量），整条轨迹有
+    // 几十厘米的起伏，累计爬升落在个位数到十几米，与平地校园一致。
+    // 自变量必须是**平滑量**（累计里程），不能用坐标的小数位——
+    // 纬度的 fract 是高频噪声，跑一步就跳十几米，比自己写的假数据还假。
+    // 两个正弦的周期分别是约 2.1km 和 5.7km，整条轨迹就是一段缓坡。
+    let base_alt = 130.0 + (cum.0 * 0.003).sin() * 3.0 + (cum.0 * 0.0011).cos() * 2.0;
+    let drift = (idx as f64 * 0.037).cos() * 0.4;
+    let altitude = (base_alt + drift).max(0.0);
+
     // 局部步幅：本段位移 / 本段步数。原来那个表达式化简后是
     // 「累计里程 / 全程步数」，单调递增的累积平均值，不是即时步幅。
     let d_seg = cum.0 - prev_cum.0;
@@ -180,14 +196,24 @@ pub fn point_json_full(
     json!({
         "avgSpeed": (avg_speed * 10000.0).round() / 10000.0,
         // 海拔三兄弟不能是 0：服务端按它们算累计爬升，全 0 等于「在海底跑」
-        "bdA": 1.0,
+        "bdA": (altitude * 10.0).round() / 10.0,
         "bdD": 0.0,
         "bdG": 1,
         "bdS": 1.0,
         "coorType": "gcj02",
         "count": 1,
         "dtr": 0.0,
-        "flag": start_ms,
+        // flag 是**这个采样点的定位时刻**，不是整条轨迹的开始时刻。
+        //
+        // 原来这里写死 start_ms，419 个点的 flag 全一样。App 画轨迹时
+        // 按 flag 排点、按相邻两点的 flag 差算时间间隔——全部相等等于
+        // 「所有点同时定位」，折线拿不到任何时间维度的信息，地图上就
+        // 只剩里程/时长/配速这些标量，画不出线。表现是记录点进去只有
+        // 数据、没有轨迹，一看就是刷的。
+        //
+        // verify_view 也从首点 flag 反解 startTime，说明这个字段本来就
+        // 是绝对毫秒时间戳，与 totalTime（累计秒）不是一回事。
+        "flag": p.time_ms,
         "gLat": (glat * 1e7).round() / 1e7,
         "gLng": (glng * 1e7).round() / 1e7,
         "gainTime": "",
@@ -890,6 +916,61 @@ mod point_shape_tests {
 
     fn tp(lat: f64, lon: f64, t: i64) -> TrackPoint {
         TrackPoint { lat, lon, time_ms: t }
+    }
+
+    /// 每个采样点的 `flag` 必须是它自己的定位时刻，不能整条轨迹一个值。
+    #[test]
+    fn flag_advances_per_point() {
+        let pts: Vec<TrackPoint> = (0..10)
+            .map(|i| tp(31.2304 + i as f64 * 2e-4, 121.4737, 1_790_000_000_000 + i * 5000))
+            .collect();
+        let params = params();
+        let sim = test_sim(&params, &pts);
+        let sub = build(&params, &pts, &[], &sim).unwrap();
+        let s = sub.save_record["allLocJson"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+
+        // 全同 = App 拿不到时间维度的信息，画不出折线，记录只剩标量数据
+        let flags: Vec<i64> = arr.iter().map(|p| p["flag"].as_i64().unwrap()).collect();
+        assert!(
+            flags.windows(2).all(|w| w[1] > w[0]),
+            "flag 必须逐点递增，实际 {flags:?}"
+        );
+        // 首点就是 startTime，verify_view 反过来靠它反解
+        assert_eq!(flags[0], params.start_time_ms, "首点 flag 应等于 startTime");
+        // 与 totalTime 同源：末点累计秒对应的时间戳要对得上
+        let last_total_time = arr.last().unwrap()["totalTime"].as_i64().unwrap();
+        assert_eq!(
+            flags.last().unwrap() - flags[0],
+            last_total_time * 1000,
+            "flag 跨度应与 totalTime 一致"
+        );
+    }
+
+    /// 海拔不能是常量。
+    #[test]
+    fn altitude_varies() {
+        let pts: Vec<TrackPoint> = (0..40)
+            .map(|i| tp(31.2304 + i as f64 * 2e-4, 121.4737, 1_790_000_000_000 + i * 5000))
+            .collect();
+        let params = params();
+        let sim = test_sim(&params, &pts);
+        let sub = build(&params, &pts, &[], &sim).unwrap();
+        let s = sub.save_record["allLocJson"].as_str().unwrap();
+        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+
+        let alts: Vec<f64> = arr.iter().map(|p| p["bdA"].as_f64().unwrap()).collect();
+        // 恒 1.0 是「这个点没有海拔数据」的特征，服务端据此算累计爬升
+        assert!(alts.iter().any(|&a| a > 1.5), "海拔应脱离 1.0，实际均值约 {}", alts.iter().sum::<f64>() / alts.len() as f64);
+
+        // 相邻两点变化要小，真实 GPS 高程是连续量
+        let max_step = alts.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+        assert!(max_step < 3.0, "相邻点海拔跳变 {max_step:.2}m，太假");
+
+        // 整条轨迹要有起伏
+        let mean = alts.iter().sum::<f64>() / alts.len() as f64;
+        let var = alts.iter().map(|a| (a - mean).powi(2)).sum::<f64>() / alts.len() as f64;
+        assert!(var.sqrt() > 0.05, "海拔标准差 {} 太小，等于一条直线", var.sqrt());
     }
 
     #[test]
