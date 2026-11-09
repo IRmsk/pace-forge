@@ -1031,8 +1031,11 @@ pub fn run_full(
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_default();
     let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid, &five_pt);
+    // 本地时区和 UTC 各传一份：服务端拼 key 用哪个时区没有确定证据，
+    // 猜错就等于轨迹对象不存在，记录点开只有标量数据。
     let keys = vec![
         super::obs::detail_key(start_ms, &uuid),
+        super::obs::detail_key_utc(start_ms, &uuid),
         format!("run_data/{}/{rrid}.json", rrid / 1_000_000),
     ];
     let bytes = serde_json::to_vec(&payload).map_err(|e| format!("明细序列化失败: {e}"))?;

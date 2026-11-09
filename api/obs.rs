@@ -121,11 +121,28 @@ fn tz_offset_sec() -> i64 {
         .unwrap_or(8 * 3600)
 }
 
-/// 生成 objectKey（详情页格式）。
+/// 生成 objectKey（详情页格式，本地时区）。
 pub fn detail_key(now_ms: i64, uuid: &str) -> String {
-    let secs = now_ms / 1000 + tz_offset_sec();
-    let days = secs / 86_400;
-    let (y, m, d, h) = civil_from_days(days, (secs % 86_400) / 3600);
+    key_at_offset(now_ms, uuid, tz_offset_sec())
+}
+
+/// 生成 objectKey，UTC 版本。
+///
+/// 服务端拼 key 时用哪个时区没有确定证据——它可能是 `ZoneId.systemDefault()`
+/// （服务器在中国就是 UTC+8），也可能是 `ZoneOffset.UTC`。猜错的代价是
+/// 服务端按自己的时区去找对象时取空，轨迹读不到，记录里只剩里程/时长/
+/// 配速这些标量，一眼假。
+///
+/// 既然一个对象才几 KB，两个时区各传一份，不管服务端按哪个算都能命中。
+/// 这比继续猜便宜得多。
+pub fn detail_key_utc(now_ms: i64, uuid: &str) -> String {
+    key_at_offset(now_ms, uuid, 0)
+}
+
+fn key_at_offset(now_ms: i64, uuid: &str, offset_sec: i64) -> String {
+    let secs = now_ms / 1000 + offset_sec;
+    let days = secs.div_euclid(86_400);
+    let (y, m, d, h) = civil_from_days(days, (secs.rem_euclid(86_400)) / 3600);
     format!("run_data/{y:04}{m:02}{d:02}{h:02}/{uuid}.json")
 }
 

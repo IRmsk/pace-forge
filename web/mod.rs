@@ -1499,7 +1499,25 @@ fn handle_run(
     drop(log);
 
     match result {
-        Ok(o) => json_ok(request, json!({
+        Ok(o) => {
+            // 记下这次提交的时刻。
+            //
+            // 这个字段原来从没被更新过——`last_submit_ms` 只在切换账号时
+            // 保留旧值，永远是 0。于是静默窗口判断 `now - last_submit >= 600s`
+            // 恒成立，客户端这边等于完全不拦；连续点几下全发给服务端，
+            // 每次都要等它回 10603 才知道太频繁。
+            if o.submitted {
+                if let Ok(mut st) = state.lock() {
+                    if let Some(id) = st.current.clone() {
+                        let now = crate::crypto::envelope::now_ms() as i64;
+                        if let Some(a) = st.book.get_mut(&id) {
+                            a.last_submit_ms = now;
+                        }
+                        st.persist();
+                    }
+                }
+            }
+            json_ok(request, json!({
             "submitted": o.submitted,
             "recordId": o.record_id,
             "distance": o.real_length_m,
@@ -1508,7 +1526,8 @@ fn handle_run(
             "points": o.track_points,
             "obsKeys": o.obs_keys.len(),
             "logs": logs.borrow().clone(),
-        })),
+            }))
+        }
         Err(e) => json_err(request, &format!("{e}\n---\n{}", logs.borrow().join("\n"))),
     }
 }
