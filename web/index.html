@@ -559,6 +559,7 @@ function renderAccounts(r) {
       </div>
       <button class="ghost mini" data-act="switch"  data-id="${a.id}" ${a.current ? 'disabled' : ''}>切换</button>
       <button class="ghost mini" data-act="login"   data-id="${a.id}" ${a.hasPassword ? '' : 'disabled'}>重登</button>
+      <button class="ghost mini" data-act="logout"  data-id="${a.id}" ${a.loggedIn ? '' : 'disabled'}>退出</button>
       <button class="ghost mini" data-act="toggle"  data-id="${a.id}">${a.enabled ? '停用' : '启用'}</button>
       <button class="ghost mini" data-act="del"     data-id="${a.id}" style="color:#ef4444">删除</button>
     </div>`;
@@ -573,9 +574,10 @@ async function accountAction(act, id) {
   const m = $('accMsg');
   try {
     if (act === 'del') {
-      if (!confirm('删除这个账号？存盘的密码也会一起删掉。')) return;
-      await api('/api/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
-      m.textContent = '已删除';
+      if (!confirm('删除这个账号？\n\n会先退出登录再删（不然服务端会话留活，下次登要锁一小时），存盘的密码也会一起删掉。\n\n只是想换账号的话，用旁边的「退出」——密码留着，随时重登。')) return;
+      m.textContent = '退出中…';
+      const r = await api('/api/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
+      m.textContent = r.remoteLogout ? '已退出登录并删除' : '已删除';
     } else if (act === 'switch') {
       await api('/api/accounts/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
       m.textContent = '已切换';
@@ -584,6 +586,12 @@ async function accountAction(act, id) {
       m.textContent = '登录中…';
       const r = await api('/api/accounts/' + encodeURIComponent(id) + '/login', { method: 'POST' });
       m.textContent = '登录成功：' + (r.name || r.uid);
+    } else if (act === 'logout') {
+      // 退出登录：通知服务端让 token 失效，本地只清登录态，密码留着。
+      // 不走这一步直接删账号的话，服务端会话还活着，账号仍被标记「已登录」，
+      // 下次登录触发 10121 并锁一小时。
+      await api('/api/accounts/' + encodeURIComponent(id) + '/logout', { method: 'POST' });
+      m.textContent = '已退出登录，密码已保留，随时可以重登';
     } else if (act === 'toggle') {
       await api('/api/accounts/' + encodeURIComponent(id) + '/toggle', { method: 'POST' });
       m.textContent = '';

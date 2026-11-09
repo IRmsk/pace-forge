@@ -117,6 +117,36 @@ impl State {
     }
 }
 
+/// 对某个账号发一次服务端退出，失败也返回 false 而不是报错。
+///
+/// 优先用内存里的 client；没有（进程刚重启、或者这个账号还没被激活过）
+/// 就用存盘的 uid/token 临时建一个，只为发这一个请求。
+///
+/// 这一步不能省。重启后直接删账号时内存里没有 client，如果就此跳过，
+/// 服务端会话仍然活着，账号在服务端还是「已登录」——下次登录 10121 并
+/// 锁一小时。用户视角就是「我明明删了，怎么还锁我」。
+fn remote_logout(state: &Shared, id: &str) -> bool {
+    let mut tmp: Option<Client> = None;
+    {
+        let mut st = match state.lock() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        if let Some(c) = st.clients.get_mut(id) {
+            return crate::api::login::logout(c).unwrap_or(false);
+        }
+        if let Some(a) = st.book.get(id) {
+            if a.logged_in() {
+                tmp = Some(make_client(&a.uid, &a.token, &a.unid));
+            }
+        }
+    }
+    match tmp.as_mut() {
+        Some(c) => crate::api::login::logout(c).unwrap_or(false),
+        None => false,
+    }
+}
+
 fn make_client(uid: &str, token: &str, unid: &str) -> Client {
     // 每个账号独立的 device_id，避免被按设备聚合。
     //
@@ -372,6 +402,7 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
                 return match (method, action) {
                     (Method::Delete, "") => handle_del_account(request, state, &id),
                     (Method::Post, "switch") => handle_switch(request, state, &id),
+                    (Method::Post, "logout") => handle_logout_one(request, state, &id),
                     (Method::Post, "login") => handle_login_one(request, state, &id),
                     (Method::Post, "toggle") => handle_toggle(request, state, &id),
                     _ => json_err_code(request, 404, "unknown account action"),
@@ -883,6 +914,16 @@ fn handle_del_account(
     state: Shared,
     id: &str,
 ) -> Result<(), String> {
+    // 先退出登录，再从本地删掉。
+    //
+    // 顺序不能反。直接删只是丢掉本地凭据，服务端会话还活着，账号在服务
+    // 端仍是「已登录」状态——下次登录触发 10121（已在其他设备登录），
+    // 而且锁一小时。用户看到的现象就是「删完再登登不上，等一小时」。
+    //
+    // 通知失败也继续删：服务端可能已经把会话判过期（返回 false），
+    // 那样本来就没有活的会话要清，不该因此卡住用户。
+    let remote = remote_logout(&state, id);
+
     let mut st = state.lock().map_err(|e| e.to_string())?;
     let ok = st.book.remove(id);
     st.clients.remove(id);
@@ -890,7 +931,41 @@ fn handle_del_account(
         st.current = None;
     }
     st.persist();
-    json_ok(request, json!({"removed": ok}))
+    json_ok(request, json!({"removed": ok, "remoteLogout": remote}))
+}
+
+/// 按账号退出登录：只清登录态，保留手机号和存盘密码。
+///
+/// 和顶部的「退出」（`/api/logout`）不是一回事：那个清的是**当前**账号，
+/// 而且连 web 会话一起清。这个是针对列表里某一行，退出后账号还在，
+/// 状态变成「待登录」，下次点「重登」就回来了——不用重新输密码。
+///
+/// 同样要先调服务端 `/api/v6/user/logout`。只清本地 token 的话服务端
+/// 会话还活着，账号被标记「已登录」，再登触发 10121 并锁一小时。
+fn handle_logout_one(
+    request: tiny_http::Request,
+    state: Shared,
+    id: &str,
+) -> Result<(), String> {
+    let remote = remote_logout(&state, id);
+
+    let mut st = state.lock().map_err(|e| e.to_string())?;
+    if st.book.get(id).is_none() {
+        return json_err(request, "账号不存在");
+    }
+    // 只清登录态。password_enc 不动，所以退出后还能一键重登。
+    if let Some(a) = st.book.get_mut(id) {
+        a.token.clear();
+        a.uid.clear();
+        a.unid.clear();
+    }
+    st.clients.remove(id);
+    let was_current = st.current.as_deref() == Some(id);
+    if was_current {
+        st.current = None;
+    }
+    st.persist();
+    json_ok(request, json!({"ok": true, "remoteLogout": remote, "wasCurrent": was_current}))
 }
 
 fn handle_switch(
