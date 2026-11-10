@@ -80,6 +80,9 @@ pub struct Submission {
     pub object_key: String,
     /// 供排查用的签名原文。
     pub canonical: String,
+    /// 提交用的点位数组（`allLocJson` 那份）。报文里这个字段现在发空串
+    /// （真机/Neko 都这样，轨迹只走 OBS），所以派生字段自检从这里取点。
+    pub points: Vec<Value>,
 }
 
 /// 单个轨迹点在 `allLocJson` 里的完整结构。
@@ -318,26 +321,22 @@ impl VerifyView {
 }
 
 /// 从提交报文反解出校验视图。字段名和 `point_json_full` / `build` 一一对应。
-pub fn verify_view(body: &Value) -> Result<VerifyView, String> {
+pub fn verify_view(body: &Value, pts: &[Value]) -> Result<VerifyView, String> {
+    // 报文里的 allLocJson 现在是空串（轨迹只走 OBS），点位由调用方传进来
     let start_ms = body
         .get("startTime")
         .and_then(|v| v.as_i64())
         .or_else(|| {
-            body.get("allLocJson")
-                .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str::<Vec<Value>>(s).ok())
-                .and_then(|a| a.first().and_then(|p| p.get("flag")).and_then(|f| f.as_i64()))
+            pts.first()
+                .and_then(|p| p.get("flag"))
+                .and_then(|f| f.as_i64())
         })
         .ok_or("报文缺 startTime")?;
     let stop_ms = body.get("stopTime").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    let raw = body
-        .get("allLocJson")
-        .and_then(|v| v.as_str())
-        .ok_or("报文缺 allLocJson")?;
-    let arr: Vec<Value> = serde_json::from_str(raw).map_err(|e| format!("allLocJson 解析失败: {e}"))?;
+    let arr: Vec<Value> = pts.to_vec();
     if arr.is_empty() {
-        return Err("allLocJson 为空".into());
+        return Err("点位列是空的".into());
     }
 
     let mut points: Vec<TrackPoint> = Vec::with_capacity(arr.len());
@@ -579,15 +578,12 @@ pub fn build_laps_from_points(pts: &[Value], start_ms: i64) -> Vec<Value> {
 /// 反算一遍，跟声明值比——检查对象与发送对象是同一份。
 ///
 /// 返回空 vec 表示自洽；非空表示必须拦下（不是提示）。
-pub fn audit_derived(body: &Value) -> Vec<String> {
+pub fn audit_derived(body: &Value, pts: &[Value]) -> Vec<String> {
     let mut probs: Vec<String> = Vec::new();
-    let Some(raw) = body.get("allLocJson").and_then(|v| v.as_str()) else {
-        return vec!["报文缺 allLocJson".into()];
-    };
-    let pts: Vec<Value> = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(e) => return vec![format!("allLocJson 解析失败: {e}")],
-    };
+    if pts.is_empty() {
+        return vec!["点位列是空的，派生字段无从校验".into()];
+    }
+    let pts: Vec<Value> = pts.to_vec();
     let dis = body.get("totalDis").and_then(|v| v.as_i64()).unwrap_or(0);
     let time_sec = body.get("totalTime").and_then(|v| v.as_i64()).unwrap_or(0);
 
@@ -721,7 +717,6 @@ pub fn build(
             )
         })
         .collect();
-    let all_loc_json = serde_json::to_string(&loc_items).map_err(|e| e.to_string())?;
 
     // 累计爬升必须从**已生成的点位**反算，与 allLocJson 里的 bdA 物理同源。
     // 原来恒发 0：点位有起伏、总爬升却是 0，服务端按两点海拔差累计时立刻
@@ -733,7 +728,8 @@ pub fn build(
     // 服务端都可能认不出这是它发的那批点。
     let fp_items: Vec<Value> = fixed
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
             json!({
                 "lon": f.lon,
                 "lat": f.lat,
@@ -742,6 +738,14 @@ pub fn build(
                 "glon": f.glon,
                 "glat": f.glat,
                 "position": f.position,
+                // 下面四个是真机五点数组里的必现字段，缺了服务端存不下点位，
+                // 详情页回显 fivePointJson 就是空串，App 那边也拿不到点位连线。
+                // 参照实现 Neko 的 five_point_payload 逐项对拍：
+                //   flag 定位时刻 / id 序号 / isPass 是否经过 / state 速度合规三态
+                "flag": params.start_time_ms,
+                "id": i as i64 + 1,
+                "isPass": f.position >= 0,
+                "state": 0,
             })
         })
         .collect();
@@ -821,7 +825,11 @@ pub fn build(
 
     let save_record = json!({
         "address": "",
-        "allLocJson": all_loc_json,
+        // 轨迹不进 body：真机与 Neko 都发空串，点集只走 OBS 的 run_data。
+        // 原来把 420 个点塞在这里，服务端把它当「客户端自带轨迹」，
+        // 详情里 allLocJson 回 null、jsonFromObs 置 1，App 转去查手机本地库，
+        // 结果地图上一条线都没有。
+        "allLocJson": String::new(),
         "avgPower": avg_power,
         "avgStepFreq": avg_step_freq,
         "calorie": calorie,
@@ -873,7 +881,7 @@ pub fn build(
     // 真正的 objectKey 要等提交返回 rrid 才能算，这里先给出 detail key 的雏形
     let object_key = crate::api::obs::detail_key(params.start_time_ms, &params.uuid);
 
-    Ok(Submission { save_record, object_key, canonical })
+    Ok(Submission { save_record, object_key, canonical, points: loc_items })
 }
 
 #[cfg(test)]
@@ -985,10 +993,11 @@ mod tests {
         let sim = test_sim(&params(), &points());
         let sub = build(&params(), &points(), &[], &sim).unwrap();
         let v = &sub.save_record;
-        // allLocJson 是字符串化的 JSON（双重序列化）
-        assert!(v["allLocJson"].is_string(), "allLocJson 应为字符串");
-        let inner: Value = serde_json::from_str(v["allLocJson"].as_str().unwrap()).unwrap();
-        assert!(inner.is_array(), "allLocJson 解一层后应是数组");
+        // allLocJson 必须是**空串**：真机与 Neko 都这样发，点集只走 OBS 的
+        // run_data。塞进 body 会让服务端把轨迹当成「客户端自带」，详情里
+        // allLocJson 回 null、jsonFromObs 置 1，App 转去查本地库 → 地图无线。
+        assert_eq!(v["allLocJson"], json!(""), "allLocJson 应发空串");
+        assert!(!sub.points.is_empty(), "点集要在 Submission.points 里备着给 OBS/自检用");
 
         // speedPerTenSec / stepsPerTenSec 是**数组**，不要套成字符串。
         // 早先按 allLocJson 的模式一起套了，提交回来 -10000。
@@ -1185,8 +1194,7 @@ mod point_shape_tests {
         let params = params();
         let sim = test_sim(&params, &pts);
         let sub = build(&params, &pts, &[], &sim).unwrap();
-        let s = sub.save_record["allLocJson"].as_str().unwrap();
-        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        let arr: Vec<serde_json::Value> = sub.points.clone();
 
         // 全同 = App 拿不到时间维度的信息，画不出折线，记录只剩标量数据
         let flags: Vec<i64> = arr.iter().map(|p| p["flag"].as_i64().unwrap()).collect();
@@ -1214,8 +1222,7 @@ mod point_shape_tests {
         let params = params();
         let sim = test_sim(&params, &pts);
         let sub = build(&params, &pts, &[], &sim).unwrap();
-        let s = sub.save_record["allLocJson"].as_str().unwrap();
-        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        let arr: Vec<serde_json::Value> = sub.points.clone();
 
         let alts: Vec<f64> = arr.iter().map(|p| p["bdA"].as_f64().unwrap()).collect();
         // 恒 1.0 是「这个点没有海拔数据」的特征，服务端据此算累计爬升
@@ -1241,8 +1248,7 @@ mod point_shape_tests {
         let params = params();
         let sim = test_sim(&params, &pts);
         let sub = build(&params, &pts, &[], &sim).unwrap();
-        let s = sub.save_record["allLocJson"].as_str().unwrap();
-        let arr: Vec<serde_json::Value> = serde_json::from_str(s).unwrap();
+        let arr: Vec<serde_json::Value> = sub.points.clone();
         assert_eq!(arr.len(), 3);
 
         let p0 = &arr[0];
@@ -1299,7 +1305,7 @@ mod point_shape_tests {
         let sim = test_sim(&p0, &pts);
         let sub = build(&p0, &pts, &[], &sim).unwrap();
         let arr: Vec<serde_json::Value> =
-            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+            sub.points.clone();
 
         let mut types = std::collections::HashSet::new();
         for p in &arr {
@@ -1458,7 +1464,7 @@ mod verify_roundtrip_tests {
         let t = track();
         let sim = test_sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
-        let v = verify_view(&sub.save_record).unwrap();
+        let v = verify_view(&sub.save_record, &sub.points).unwrap();
 
         assert_eq!(v.step_buckets.len(), sim.step_buckets.len());
         for (a, b) in v.step_buckets.iter().zip(sim.step_buckets.iter()) {
@@ -1475,7 +1481,7 @@ mod verify_roundtrip_tests {
         let t = track();
         let sim = test_sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
-        let v = verify_view(&sub.save_record).unwrap();
+        let v = verify_view(&sub.save_record, &sub.points).unwrap();
         assert_eq!(v.points.len(), t.len());
         for (got, want) in v.points.iter().zip(t.iter()) {
             let d = crate::track::geo::distance((got.lat, got.lon), (want.lat, want.lon));
@@ -1499,7 +1505,7 @@ mod verify_roundtrip_tests {
         let t = track();
         let sim = test_sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
-        let v = verify_view(&sub.save_record).unwrap();
+        let v = verify_view(&sub.save_record, &sub.points).unwrap();
         assert_eq!(v.start_time_ms, p.start_time_ms);
         assert!(v.stop_time_ms > v.start_time_ms);
     }
@@ -1530,7 +1536,7 @@ mod step_distance_tests {
         let sim = test_sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
         let arr: Vec<serde_json::Value> =
-            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+            sub.points.clone();
 
         let vals: Vec<f64> = arr.iter()
             .filter_map(|q| q.get("stepDistance").and_then(|v| v.as_f64()))
@@ -1621,7 +1627,7 @@ mod step_distance_tests {
         let sim = test_sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
         let arr: Vec<serde_json::Value> =
-            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+            sub.points.clone();
         let laps = build_laps_from_points(&arr, p.start_time_ms);
 
         assert_eq!(laps.len(), 3, "2400m 应切 3 圈，实际 {}", laps.len());
@@ -1657,7 +1663,7 @@ mod step_distance_tests {
         let sim = test_sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
         let arr: Vec<serde_json::Value> =
-            serde_json::from_str(sub.save_record["allLocJson"].as_str().unwrap()).unwrap();
+            sub.points.clone();
 
         let expect = total_ascent_from_points(&arr);
         let declared = sub.save_record["totalAscent"].as_i64().unwrap();
@@ -1733,7 +1739,7 @@ mod audit_tests {
         let t = track();
         let sim = sim(&p, &t);
         let sub = build(&p, &t, &[], &sim).unwrap();
-        let probs = audit_derived(&sub.save_record);
+        let probs = audit_derived(&sub.save_record, &sub.points);
         assert!(probs.is_empty(), "新建报文不该有派生字段问题: {probs:?}");
     }
 
@@ -1748,7 +1754,7 @@ mod audit_tests {
         body["totalAscent"] = json!(0);
         body["calorie"] = json!(124); // 2km × 62
         body["avgPower"] = json!(0);
-        let probs = audit_derived(&body);
+        let probs = audit_derived(&body, &sub.points);
         assert!(probs.iter().any(|s| s.contains("totalAscent")), "{probs:?}");
         assert!(probs.iter().any(|s| s.contains("calorie")), "{probs:?}");
         assert!(probs.iter().any(|s| s.contains("avgPower")), "{probs:?}");
@@ -1763,7 +1769,7 @@ mod audit_tests {
         let mut body = sub.save_record.clone();
         // 把 m/s 当 speed 发（常见错误：速度 ×1000 而不是配速 ×1000）
         body["speed"] = json!((2000.0 / 720.0 * 1000.0) as i64);
-        let probs = audit_derived(&body);
+        let probs = audit_derived(&body, &sub.points);
         assert!(probs.iter().any(|s| s.contains("speed")), "{probs:?}");
     }
 
@@ -1806,5 +1812,43 @@ mod audit_tests {
         let v = &sub.save_record["avgPower"];
         assert!(v.is_i64() || v.is_u64(), "avgPower 必须是 JSON 整数，实际 {v}");
         assert!(v.as_i64().unwrap() > 0, "avgPower 不应为 0");
+    }
+
+    /// 五点数组的每项必须带真机那套字段。
+    ///
+    /// 缺 `isPass` / `state` / `id` / `flag` 时服务端存不下点位，详情页
+    /// 回显 fivePointJson 是空串 —— App 那边既没有点位连线，点位判定
+    /// （「按顺序通过所有点位」）也永远是 false。
+    #[test]
+    fn five_point_items_carry_device_fields() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let fixed = vec![
+            FixedPoint {
+                lat: 47.385199, lon: 123.959484, position: 0, is_fixed: 1,
+                point_name: "秋实城东南".into(), glat: 47.378857, glon: 123.953134,
+            },
+            FixedPoint {
+                lat: 47.386100, lon: 123.960100, position: 5, is_fixed: 0,
+                point_name: "梅园2栋西".into(), glat: 47.379700, glon: 123.953800,
+            },
+        ];
+        let sub = build(&p, &t, &fixed, &sim).unwrap();
+
+        let env: Value = serde_json::from_str(sub.save_record["fivePointJson"].as_str().unwrap())
+            .expect("fivePointJson 应是字符串化 JSON");
+        assert!(env.get("fivePointJson").is_some(), "外层 envelope 要带 fivePointJson");
+        let inner: Vec<Value> =
+            serde_json::from_str(env["fivePointJson"].as_str().unwrap()).unwrap();
+        assert!(!inner.is_empty(), "点位数组不能为空");
+        for (i, f) in inner.iter().enumerate() {
+            for k in ["lon", "lat", "glon", "glat", "isFixed", "pointName",
+                      "position", "flag", "id", "isPass", "state"] {
+                assert!(f.get(k).is_some(), "第 {i} 个点缺字段 {k}");
+            }
+            assert!(f["isPass"].is_boolean(), "isPass 必须是 bool");
+            assert_eq!(f["id"], json!(i as i64 + 1), "id 应从 1 递增");
+        }
     }
 }

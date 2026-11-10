@@ -994,6 +994,37 @@ function recHtml(r, i) {
   </div>`;
 }
 
+/* ---------- 从 OBS 拉轨迹 ----------
+ * 服务端详情接口对工具提交的记录不返回坐标（jsonFromObs=1 → App 查本地库），
+ * 但轨迹对象确实在对象存储里，key 规则是 run_data/{rrid/1000000}/{rrid}.json。
+ * 用后端 /api/obs/fetch 换 Get 签名下载，浏览器侧用 DecompressionStream('gzip')
+ * 解压，再取 run_data.allLocJson。
+ */
+async function ungzipB64(b64) {
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const out = new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return await new Response(out).text();
+}
+
+async function obsTrack(rrid) {
+  const key = 'run_data/' + Math.floor(rrid / 1000000) + '/' + rrid + '.json';
+  try {
+    const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
+    const obj = j.data ?? j;
+    if (!obj || !obj.run_data) return null;
+    const wrap = JSON.parse(await ungzipB64(obj.run_data));
+    const raw = wrap.allLocJson;
+    const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(arr)) return null;
+    // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
+    return arr
+      .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
+      .filter(p => p.lat && p.lng);
+  } catch (e) {
+    return null;
+  }
+}
+
 /* ---------- 单条详情 ---------- */
 async function selectRec(r, el) {
   document.querySelectorAll('.rec').forEach(x => x.classList.remove('sel'));
@@ -1005,7 +1036,15 @@ async function selectRec(r, el) {
 
   try {
     const d = await api('/api/record/' + rrid);
-    const pts = findTrack(d);
+    let pts = findTrack(d);
+    // 服务端详情不带轨迹点（jsonFromObs=1 时 App 也去查手机本地库），
+    // 但轨迹对象一直在 OBS 里：key 是 run_data/{rrid/1000000}/{rrid}.json。
+    // 拉下来 → gzip 解压 → 取 run_data.allLocJson → 就能画线。
+    if (pts.length <= 1) {
+      $('detail').innerHTML = '<span class="spin"></span> 从 OBS 拉轨迹…';
+      const obs = await obsTrack(rrid);
+      if (obs && obs.length > 1) pts = obs;
+    }
     if (pts.length > 1) {
       const line = L.polyline(pts, { color: '#4493f8', weight: 4, opacity: .9 }).addTo(layer);
       L.circleMarker(pts[0], { radius: 6, color: '#3fb950', fillOpacity: 1 }).addTo(layer);
@@ -1016,9 +1055,9 @@ async function selectRec(r, el) {
     } else {
       map.setView([30.5, 104.0], 15);
       $('detail').innerHTML = detailHtml(d, 0) +
-        '<div style="margin-top:8px;color:var(--dim)">服务端不返回轨迹点：' +
-        'App 画线读的是手机本地 RunData 库（jsonFromObs=1 时查本地，无网络回落），' +
-        '所以这里和 App 里都看不到线，属正常，不是上传失败。</div>';
+        '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
+        '要么当时上传失败，要么 objectKey 对不上。App 里看不到线是另一回事——' +
+        '它只读手机本地 RunData 库，不读服务端。</div>';
     }
   } catch (e) {
     $('detail').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';

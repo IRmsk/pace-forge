@@ -748,7 +748,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         total_ascent: 0,
     };
     let probe_sub = super::submit::build(&probe, &track_points, &[], &sim)?;
-    let view = super::submit::verify_view(&probe_sub.save_record)?;
+    let view = super::submit::verify_view(&probe_sub.save_record, &probe_sub.points)?;
     log(&format!(
         "√ [verify] 从报文反解：{} 点 / {:.0}m / {}s / {} 步 / {} 个步数桶",
         view.point_count,
@@ -1042,7 +1042,7 @@ pub fn run_full(
     // 派生字段互校：爬升 / 卡路里 / 功率 / 配速 / 圈数据必须与点位列自洽。
     // 这些都是「填错了也能提交成功」的字段，回退成常量只会让服务端把整条
     // 记录判成来源可疑，所以宁可在这里拦下。
-    let derived_problems = super::submit::audit_derived(&body);
+    let derived_problems = super::submit::audit_derived(&body, &submission.points);
     if !derived_problems.is_empty() {
         return Err(format!(
             "报文派生字段自检失败（未提交）：{}",
@@ -1069,13 +1069,15 @@ pub fn run_full(
     log(&format!("[obs] 用 rrid={rrid} 上传明细…"));
     // OBS 的 fixed_point_json 要的是裸点位数组，不是主报文那层 envelope。
     // 之前把 envelope 整个塞进来，服务端解不出点位列表。
+    // OBS 的 fixed_point_json 要的是**完整 envelope**（含 fivePointJson 内层串、
+    // useZip、runAreaId、geoFencesJson、freedomShowFence），不是裸点位数组。
+    // 参照实现 Neko 的 build_obs_object 就是这么发的；传裸数组时服务端解析
+    // 不出点位，于是「按顺序通过所有点位」永远 false。
     let five_pt = body
         .get("fivePointJson")
         .and_then(|v| v.as_str())
-        .and_then(|t| serde_json::from_str::<Value>(t).ok())
-        .and_then(|v| v.get("fivePointJson").cloned())
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid, &five_pt);
     // 本地时区和 UTC 各传一份：服务端拼 key 用哪个时区没有确定证据，
     // 猜错就等于轨迹对象不存在，记录点开只有标量数据。
@@ -1205,6 +1207,13 @@ pub fn detail_payload_rrid(
         // 对「哪个点是打卡点」的判断一致
         let cp_idxs: Vec<usize> = serde_json::from_str::<Value>(five_point_json)
             .ok()
+            // 传进来的是 envelope 时取内层 fivePointJson，是裸数组时直接用
+            .and_then(|v| {
+                v.get("fivePointJson")
+                    .and_then(|x| x.as_str())
+                    .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                    .or(Some(v))
+            })
             .and_then(|v| v.as_array().cloned())
             .map(|arr| {
                 arr.iter()
