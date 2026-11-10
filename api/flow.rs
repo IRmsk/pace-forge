@@ -559,6 +559,36 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         // 优先走真实道路。OSM 在部分校区完全没有数据（实测某校整个 bbox
         // 只有 1 个 landuse 标签），所以这是「能走就走」，失败静默降级到
         // 几何规划——不能因为查不到路网就不跑了。
+        // 障碍轮廓：建筑 + 水体。路线生成完后再避让，不能让轨迹从楼里穿过。
+        // 数据源是 Overpass（30 天缓存），拉不到就跳过，不阻断跑单。
+        let blockers: Vec<Vec<(f64, f64)>> = {
+            let bbox = crate::track::roadnet::bbox_of(&fence_ring, 60.0);
+            let mut v: Vec<Vec<(f64, f64)>> = Vec::new();
+            match crate::track::roadnet::fetch_buildings(bbox) {
+                Ok(b) if !b.is_empty() => {
+                    log(&format!("[block] 建筑轮廓 {} 栋", b.len()));
+                    v.extend(b);
+                }
+                Ok(_) => log("[block] 这一带没有建筑数据"),
+                Err(e) => log(&format!("[block] 建筑轮廓没拿到（{e}），本次不避让")),
+            }
+            if let Ok(w) = crate::track::roadnet::fetch_water(bbox) {
+                if !w.is_empty() {
+                    log(&format!("[block] 水域 {} 片", w.len()));
+                    v.extend(w);
+                }
+            }
+            // 本地手绘禁区。OSM 在国内校园基本是空白（实测某校区整个 bbox
+            // 只有 15 个 way、76 个 node，一栋楼都没有），Overpass 拿不到轮廓
+            // 时只能靠人自己在地图上圈。这份标注全账号共享，长期有效。
+            let local = crate::track::roadnet::load_local_blockers();
+            if !local.is_empty() {
+                log(&format!("[block] 本地标注禁区 {} 块", local.len()));
+                v.extend(local);
+            }
+            v
+        };
+
         let on_roads = if p.prefer_roads {
             try_route_on_roads(&fence_ring, &must, p.distance_m, seed, &mut *log)
         } else {
@@ -602,6 +632,19 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             120.0,
             if p.seed != 0 { p.seed } else { start_ms as u64 },
         );
+        // 建筑避让放在摆动之后：add_wander 会把点横推 ±6m，先避让再摆动
+        // 等于白做。这里逐点推出楼体 + 逐段插贴边绕行，外扩 3m 当作墙根。
+        let wandered = if blockers.is_empty() {
+            wandered
+        } else {
+            let before = wandered.len();
+            let avoided = crate::track::fence_route::avoid_blockers(&wandered, &blockers, 3.0);
+            let pushed = avoided.len().saturating_sub(before);
+            if pushed > 0 {
+                log(&format!("[block] 绕开建筑/水面，多插 {pushed} 个点"));
+            }
+            avoided
+        };
         let sampled = crate::track::fence_route::resample_with_checkpoints(
             &wandered,
             p.sample_step_m,
