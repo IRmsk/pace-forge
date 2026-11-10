@@ -1563,8 +1563,9 @@ fn handle_run(
 
 /// 按 rrid 从 OBS 拉历史记录的原始轨迹。
 ///
-/// 轨迹不在 `get_one_record` 里返回（那个接口的 allLocJson 永远是 null），
+/// 轨迹不在 `get_one_record` 里返回（实测 50 条记录该字段全为 null），
 /// 但记录列表带了 uuid 和 startTime，拼出 objectKey 就能直接从 OBS 取。
+/// App 自己走不走这条路还没定论，见 TRAJECTORY-DISPLAY.md。
 /// 读本地手绘禁区。
 fn handle_blockers_get(request: tiny_http::Request) -> Result<(), String> {
     let polys = crate::track::roadnet::load_local_blockers();

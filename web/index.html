@@ -1229,8 +1229,8 @@ async function selectRec(r, el) {
       map.setView([30.5, 104.0], 15);
       $('detail').innerHTML = detailHtml(d, 0) +
         '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
-        '要么当时上传失败，要么 objectKey 对不上。App 里看不到线是另一回事——' +
-        '它只读手机本地 RunData 库，不读服务端。</div>';
+        '要么当时上传失败，要么 objectKey 对不上（旧版时区不稳，实测 11-07 那批 ' +
+        'UTC+8 的 key 全是 404）。这条记录在哪儿都画不出线。</div>';
     }
   } catch (e) {
     $('detail').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';

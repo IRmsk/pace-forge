@@ -826,9 +826,12 @@ pub fn build(
     let save_record = json!({
         "address": "",
         // 轨迹不进 body：真机与 Neko 都发空串，点集只走 OBS 的 run_data。
-        // 原来把 420 个点塞在这里，服务端把它当「客户端自带轨迹」，
-        // 详情里 allLocJson 回 null、jsonFromObs 置 1，App 转去查手机本地库，
-        // 结果地图上一条线都没有。
+        //
+        // 详情接口对这类提交一律回 allLocJson=null、jsonFromObs=1（实测 50/50），
+        // 所以塞不塞点都不会让详情带回坐标。发空串是为了跟真机报文一致，
+        // 少一个可能被判「非真机」的差异字段。
+        // App 拿 jsonFromObs=1 之后到底会不会去 OBS 拉，见 TRAJECTORY-DISPLAY.md
+        // 的「未定项」——那里有两个互斥候选，尚未做对照实验。
         "allLocJson": String::new(),
         "avgPower": avg_power,
         "avgStepFreq": avg_step_freq,
@@ -993,9 +996,9 @@ mod tests {
         let sim = test_sim(&params(), &points());
         let sub = build(&params(), &points(), &[], &sim).unwrap();
         let v = &sub.save_record;
-        // allLocJson 必须是**空串**：真机与 Neko 都这样发，点集只走 OBS 的
-        // run_data。塞进 body 会让服务端把轨迹当成「客户端自带」，详情里
-        // allLocJson 回 null、jsonFromObs 置 1，App 转去查本地库 → 地图无线。
+        // allLocJson 必须是**空串**，与真机/Neko 一致，点集只走 OBS 的 run_data。
+        // 注意：这不是「画不出线」的原因——详情接口对这类提交固定回
+        // allLocJson=null、jsonFromObs=1，塞点也一样（实测 50/50）。
         assert_eq!(v["allLocJson"], json!(""), "allLocJson 应发空串");
         assert!(!sub.points.is_empty(), "点集要在 Submission.points 里备着给 OBS/自检用");
 
