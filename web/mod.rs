@@ -399,8 +399,11 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
                 let mut it = rest.splitn(2, '/');
                 let id = it.next().unwrap_or("").to_string();
                 let action = it.next().unwrap_or("");
+                let force = query_param(&query, "force")
+                    .map(|v| v == "1" || v == "true")
+                    .unwrap_or(false);
                 return match (method, action) {
-                    (Method::Delete, "") => handle_del_account(request, state, &id),
+                    (Method::Delete, "") => handle_del_account(request, state, &id, force),
                     (Method::Post, "switch") => handle_switch(request, state, &id),
                     (Method::Post, "logout") => handle_logout_one(request, state, &id),
                     (Method::Post, "login") => handle_login_one(request, state, &id),
@@ -913,16 +916,37 @@ fn handle_del_account(
     request: tiny_http::Request,
     state: Shared,
     id: &str,
+    force: bool,
 ) -> Result<(), String> {
-    // 先退出登录，再从本地删掉。
+    // 先退出登录，再从本地删掉。顺序不能反：直接删只是丢掉本地凭据，服务端
+    // 会话还活着，账号仍被标记「已登录」——下次登录触发 10121 并锁一小时，
+    // 用户看到的就是「删完就锁我」。
     //
-    // 顺序不能反。直接删只是丢掉本地凭据，服务端会话还活着，账号在服务
-    // 端仍是「已登录」状态——下次登录触发 10121（已在其他设备登录），
-    // 而且锁一小时。用户看到的现象就是「删完再登登不上，等一小时」。
-    //
-    // 通知失败也继续删：服务端可能已经把会话判过期（返回 false），
-    // 那样本来就没有活的会话要清，不该因此卡住用户。
+    // 关键改动：以前不管退出成功与否都照删。但「服务端没确认退出」和「服务端
+    // 本来就没有活会话」在返回码上分不开，一律照删的结果是把「确保不会锁」
+    // 这件事交给了运气。现在有存盘 token 且退出没成功时**先不删**，把后果
+    // 交给用户确认（`?force=1` 才跳过），这样「删完锁一小时」不会再意外发生。
+    let had_token = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        st.book
+            .get(id)
+            .map(|a| !a.token.is_empty())
+            .unwrap_or(false)
+    };
+
     let remote = remote_logout(&state, id);
+
+    if had_token && !remote && !force {
+        return json_ok(
+            request,
+            json!({
+                "removed": false,
+                "remoteLogout": false,
+                "needConfirm": true,
+                "warning": "服务端没有确认退出登录（可能是网络或接口失败），现在删掉的话服务端会话可能还在，重新登录会锁一小时。建议先点「退出」，成功了再删。",
+            }),
+        );
+    }
 
     let mut st = state.lock().map_err(|e| e.to_string())?;
     let ok = st.book.remove(id);
@@ -931,7 +955,7 @@ fn handle_del_account(
         st.current = None;
     }
     st.persist();
-    json_ok(request, json!({"removed": ok, "remoteLogout": remote}))
+    json_ok(request, json!({"removed": ok, "remoteLogout": remote, "needConfirm": false}))
 }
 
 /// 按账号退出登录：只清登录态，保留手机号和存盘密码。

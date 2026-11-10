@@ -153,7 +153,7 @@ button.danger:disabled{opacity:.5}
     </div>
     <button class="ghost" id="semBtn">查学期</button>
     <button class="ghost" id="reload">刷新记录</button>
-    <button class="ghost" id="logout">退出</button>
+    <button class="ghost" id="logout" title="让服务端 token 失效；账号和密码都保留，下次点「重登」即可">退出登录</button>
   </div>
 
   <div class="panel" id="accPanel">
@@ -279,6 +279,8 @@ function enter(me) {
   loadRecords();
 }
 $('logout').onclick = async () => {
+  // 退出登录 = 让服务端 token 失效 + 清本地登录态。
+  // 账号和存盘密码都留着，下次打开页面点「重登」即可，不用重新输密码。
   const btn = $('logout');
   btn.disabled = true;
   btn.textContent = '退出中…';
@@ -575,9 +577,21 @@ async function accountAction(act, id) {
   try {
     if (act === 'del') {
       if (!confirm('删除这个账号？\n\n会先退出登录再删（不然服务端会话留活，下次登要锁一小时），存盘的密码也会一起删掉。\n\n只是想换账号的话，用旁边的「退出」——密码留着，随时重登。')) return;
-      m.textContent = '退出中…';
-      const r = await api('/api/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
-      m.textContent = r.remoteLogout ? '已退出登录并删除' : '已删除';
+      m.textContent = '退出登录中…';
+      const url = '/api/accounts/' + encodeURIComponent(id);
+      let r = await api(url, { method: 'DELETE' });
+      // 服务端没确认退出时后端不会真删，先让用户知道后果再决定
+      if (r.needConfirm) {
+        if (!confirm((r.warning || '服务端未确认退出登录。') + '\n\n仍要删除这个账号？')) {
+          m.textContent = '已取消删除，账号还在';
+          m.className = 'msg';
+          return;
+        }
+        r = await api(url + '?force=1', { method: 'DELETE' });
+      }
+      m.textContent = r.remoteLogout
+        ? '已退出登录并删除'
+        : (r.removed ? '已删除（服务端未确认退出，建议半小时内别重登）' : '已取消删除');
     } else if (act === 'switch') {
       await api('/api/accounts/' + encodeURIComponent(id) + '/switch', { method: 'POST' });
       m.textContent = '已切换';
@@ -935,6 +949,19 @@ async function loadRecords() {
   }
 }
 
+/* 里程读数：统一成公里。
+ * 服务端给米（totalDis=2000），个别接口给公里（2.5），单看数字分不清，
+ * 用 200 做阈值：跑步记录不可能小于 0.2 km，小于它的一定是公里口径。
+ * 后端已经补了 distanceKm，这里是第二道保险（后端没更新时前端也能显示对）。 */
+function km(obj, ...keys) {
+  if (obj && obj.distanceKm != null && keys[0] === 'totalDistance') return num(obj.distanceKm);
+  for (const k of keys) {
+    const v = num(obj?.[k]);
+    if (v > 0) return v < 200 ? v : v / 1000;
+  }
+  return 0;
+}
+
 /* 列表响应结构在不同版本里可能是 {records:[...]} / {list:[...]} / 直接数组 */
 function pickRows(d) {
   if (Array.isArray(d)) return d;
@@ -945,9 +972,14 @@ function pickRows(d) {
 }
 
 function recHtml(r, i) {
-  const dist = num(r.totalDistance ?? r.total_distance ?? r.distance) / 1000;
+  // 服务端字段是 totalDis（米），后端已归一化出 totalDistance/distanceKm；
+  // 这里再兜一层并做量级判断，免得哪天出口改名又变回 0.00 km。
+  const dist = km(r, 'totalDistance', 'totalDis', 'total_distance', 'distance');
   const secs = int(r.totalTime ?? r.total_time ?? r.runTime);
-  const valid = r.isValid ?? r.is_valid ?? (r.status === 1);
+  // 服务端判定字段是 complete（bool）。以前读 isValid / status===1，
+  // 而服务端根本不给这两个 —— undefined 恒为假，于是每条都显示「未达标」，
+  // 哪怕 complete=true、statusInfo 写着「太棒了，恭喜您完成了跑步」。
+  const valid = r.complete ?? r.completed ?? r.isValid ?? r.is_valid ?? false;
   const start = r.startTime ?? r.start_time;
   return `<div class="rec" data-i="${i}">
     <div class="r1">
@@ -984,7 +1016,9 @@ async function selectRec(r, el) {
     } else {
       map.setView([30.5, 104.0], 15);
       $('detail').innerHTML = detailHtml(d, 0) +
-        '<div style="margin-top:8px;color:var(--dim)">这条记录没有轨迹坐标（服务端未返回）</div>';
+        '<div style="margin-top:8px;color:var(--dim)">服务端不返回轨迹点：' +
+        'App 画线读的是手机本地 RunData 库（jsonFromObs=1 时查本地，无网络回落），' +
+        '所以这里和 App 里都看不到线，属正常，不是上传失败。</div>';
     }
   } catch (e) {
     $('detail').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
@@ -993,13 +1027,17 @@ async function selectRec(r, el) {
 
 function detailHtml(d, n) {
   const g = (k, alt) => d[k] ?? alt;
-  const dist = num(g('totalDistance', g('total_distance'))) / 1000;
-  const vdist = num(g('validDistance', g('valid_distance'))) / 1000;
+  const dist = km(d, 'totalDistance', 'totalDis', 'total_distance');
+  const vdist = km(d, 'validDistance', 'validDis', 'valid_distance');
   const secs = int(g('totalTime', g('total_time')));
   const vsecs = int(g('validTime', g('valid_time')));
   const cal = int(g('calorie'));
-  const freq = int(g('avgStepFreq', g('avg_step_freq')));
+  const freq = int(g('avgStepFreq', g('avg_step_freq', g('stepFreq'))));
   const reason = g('unCompleteReason', g('uncomplete_reason'));
+  // reasonList 是逐条规则的判定：complete=false 的那几条就是没达标的原因
+  const reasons = Array.isArray(d.reasonList)
+    ? d.reasonList.filter(x => x && x.complete === false && x.reason).map(x => x.reason)
+    : [];
   const rows = [
     ['总距离', dist.toFixed(2) + ' km'],
     ['有效距离', vdist.toFixed(2) + ' km'],
@@ -1010,7 +1048,13 @@ function detailHtml(d, n) {
     ['消耗', cal ? cal + ' 千卡' : '—'],
     ['轨迹点', n ? n + ' 个' : '无'],
   ];
-  if (reason) rows.push(['未达标原因', String(reason)]);
+  if (reasons.length) rows.push(['未通过规则', reasons.join('、')]);
+  else if (reason) rows.push(['未达标原因', String(reason)]);
+  // jsonFromObs=1 表示这条记录的轨迹在 App 本地库里，服务端不存点——详情页
+  // 拉不到坐标是正常的，不是上传失败（见 TRAJECTORY-DISPLAY.md）。
+  if (d.jsonFromObs === 1 && n === 0) {
+    rows.push(['轨迹来源', 'App 本地库（服务端不存轨迹点）']);
+  }
   return '<div class="kv">' + rows.map(([k, v]) => `<span>${k}</span><span>${esc(String(v))}</span>`).join('') + '</div>';
 }
 

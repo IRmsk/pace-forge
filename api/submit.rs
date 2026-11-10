@@ -453,12 +453,16 @@ pub fn calorie_for(distance_m: f64, time_sec: i64, weight_kg: f64) -> i64 {
 ///
 /// 真机有这个字段且非零；发 `0` 等于自称「全程不做功」，与 pace、步频、
 /// 卡路里三项都对不上。乘 1.1 是官方的体重→功率经验系数。
-pub fn avg_power_for(distance_m: f64, time_sec: i64, weight_kg: f64) -> f64 {
+pub fn avg_power_for(distance_m: f64, time_sec: i64, weight_kg: f64) -> i64 {
     if distance_m <= 0.0 || time_sec <= 0 || weight_kg <= 0.0 {
-        return 0.0;
+        return 0;
     }
     let v = distance_m / time_sec as f64;
-    ((1.1 * weight_kg * v) * 10.0).round() / 10.0
+    // **必须取整**。服务端 avgPower 是整型（参考实现 `RunDetail.avg_power: i64`），
+    // 发 187.5 时它反序列化截断成 187，再拿 187 重算签名，而我们的签名串里
+    // 是 "187.5" —— 两边拼出来的串不同，直接 10501「验证签名失败」。
+    // 这种错 body 内部完全自洽、本地 audit 也查不出来，只有真发一次才暴露。
+    (1.1 * weight_kg * v).round() as i64
 }
 
 /// 从**已组装好的点位数组**算累计爬升（米）。
@@ -608,12 +612,12 @@ pub fn audit_derived(body: &Value) -> Vec<String> {
         ));
     }
 
-    // 3) 平均功率非零且与速度成比例
+    // 3) 平均功率非零且与速度成比例（整数瓦特，服务端 avgPower 是整型）
     let expect_pow = avg_power_for(dis as f64, time_sec, DEFAULT_WEIGHT_KG);
-    let declared_pow = body.get("avgPower").and_then(|v| v.as_f64()).unwrap_or(-1.0);
-    if (declared_pow - expect_pow).abs() > 0.15 {
+    let declared_pow = body.get("avgPower").and_then(|v| v.as_i64()).unwrap_or(i64::MIN);
+    if declared_pow != expect_pow {
         probs.push(format!(
-            "avgPower 声明 {declared_pow} 与折算 {expect_pow} 不符"
+            "avgPower 声明 {declared_pow} 与折算 {expect_pow} 不符（必须是整数）"
         ));
     }
 
@@ -675,16 +679,13 @@ pub fn build(
         params.total_time_sec,
         DEFAULT_WEIGHT_KG,
     );
-    let avg_power = avg_power_for(
+    let avg_power: i64 = avg_power_for(
         params.total_distance_m as f64,
         params.total_time_sec,
         DEFAULT_WEIGHT_KG,
     );
-    // 签名串和报文体的这个数字必须是**同一段文本**：Rust 的 f64 Display 去尾零
-    // （写 "207.8"），而 serde 的 f64 序列化在整数值时会补 ".0"（写 "0.0"），
-    // 两边一旦不同，tokenSign/signature 立刻对不上。统一以 Display 文本为准。
-    let avg_power_str = format!("{avg_power}");
-    let avg_power_val: Value = serde_json::from_str(&avg_power_str).unwrap_or(json!(0));
+    // 整数类型下 to_string 与 serde 序列化必然一致，不需要再做文本对齐。
+    let avg_power_str = avg_power.to_string();
 
     // 轨迹点带瞬时速度（中心差分），服务端画图会用到
     // 单一数据源：直接用 simulate() 产出的桶。
@@ -821,7 +822,7 @@ pub fn build(
     let save_record = json!({
         "address": "",
         "allLocJson": all_loc_json,
-        "avgPower": avg_power_val.clone(),
+        "avgPower": avg_power,
         "avgStepFreq": avg_step_freq,
         "calorie": calorie,
         "complete": complete,
@@ -1587,11 +1588,11 @@ mod step_distance_tests {
     fn avg_power_is_nonzero_and_scales_with_speed() {
         let slow = avg_power_for(3000.0, 1200, DEFAULT_WEIGHT_KG);
         let fast = avg_power_for(3000.0, 600, DEFAULT_WEIGHT_KG);
-        assert!(slow > 0.0, "慢跑功率不应为 0");
+        assert!(slow > 0, "慢跑功率不应为 0");
         assert!(fast > slow, "速度翻倍功率应更高");
         // 1.1 * 68 * 2.5 m/s = 187 W
-        let expect = (1.1 * DEFAULT_WEIGHT_KG * 2.5 * 10.0).round() / 10.0;
-        assert!((avg_power_for(2500.0, 1000, DEFAULT_WEIGHT_KG) - expect).abs() < 0.01);
+        assert_eq!(avg_power_for(2500.0, 1000, DEFAULT_WEIGHT_KG), 187,
+            "1.1*68*2.5=187W，且必须整数：服务端整型会截断，发小数就是 10501");
     }
 
     // ---- 圈与爬升 ----
@@ -1764,5 +1765,46 @@ mod audit_tests {
         body["speed"] = json!((2000.0 / 720.0 * 1000.0) as i64);
         let probs = audit_derived(&body);
         assert!(probs.iter().any(|s| s.contains("speed")), "{probs:?}");
+    }
+
+    /// 签名串里的数值必须是**整数文本**。
+    ///
+    /// 10501「验证签名失败」踩过一次：avgPower 按 f64 发 187.5，服务端
+    /// avgPower 是整型（参考实现 RunDetail.avg_power: i64），反序列化截断成
+    /// 187 后拿它重算签名，而我们拼的串里是 "187.5" —— 两边不同，直接驳回。
+    /// body 内部完全自洽，本地 audit 也查不出来，只有真发一次才暴露。
+    #[test]
+    fn signature_numeric_fields_are_integers() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+
+        // 这些是字符串/标识字段，允许非数字
+        let text_keys = [
+            "address", "geeToken", "goalId", "policy", "uuid",
+            "selectedUnid", "uid",
+        ];
+        for kv in sub.canonical.split('&') {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            if text_keys.contains(&k) {
+                continue;
+            }
+            assert!(
+                !v.contains('.'),
+                "签名串字段 {k}={v} 带小数点：服务端整型会截断，重算签名与这里不一致（10501）"
+            );
+        }
+    }
+
+    #[test]
+    fn avg_power_is_integer_watt() {
+        let p = params();
+        let t = track();
+        let sim = sim(&p, &t);
+        let sub = build(&p, &t, &[], &sim).unwrap();
+        let v = &sub.save_record["avgPower"];
+        assert!(v.is_i64() || v.is_u64(), "avgPower 必须是 JSON 整数，实际 {v}");
+        assert!(v.as_i64().unwrap() > 0, "avgPower 不应为 0");
     }
 }
