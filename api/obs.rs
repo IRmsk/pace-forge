@@ -113,7 +113,7 @@ pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
 /// 配速四项全过，很容易把排查带到别处。
 ///
 /// 跨时区部署时用 `PACE_TZ_OFFSET_SEC` 覆盖，别硬编码。
-fn tz_offset_sec() -> i64 {
+pub(crate) fn tz_offset_sec() -> i64 {
     std::env::var("PACE_TZ_OFFSET_SEC")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
@@ -152,7 +152,7 @@ pub fn fallback_key(uid: &str, sport_type: i32, start_sec: i64, uuid: &str) -> S
 }
 
 /// 由 Unix 天数换算年月日时（Howard Hinnant 算法）。
-fn civil_from_days(days: i64, hour: i64) -> (i64, u32, u32, i64) {
+pub(crate) fn civil_from_days(days: i64, hour: i64) -> (i64, u32, u32, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;

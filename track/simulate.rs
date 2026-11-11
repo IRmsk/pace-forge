@@ -271,25 +271,17 @@ fn distribute_steps(
         .enumerate()
         .map(|(i, b)| {
             let steps = counts[i].max(0);
-            let per3 = (steps as f64 / 3.0).round() as i32;
-            let thirds = [per3, per3, steps - 2 * per3];
-            let diffs: Vec<i32> = thirds.windows(2).map(|w| (w[1] - w[0]).abs()).collect();
-            let max_diff = *diffs.iter().max().unwrap_or(&0);
-            let min_diff = *diffs.iter().min().unwrap_or(&0);
-            let avg_diff = if diffs.is_empty() {
-                0
-            } else {
-                diffs.iter().sum::<i32>() / diffs.len() as i32
-            };
             StepBucket {
                 steps_num: steps,
                 begin_time: b.begin_time,
                 end_time: b.end_time,
                 flag: b.flag,
                 id: 0,
-                max_diff,
-                min_diff,
-                avg_diff,
+                // diff 三件套：真机每桶恒为这三个常量（581 个桶实测无一例外）。
+                // 早先算桶内三段差值想造「波动」，方向和真机相反。
+                max_diff: 0,
+                min_diff: 1000,
+                avg_diff: 0,
                 state: 0,
                 queue_num: 0,
             }

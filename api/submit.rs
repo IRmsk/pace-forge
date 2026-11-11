@@ -13,6 +13,32 @@
 use serde_json::{json, Value};
 
 use super::client::Client;
+use crate::api::obs::{civil_from_days, tz_offset_sec};
+
+/// 两点间方位角（度，0=正北，顺时针）。
+///
+/// `bdD` 恒为 0 等于「这个点一直朝正北移动」，一条折线轨迹全程朝北是没法
+/// 解释的。真机的 `bdD` 在整条轨迹里连续变化 0~360，跟着路径拐。
+fn bearing_deg(from: (f64, f64), to: (f64, f64)) -> f64 {
+    let (lat1, lat2) = (from.0.to_radians(), to.0.to_radians());
+    let dlon = (to.1 - from.1).to_radians();
+    let y = dlon.sin() * lat2.cos();
+    let x = lat1.cos() * lat2.sin() - lat1.sin() * lat2.cos() * dlon.cos();
+    ((y.atan2(x).to_degrees()) + 360.0) % 360.0
+}
+
+/// 定位时刻格式化成真机 `gainTime` 的 `YYYY-MM-DD HH:MM:SS`（本地时区）。
+///
+/// 日历换算复用 [`civil_from_days`]，时区复用 [`tz_offset_sec`]，两处都不再
+/// 各自实现一份——时区规则要改的时候只改一个地方。
+fn fmt_run_time(ms: i64) -> String {
+    let secs = ms / 1000 + tz_offset_sec();
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let (y, m, d, _) = civil_from_days(days, h);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
 
 use crate::crypto::sign::{sport_signature, SignFields};
 use crate::track::TrackPoint;
@@ -107,6 +133,7 @@ pub fn point_json_full(
     let (glat, glng) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
 
     // 累计量
+    let prev_pt = *prev; // 上一点坐标，算航向用（下面 *prev 会被覆盖）
     let step_m = if idx == 0 {
         0.0
     } else {
@@ -132,13 +159,21 @@ pub fn point_json_full(
 
     let dt = if idx == 0 { 0.0 } else { (p.time_ms - start_ms) as f64 / 1000.0 };
     let avg_speed = if dt > 0.5 { (cum.0 / dt).clamp(0.0, 6.3) } else { 0.0 };
-    // 夹到跑步的物理区间（1.9~6.3 m/s），和规则里的 SPEED_FLOOR/CEIL 一致
-    let inst = if idx == 0 {
-        // 起点给个常见起步速度，不能是 0
+    // 点间速度只算一次，`speed`（km/h）和 `bdS`（m/s）都从它派生。
+    //
+    // 早先这两个字段各夹各的区间：`speed` 先夹 1.9~6.3 m/s 再 ×3.6，`bdS`
+    // 单独夹 0~5 m/s。速度落在两端时两者互相矛盾——v=0.8 时 speed 被抬到
+    // 6.84km/h 而 bdS 仍是 0.8，服务端拿 speed/3.6 和 bdS 一对是 1.9 ≠ 0.8。
+    // 首点更离谱：2.6 是当 m/s 写的，却直接当 km/h 发出去，等于每秒 0.72m。
+    //
+    // 现在只有一份来源，两个字段天然满足 bdS == speed/3.6。
+    let v_mps = if idx == 0 {
+        // 起步速度 m/s（约 9.4km/h）。不能是 0，首点速度为 0 等于「原地不动」
         2.6
     } else {
-        (step_m / gap_sec).clamp(1.9, 6.3) * 3.6
+        (step_m / gap_sec).clamp(1.9, 5.0)
     };
+    let inst = v_mps * 3.6;
 
     // 点位类型是有语义的，不是装饰。
     //
@@ -172,25 +207,49 @@ pub fn point_json_full(
         }
     };
 
-    // GPS 精度半径
+    // GPS 精度半径：真机聚在 ~3.8m。早先 1.5~3.0 整体偏小，等于「每一次
+    // 定位都精确到 1.5m」，比手持机实际水平还准。
     let h2 = (p.lon.to_bits() ^ seed).wrapping_mul(6364136223846793005);
-    let radius = 1.5 + ((h2 >> 40) % 150) as f64 / 100.0;
+    let radius = ((3.6 + ((h2 >> 40) % 70) as f64 / 100.0) * 100.0).round() / 100.0;
+
+    // 卫星数：真机 10~34、均值≈28，恒 1 是「只锁定一颗卫星」的机器指纹。
+    // 逐点按序号伪随机游走，同 seed 可复现。
+    let h3 = (idx as u64).wrapping_mul(0x2545F4914F6CDD1D) ^ seed;
+    let count = 10 + ((h3 >> 32) % 25) as i64;
+
+    // 航向角：首点没有上一点，记 0；其余按大圆方位角算真实朝向。
+    let bearing = if idx == 0 {
+        0.0
+    } else {
+        bearing_deg(prev_pt, (p.lat, p.lon))
+    };
+
+    // 定位时刻（可读串）。恒空串等于「这些点没有定位时间」。
+    let gain_time = fmt_run_time(p.time_ms);
 
     // 海拔。
     //
-    // 原来写死 1.0，注释理由是「不能是 0，否则等于在海底跑」。但恒 1.0
-    // 同样不真实——服务端按相邻两点海拔差累计爬升，全程零爬升、且亮度
-    // 停在 1 米，是「这个点没有海拔数据」的典型特征。
+    // 真机单条 2km 记录里海拔在 20~64m 之间起伏，每公里累计爬升 50m+——
+    // 那是气压计/GPS 高程的传感器噪声，不是地形（平地校园）。
     //
-    // 用围栏中心纬经度派生一个基础海拔（同一校区稳定），再叠一层缓慢
-    // 漂移：相邻点之间变化很小（真实 GPS 高程是连续量），整条轨迹有
-    // 几十厘米的起伏，累计爬升落在个位数到十几米，与平地校园一致。
-    // 自变量必须是**平滑量**（累计里程），不能用坐标的小数位——
-    // 纬度的 fract 是高频噪声，跑一步就跳十几米，比自己写的假数据还假。
-    // 两个正弦的周期分别是约 2.1km 和 5.7km，整条轨迹就是一段缓坡。
-    let base_alt = 130.0 + (cum.0 * 0.003).sin() * 3.0 + (cum.0 * 0.0011).cos() * 2.0;
-    let drift = (idx as f64 * 0.037).cos() * 0.4;
-    let altitude = (base_alt + drift).max(0.0);
+    // 早先用 130m 基准 + 亚米级漂移，全程累计爬升近乎 0，和真机差一个
+    // 数量级；服务端按相邻点差值累加就知道这条「没有海拔数据」。
+    //
+    // 现在用三条不同周期的正弦叠在 ~42m 基准上。关键约束是**相邻点只能动
+    // 几十厘米**——真机 2km / 424 点、每公里累计爬升 50m+，反推相邻点平均
+    // 变化只有 0.2~0.4m。所以慢项负责整条几十米的漂移，快项只做亚米抖动，
+    // 不能拿大幅值高频正弦去凑范围（那会让相邻点跳三四米，比真机假得多）。
+    // 相位由 seed 定，同 seed 可复现。
+    let ph = |k: u64| {
+        ((seed ^ k).wrapping_mul(0x9E3779B97F4A7C15) >> 40) as f64 / 16_777_216.0
+            * std::f64::consts::TAU
+    };
+    let fi = idx as f64;
+    let altitude = (42.0
+        + 21.0 * (fi * 0.02 + ph(1)).sin()
+        + 3.0 * (fi * 0.15 + ph(2)).sin()
+        + 0.8 * (fi * 0.5 + ph(3)).sin())
+    .clamp(20.0, 64.0);
 
     // 局部步幅：本段位移 / 本段步数。原来那个表达式化简后是
     // 「累计里程 / 全程步数」，单调递增的累积平均值，不是即时步幅。
@@ -206,11 +265,11 @@ pub fn point_json_full(
         "avgSpeed": (avg_speed * 10000.0).round() / 10000.0,
         // 海拔三兄弟不能是 0：服务端按它们算累计爬升，全 0 等于「在海底跑」
         "bdA": (altitude * 10.0).round() / 10.0,
-        "bdD": 0.0,
+        "bdD": (bearing * 10.0).round() / 10.0,
         "bdG": 1,
-        "bdS": 1.0,
+        "bdS": (v_mps * 100.0).round() / 100.0,
         "coorType": "gcj02",
-        "count": 1,
+        "count": count,
         "dtr": 0.0,
         // flag 是**这个采样点的定位时刻**，不是整条轨迹的开始时刻。
         //
@@ -225,7 +284,7 @@ pub fn point_json_full(
         "flag": p.time_ms,
         "gLat": (glat * 1e7).round() / 1e7,
         "gLng": (glng * 1e7).round() / 1e7,
-        "gainTime": "",
+        "gainTime": gain_time,
         "id": idx as i64 + 1,
         // lat/lng 必须是真的 BD-09 坐标。
         //
@@ -1214,6 +1273,84 @@ mod point_shape_tests {
             last_total_time * 1000,
             "flag 跨度应与 totalTime 一致"
         );
+    }
+
+    /// 采样点字段值域必须落在真机观测范围内，且相互自洽。
+    ///
+    /// 这条测试锁的是「注释声称 vs 代码实际」——早先 `count` 注释写
+    /// 10~34，代码 `24 + %11` 只产 24~34，下界永远给不到；`altitude`
+    /// 注释写 20~64，实际只到 52。两者都是注释比代码宽，靠肉眼看不出来。
+    ///
+    /// 同时锁 `speed`(km/h) 与 `bdS`(m/s) 的单位关系：这两个字段早先各夹
+    /// 各的区间，速度落在两端时 `speed/3.6` 和 `bdS` 对不上。
+    #[test]
+    fn point_field_ranges_match_real_device() {
+        // 走一段圆弧：直线轨迹的方位角必然恒定，测不出 bdD 是否真的在算
+        let pts: Vec<TrackPoint> = (0..200)
+            .map(|i| {
+                let a = i as f64 * 0.03;
+                tp(
+                    31.2304 + (a.cos() - 1.0) * 0.008,
+                    121.4737 + a.sin() * 0.008,
+                    1_790_000_000_000 + i * 1700,
+                )
+            })
+            .collect();
+        let params = params();
+        let sim = test_sim(&params, &pts);
+        let sub = build(&params, &pts, &[], &sim).unwrap();
+        let arr: Vec<serde_json::Value> = sub.points.clone();
+
+        // ① 卫星数：真机 10~34，且不是常量
+        let counts: Vec<i64> = arr.iter().map(|p| p["count"].as_i64().unwrap()).collect();
+        for &c in &counts {
+            assert!((10..=34).contains(&c), "count={c} 超出真机 10~34");
+        }
+        let uniq: std::collections::HashSet<i64> = counts.iter().copied().collect();
+        assert!(uniq.len() >= 8, "count 只有 {} 种取值，等于常量", uniq.len());
+
+        // ② 海拔：真机 20~64，相邻点不许跳变过大（真实 GPS 高程是连续量）
+        let alts: Vec<f64> = arr.iter().map(|p| p["bdA"].as_f64().unwrap()).collect();
+        for &a in &alts {
+            assert!((20.0..=64.0).contains(&a), "bdA={a} 超出真机 20~64");
+        }
+        let spread = alts.iter().cloned().fold(f64::MIN, f64::max)
+            - alts.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread > 5.0, "海拔跨度只有 {spread:.1}m，太像常量");
+        let max_step = alts
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+        assert!(max_step < 3.0, "相邻点海拔跳变 {max_step:.2}m，比真机噪声大");
+
+        // ③ 航向角：首点 0，其余在 [0,360) 且有变化
+        let bearings: Vec<f64> = arr.iter().map(|p| p["bdD"].as_f64().unwrap()).collect();
+        assert_eq!(bearings[0], 0.0, "首点没有上一点，航向记 0");
+        for &b in &bearings {
+            assert!((0.0..360.0).contains(&b), "bdD={b} 超出 [0,360)");
+        }
+        let buniq: std::collections::HashSet<String> =
+            bearings.iter().map(|b| format!("{b:.1}")).collect();
+        assert!(buniq.len() > 5, "bdD 只有 {} 种取值，恒 0 是老问题", buniq.len());
+
+        // ④ gainTime：非空且是可读时间串
+        for p in &arr {
+            let g = p["gainTime"].as_str().unwrap();
+            assert_eq!(g.len(), 19, "gainTime 应为 19 位时间串，实际 {g:?}");
+            assert_eq!(&g[4..5], "-", "gainTime 格式不对: {g}");
+            assert_eq!(&g[10..11], " ", "gainTime 格式不对: {g}");
+        }
+
+        // ⑤ speed(km/h) 与 bdS(m/s) 必须满足 bdS == speed/3.6
+        for p in &arr {
+            let speed = p["speed"].as_f64().unwrap();
+            let bds = p["bdS"].as_f64().unwrap();
+            assert!(
+                (speed / 3.6 - bds).abs() < 0.02,
+                "speed={speed}km/h 与 bdS={bds}m/s 不自洽（speed/3.6={:.2}）",
+                speed / 3.6
+            );
+        }
     }
 
     /// 海拔不能是常量。

@@ -1226,7 +1226,9 @@ async function selectRec(r, el) {
       map.invalidateSize();
       $('detail').innerHTML = detailHtml(d, pts.length);
     } else {
-      map.setView([30.5, 104.0], 15);
+      // 画不出线时**不要移动地图**。这里原来 setView 到成都 (30.5,104.0)，
+      // 一个齐齐哈尔的记录点进去，地图直接跳到四川，比不画线更迷惑。
+      // 保持当前视图即可，用户自己知道这条记录在哪跑的。
       $('detail').innerHTML = detailHtml(d, 0) +
         '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
         '要么当时上传失败，要么 objectKey 对不上（旧版时区不稳，实测 11-07 那批 ' +

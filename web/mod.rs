@@ -1487,20 +1487,49 @@ fn handle_run(
         c.clone()
     };
 
-    // 中心点：没传就用围栏中心反推
+    // 中心点：请求里没给就用围栏反推。
+    //
+    // 这里原来兜底成 `(30.5, 104.0)`（成都），而校区在齐齐哈尔。围栏拉取
+    // 一旦失败，闭环就变成「成都 → 各打卡点 → 成都」，规划器报
+    // 「最短闭环 1777736m」，用户看到一条跨越半个中国的轨迹。
+    //
+    // 兜底坐标不该出现在业务路径上：拿不到真实位置就明确报错，别静默
+    // 生成一条荒唐轨迹——错误信息比一条假轨迹有用。
     let (clat, clng) = match (lat, lng) {
         (Some(a), Some(b)) => (a, b),
-        _ => {
-            match crate::api::fence::fetch_fences(&client) {
-                Ok(fs) if !fs.is_empty() && !fs[0].ring.is_empty() => {
-                    let r = &fs[0].ring;
+        _ => match crate::api::fence::fetch_fences(&client) {
+            Ok(fs) if !fs.is_empty() => {
+                let centroid = |r: &[(f64, f64)]| {
                     let n = r.len() as f64;
-                    let s: (f64, f64) = r.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+                    let s = r.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
                     (s.0 / n, s.1 / n)
+                };
+                // 优先围栏环中心；环为空时退到必经打卡点中心
+                // （有的学校只在围栏响应里下发 passPoints，环是空的）
+                if !fs[0].ring.is_empty() {
+                    centroid(&fs[0].ring)
+                } else {
+                    let pts: Vec<(f64, f64)> = fs
+                        .iter()
+                        .flat_map(|f| f.pass_points.iter())
+                        .map(|p| (p.lat, p.lon))
+                        .collect();
+                    if pts.is_empty() {
+                        return json_err(
+                            request,
+                            "围栏既没有边界也没有打卡点，无法确定校区位置；请稍后重试",
+                        );
+                    }
+                    centroid(&pts)
                 }
-                _ => (30.5, 104.0),
             }
-        }
+            Ok(_) => {
+                return json_err(request, "服务端没返回围栏，无法确定校区位置；请稍后重试")
+            }
+            Err(e) => {
+                return json_err(request, &format!("拉取围栏失败，无法确定校区位置: {e}"))
+            }
+        },
     };
 
     let custom_path = parse_custom_path(body);
