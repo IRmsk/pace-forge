@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>运动世界校园 · 记录看板</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
@@ -66,7 +66,79 @@
   .ghost:hover { color: var(--fg); border-color: var(--dim); }
 
   .grid { display: grid; grid-template-columns: 400px 1fr; gap: 20px; align-items: start; }
-  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  /* ================= 响应式 =================
+     三档断点：宽屏笔记本 / 平板竖屏 / 手机。
+     另外单独一段处理触摸设备（pointer: coarse），因为「屏幕窄」和
+     「用手指点」是两件事——平板横屏足够宽，但按钮照样要够大。 */
+
+  /* 窄一点的笔记本：侧栏让出 60px 给地图 */
+  @media (max-width: 1180px) {
+    .grid { grid-template-columns: 340px 1fr; }
+  }
+
+  /* 平板竖屏 / 小笔记本：单列堆叠，地图抬高一点 */
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; gap: 14px; }
+    #map { height: 50vh; min-height: 280px; }
+    #list { max-height: 44vh; }
+    .planout { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  }
+
+  /* 手机 */
+  @media (max-width: 560px) {
+    .wrap { padding: 12px 10px 36px; }
+    #login { margin: 4vh auto; padding: 22px 16px; border-radius: 10px; }
+    #login h1 { font-size: 17px; }
+    #login p.sub { margin-bottom: 18px; }
+
+    .topbar { gap: 10px; padding-bottom: 12px; margin-bottom: 14px; }
+    .avatar { width: 34px; height: 34px; font-size: 13px; }
+    /* 头像右边整行给名字，别让三个按钮把它挤成几个字 */
+    .who { flex: 1 1 calc(100% - 44px); min-width: 0; }
+    .who b, .who div { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .who b { font-size: 14px; }
+    /* 三个操作按钮均分第二行，拇指够得着，不用横向找 */
+    .topbar .ghost { flex: 1 1 30%; padding: 9px 6px; font-size: 12px; }
+
+    #map { height: 46vh; min-height: 230px; }
+    #list { max-height: 38vh; }
+    #detail { padding: 10px 12px; font-size: 12px; }
+    .rec { padding: 10px 12px; }
+    .rec .dist { font-size: 15px; }
+    .rec .r2 { gap: 8px; font-size: 11px; }
+
+    /* 表单：输入框独占一行，按钮排成一行三等分 */
+    .runform { gap: 6px; }
+    .runform input { flex: 1 1 100%; width: 100%; height: 42px; }
+    .runform button { flex: 1 1 28%; height: 42px; padding: 0 8px; }
+    .kv { gap: 3px 10px; }
+  }
+
+  /* 触摸设备：交付面积比屏幕宽度更重要，一律放宽到 42px 以上 */
+  @media (hover: none) and (pointer: coarse) {
+    button:not(.mini):not(.ghost) { min-height: 42px; }
+    button.ghost { min-height: 40px; }
+    button.mini { min-height: 34px; padding: 7px 11px; font-size: 12px; }
+    /* 16px 是 iOS Safari 的免缩放阈值，低于它一聚焦就放大页面 */
+    input, select { min-height: 42px; font-size: 16px; }
+    .rec { padding-top: 13px; padding-bottom: 13px; }
+    .leaflet-container { -webkit-tap-highlight-color: transparent; }
+  }
+
+  /* 刘海屏底部安全区：iPhone 的手势横条会盖住最后一行按钮 */
+  @supports (padding: env(safe-area-inset-bottom)) {
+    .wrap { padding-bottom: calc(36px + env(safe-area-inset-bottom)); }
+    #buildTag { bottom: calc(4px + env(safe-area-inset-bottom)); }
+  }
+
+  /* 手机横屏：屏幕矮，按高度比例放大地图，否则只剩一条缝 */
+  @media (orientation: landscape) and (max-height: 520px) {
+    .topbar { padding-bottom: 8px; margin-bottom: 10px; }
+    .grid { grid-template-columns: 300px 1fr; }
+    #map { height: 72vh; min-height: 180px; }
+    #list { max-height: 60vh; }
+  }
 
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
   .panel h2 {
