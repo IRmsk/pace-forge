@@ -487,3 +487,5 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://run.gxapp.iydsj.com/
 把完整错误贴到 Issue 里，包括 `error=` 后面的数字和 message。只写「登录不进去」没法定位——`10121`（设备锁）、`10603`（限流）、密码错、极验失败，处理方式完全不同。
 
 **另外请带上**：操作系统、`pace-forge --version`、用的是 Web 还是 CLI、有没有挂代理。
+
+> 不想记这些字段？直接[新建 issue](https://github.com/IRmsk/pace-forge/issues/new?template=bug.yml)，模板会强制带上版本、平台、`rrid` 和报错原文四项，填完就是一份能直接定位的报告。

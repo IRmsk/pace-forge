@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 登录失败排查（10121 / 10603 / 极验失败）
+    url: https://github.com/IRmsk/pace-forge#登录失败排查
+    about: 设备锁、接口限流、密码错、极验失败的处理方式在这里，多数问题不用开 issue
+  - name: 使用说明与配置项
+    url: https://github.com/IRmsk/pace-forge#readme
+    about: 安装、登录、跑单、Web 控制台的用法

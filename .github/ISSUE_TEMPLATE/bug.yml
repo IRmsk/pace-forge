@@ -1,0 +1,101 @@
+name: 报错 / 无法使用
+description: 登录失败、拉数据失败、轨迹或提交异常、界面问题都走这里
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个模板里的四项**都是必填**。不是为了走流程——README 里写过的错误码
+        （`10121` 设备锁、`10603` 限流、密码错、极验失败）处理方式完全不同，
+        缺一个就只能来回问三轮。
+
+        填之前先做一件事：把 README 的「常见问题」扫一眼，`10121` 和 `10603`
+        有现成解法。
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 平台
+      description: 你是在哪儿碰到问题的？
+      options:
+        - Web 控制台（浏览器）
+        - CLI（命令行）
+        - Android APK
+    validations:
+      required: true
+
+  - type: input
+    id: version_pf
+    attributes:
+      label: pace-forge 版本
+      description: |
+        CLI 跑 `pace-forge --version`。Web 的版本和构建号在页面**右下角**
+        有一行小字（形如 `9077a37 · 11-06 09:34`），把那整行抄过来。
+      placeholder: "0.1.0 / 9077a37 · 11-06 09:34"
+    validations:
+      required: true
+
+  - type: input
+    id: version_app
+    attributes:
+      label: 运动世界校园 App 版本
+      description: |
+        App 内「我的 → 设置 → 关于」里能看到。服务端校验是按 App 版本分的，
+        版本不对会直接影响能不能登录。
+      placeholder: "5.4.2"
+    validations:
+      required: true
+
+  - type: input
+    id: rrid
+    attributes:
+      label: 记录编号 rrid
+      description: |
+        出问题的跑步记录编号。在 Web 的「跑步记录」列表里每条记录都标着，
+        CLI 的输出里也有。
+
+        **登录阶段就失败、还没产生记录的话，填 `无`**——但请确认是真的没有，
+        不是没去找。
+      placeholder: "1361238803 ／ 无"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error_text
+    attributes:
+      label: 报错原文
+      description: |
+        原样贴，不要概括。关键是这几样：
+
+        - `error=` 后面的数字（比如 `error=10121`）
+        - message 原文
+        - 完整的调用栈（如果崩溃了）
+        - 界面上出现的红色提示，可以直接截图拖进来
+      render: shell
+      placeholder: |
+        error=10121 message=登录失败，此账号已在其他设备登录
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充信息（可选）
+      description: |
+        操作系统、有没有挂代理 / VPN、是不是在模拟器或云手机里跑、
+        同一个账号换台设备是否正常。
+      placeholder: |
+        Windows 11 / 未挂代理 / 手机端 App 正在后台运行
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 上面的版本号和报错原文是从实际运行的环境里抄的，不是凭印象写的
+          required: true
+        - label: 我搜过已有的 issue，确认这不是重复问题
+          required: true
