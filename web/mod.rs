@@ -717,7 +717,9 @@ fn handle_plan(
             total_sec,
             start_ms,
             sport_type,
-            sample_step_m: 5.0,
+            // 10m 一个采样点。真机 2km 记录约 200 点；原来 5m 采样会生出
+            // 近 400 点，密度是真机的两倍，点数这一项就露馅。
+            sample_step_m: 10.0,
         };
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(start_ms as u64);

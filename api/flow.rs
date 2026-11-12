@@ -275,7 +275,10 @@ impl Default for RunParams {
             run_mode: 1,
             steps: None,
             seed: 0,
-            sample_step_m: 5.0,
+            // 10m 一个采样点。真机 GPS 就是这么密的：2km 记录约 200 点、
+            // 406 点的那些是更长的距离。我们原来 5m 采样，同样 2km 生出
+            // 388 点，密度是真机的两倍——这个从点数量级就能看出来。
+            sample_step_m: 10.0,
             prefer_roads: true,
             start_at_ms: None,
             custom_path: None,

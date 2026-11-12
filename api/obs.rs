@@ -54,15 +54,30 @@ pub fn sign_url(client: &Client, method: &str, key: &str) -> Result<String, Stri
 
 /// PUT 上传。
 pub fn put_object(signed_url: &str, payload: &[u8]) -> Result<(), String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    agent
-        .put(signed_url)
-        .set("Content-Type", "application/json")
-        .send_bytes(payload)
-        .map_err(|e| format!("OBS PUT 失败: {e}"))?;
-    Ok(())
+    // ureq/rustls 对腾讯 COS 端点握手偶发 "tls connection init failed:
+    // unexpected end of file"（curl 直连正常，说明是客户端侧的间歇性握手
+    // 失败）。一次抖动就够让明细整条传不上去，详情页于是没有步频和轨迹。
+    // 每次新建 agent 重试，退避递增。
+    let mut last = String::new();
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        match agent
+            .put(signed_url)
+            .set("Content-Type", "application/json")
+            .send_bytes(payload)
+        {
+            Ok(_) => return Ok(()),
+            // 服务端给了状态码就是明确拒绝（签名过期、桶权限），重试没用
+            Err(e @ ureq::Error::Status(..)) => return Err(format!("OBS PUT 失败: {e}")),
+            Err(e) => last = format!("OBS PUT 失败: {e}"),
+        }
+    }
+    Err(last)
 }
 
 /// 上传到多个 objectKey，返回成功个数。
@@ -91,16 +106,28 @@ pub fn upload_keys(
 /// 回读校验。
 pub fn fetch_object(client: &Client, key: &str) -> Result<Value, String> {
     let signed = sign_url(client, "Get", key)?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let text = agent
-        .get(&signed)
-        .call()
-        .map_err(|e| format!("OBS GET 失败: {e}"))?
-        .into_string()
-        .map_err(|e| format!("OBS 读取失败: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("OBS 对象解析失败: {e}"))
+    // 同 put_object：握手抖动重试，404 这类状态码不重试（那是对象真的不存在）
+    let mut last = String::new();
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+        }
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        match agent.get(&signed).call() {
+            Ok(resp) => {
+                let text = resp
+                    .into_string()
+                    .map_err(|e| format!("OBS 读取失败: {e}"))?;
+                return serde_json::from_str(&text)
+                    .map_err(|e| format!("OBS 对象解析失败: {e}"));
+            }
+            Err(e @ ureq::Error::Status(..)) => return Err(format!("OBS GET 失败: {e}")),
+            Err(e) => last = format!("OBS GET 失败: {e}"),
+        }
+    }
+    Err(last)
 }
 
 /// 服务端所在时区偏移（秒）。

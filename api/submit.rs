@@ -529,20 +529,69 @@ pub fn avg_power_for(distance_m: f64, time_sec: i64, weight_kg: f64) -> i64 {
 /// 海拔差累计爬升，若上报值与点位序列不一致，`totalAscent` 与轨迹直接
 /// 互相矛盾——而 pace 原来恒定发 0，等于「一条有起伏的轨迹零爬升」。
 pub fn total_ascent_from_points(pts: &[Value]) -> i32 {
-    let mut prev: Option<f64> = None;
-    let mut sum = 0.0f64;
-    for p in pts {
-        let a = p.get("bdA").and_then(|v| v.as_f64());
-        let Some(a) = a else { continue };
-        if let Some(before) = prev {
-            let d = a - before;
-            if d > 0.0 {
-                sum += d;
-            }
-        }
-        prev = Some(a);
+    let ser: Vec<(f64, f64)> = pts
+        .iter()
+        .filter_map(|p| {
+            let a = p.get("bdA").and_then(|v| v.as_f64())?;
+            let d = p.get("totalDis").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Some((d, a))
+        })
+        .collect();
+    if ser.len() < 2 {
+        return 0;
     }
+    // 逐点累加正增量会报 100m+，真机记录只有 17~22m——App 把气压计噪声
+    // 滤掉才算爬升。这里先做 ±100m 窗口滑动平均（10m 采样下约 21 个点）
+    // 再累加正增量。这个窗口是拿真机数据拟合出来的：算出 18/14/18/18
+    // 对真实 22/17/20/22，误差最小。
+    const HALF_WIN_M: f64 = 100.0;
+    let smooth: Vec<f64> = ser
+        .iter()
+        .map(|&(d0, _)| {
+            let (mut s, mut n) = (0.0, 0.0);
+            for &(d, a) in &ser {
+                if (d - d0).abs() <= HALF_WIN_M {
+                    s += a;
+                    n += 1.0;
+                }
+            }
+            s / n
+        })
+        .collect();
+    let sum: f64 = smooth.windows(2).map(|w| (w[1] - w[0]).max(0.0)).sum();
     sum.round() as i32
+}
+
+/// 逐点 `speed`(km/h) / `bdS`(m/s) 改成前后各 5 点的窗口均速。
+///
+/// 手机 GPS 速度是多普勒测速，本身平滑，App 配速图上是一条稳定的线。
+/// 我们原来用「相邻两点位移 / 间隔」，而轨迹带 GPS 抖动，配速图满屏锯齿。
+pub fn smooth_point_speed(items: &mut [Value]) {
+    const HALF: usize = 5;
+    let n = items.len();
+    if n < 3 {
+        return;
+    }
+    let dis: Vec<f64> = items
+        .iter()
+        .map(|p| p["totalDis"].as_f64().unwrap_or(0.0))
+        .collect();
+    let tim: Vec<f64> = items
+        .iter()
+        .map(|p| p["totalTime"].as_f64().unwrap_or(0.0))
+        .collect();
+    for (i, item) in items.iter_mut().enumerate().take(n).skip(1) {
+        let a = i.saturating_sub(HALF);
+        let b = (i + HALF).min(n - 1);
+        let dt = tim[b] - tim[a];
+        if dt <= 0.0 {
+            continue;
+        }
+        // 上限 6.3 m/s 是给异常抖动兜底（世界纪录配速的两倍还多）
+        let v = ((dis[b] - dis[a]) / dt).clamp(0.0, 6.3);
+        item["speed"] = json!(((v * 3.6) * 10000.0).round() / 10000.0);
+        item["bdS"] = json!((v * 100.0).round() / 100.0);
+    }
 }
 
 /// 从已组装好的点位数组切圈（每 1000m 一圈，末圈 `isFullLap=false`）。
@@ -765,7 +814,7 @@ pub fn build(
         .map(|f| f.position as usize)
         .filter(|&i| i < points.len())
         .collect();
-    let loc_items: Vec<Value> = points
+    let mut loc_items: Vec<Value> = points
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -776,6 +825,10 @@ pub fn build(
             )
         })
         .collect();
+
+    // 配速平滑必须在这里做：逐点 speed 是「相邻两点位移 / 间隔」，轨迹带 GPS
+    // 抖动时 App 的配速图满屏锯齿。真机是 GPS 多普勒测速，曲线本来就平滑。
+    smooth_point_speed(&mut loc_items);
 
     // 累计爬升必须从**已生成的点位**反算，与 allLocJson 里的 bdA 物理同源。
     // 原来恒发 0：点位有起伏、总爬升却是 0，服务端按两点海拔差累计时立刻
@@ -1810,13 +1863,13 @@ mod step_distance_tests {
         assert_eq!(declared, expect as i64, "报文的 totalAscent 与点位反算值不一致");
         // pace 的地点派生海拔自带缓坡，2000m 上必须有非零爬升
         assert!(expect > 0, "2000m 轨迹爬升为 0，海拔序列是平的");
-        // 圈上的 elevationGain 之和要与总爬升同量级（差值来自切圈插值）
+        // 圈爬升是逐点累加（真机每公里 ~55m），总爬升是平滑后累加（真机
+        // 17~22m）——这两个口径本来就不一致，App 那边也是分开算的。
+        // 只要求前者不小于后者：平滑只会削掉噪声，不该凭空造出爬升。
         let laps = build_laps_from_points(&arr, p.start_time_ms);
         let lap_sum: f64 = laps.iter().map(|l| l["elevationGain"].as_f64().unwrap()).sum();
-        // 总爬升 round 到整米、圈爬升保留 2 位且切圈点按比例分摊，
-        // 两者只能同量级（差 < 圈数 米），不要求逐分相等。
-        assert!((lap_sum - expect as f64).abs() <= laps.len() as f64 + 0.5,
-            "圈爬升和 {lap_sum} 与总爬升 {expect} 差太多");
+        assert!((expect as f64) <= lap_sum,
+            "平滑后的总爬升 {expect} 不应超过逐点累加的圈爬升和 {lap_sum}");
         // 上报值也必须出现在签名参与字段里（否则服务端算签名会不一致）
         assert!(sub.canonical.contains(&format!("totalAscent={expect}")),
             "签名串里的 totalAscent 不是点位反算值: {}", sub.canonical);
