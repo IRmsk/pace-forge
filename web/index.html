@@ -20,7 +20,12 @@
     font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   }
   a { color: var(--accent); }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px; }
+  .wrap {
+    max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px;
+    /* grid 列被内容撑破时整页会横向滚动，右侧多一条空带，看起来就像
+       「上面的卡片比下面的地图窄」。兜底裁掉横向溢出。 */
+    overflow-x: clip;
+  }
 
   /* ---- 登录 ---- */
   #login {
@@ -59,13 +64,77 @@
   .who { flex: 1; min-width: 180px; }
   .who b { font-size: 15px; }
   .who div { color: var(--dim); font-size: 12px; }
+  /* 账号行：名字永远单行省略，别被右边那排按钮挤成竖排 */
+  .accname { min-width: 0; }
+  .accname b, .accname .hint {
+    display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .ghost {
     width: auto; padding: 7px 14px; background: transparent; color: var(--dim);
     border: 1px solid var(--line); font-weight: 400; font-size: 13px;
   }
   .ghost:hover { color: var(--fg); border-color: var(--dim); }
 
-  .grid { display: grid; grid-template-columns: 400px 1fr; gap: 20px; align-items: start; }
+  .grid { display: grid; grid-template-columns: 400px minmax(0, 1fr); gap: 20px; align-items: start; }
+  /* grid 项默认 min-width:auto，Leaflet 地图这类绝对尺寸内容会把列撑破，
+     表现就是「上面的卡片和下面的地图宽度对不上」。 */
+  .grid > * { min-width: 0; }
+
+  #map { height: 42vh; min-height: 300px; background: #0b0d11; width: 100%; }
+  #detail { padding: 14px 16px; font-size: 13px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; }
+  .kv span:nth-child(odd) { color: var(--dim); }
+  .hint { color: var(--dim); font-size: 12px; padding: 0 16px 14px; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .spin {
+    width: 15px; height: 15px; border: 2px solid var(--line); border-top-color: var(--accent);
+    border-radius: 50%; animation: sp .7s linear infinite; display: inline-block; vertical-align: -2px;
+  }
+  @keyframes sp { to { transform: rotate(360deg); } }
+
+.runform { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 12px; }
+.runform label { display: flex; flex-direction: column; font-size: 12px; color: #93a4b8; gap: 4px; }
+.runform input { width: 84px; padding: 7px 9px; background: #0e141c; border: 1px solid #223041;
+  border-radius: 7px; color: #e6edf3; font-size: 14px; }
+.runform button { padding: 8px 16px; background: #22d3a6; color: #06121a; border: 0;
+  border-radius: 7px; font-weight: 600; cursor: pointer; height: 36px; }
+.runform button:disabled { opacity: .5; cursor: default; }
+/* 复选框不是文本输入框：`.runform input { width:84px; padding:7px 9px }` 会把
+   checkbox 也撑成一个大方块，深色主题下就是个突兀的蓝色大勾。
+   带复选框的那一行单独走横排。 */
+.runform label.chkline { flex-direction: row; align-items: center; gap: 8px; flex-wrap: wrap; }
+.runform input[type="checkbox"] {
+  width: 17px; height: 17px; padding: 0; margin: 0; flex: none;
+  accent-color: #22d3a6; cursor: pointer;
+}
+/* 下拉框之前一条样式都没有，浏览器直接给白底黑字，在深色面板上是一块
+   刺眼的白。跟输入框同一套配色；箭头自己画，因为 appearance:none 之后
+   原生的三角也没了。 */
+.runform select {
+  padding: 7px 30px 7px 9px; background-color: #0e141c; color: #e6edf3;
+  border: 1px solid #223041; border-radius: 7px; font-size: 14px; height: 36px;
+  -webkit-appearance: none; appearance: none; cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238b93a1' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 10px center;
+}
+.runform select:focus { border-color: #4493f8; outline: none; }
+.runform select option { background: #0e141c; color: #e6edf3; }
+.planout { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 14px; }
+.planout:empty { display: none; }
+.kv { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0;
+  border-bottom: 1px solid #161f2b; }
+.kv span { color: #7d8ea3; }
+.kv b { color: #e6edf3; font-weight: 600; }
+.kv b.mono { font-family: ui-monospace, monospace; font-size: 11px; }
+.planout .note { grid-column: 1/-1; margin-top: 8px; font-size: 12px; color: #6b7c91; }
+button.mini{padding:3px 8px;font-size:11px;line-height:1.6}
+button.mini:disabled{opacity:.35}
+button.danger{background:#dc2626;border-color:#dc2626;color:#fff}
+button.danger:hover{background:#b91c1c}
+button.danger:disabled{opacity:.5}
+button.primary{background:#238636;border-color:#2ea043;color:#fff}
+button.primary:hover{background:#2ea043}
+button.primary:disabled{opacity:.5}
 
   /* ================= 响应式 =================
      三档断点：宽屏笔记本 / 平板竖屏 / 手机。
@@ -74,12 +143,13 @@
 
   /* 窄一点的笔记本：侧栏让出 60px 给地图 */
   @media (max-width: 1180px) {
-    .grid { grid-template-columns: 340px 1fr; }
+    .grid { grid-template-columns: 340px minmax(0, 1fr); }
   }
 
   /* 平板竖屏 / 小笔记本：单列堆叠，地图抬高一点 */
   @media (max-width: 900px) {
-    .grid { grid-template-columns: 1fr; gap: 14px; }
+    /* 单列时列宽就是容器宽，卡片和地图必然同宽 */
+    .grid { grid-template-columns: minmax(0, 1fr); gap: 14px; width: 100%; }
     #map { height: 50vh; min-height: 280px; }
     #list { max-height: 44vh; }
     .planout { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
@@ -113,6 +183,16 @@
     .runform input { flex: 1 1 100%; width: 100%; height: 42px; }
     .runform button { flex: 1 1 28%; height: 42px; padding: 0 8px; }
     .kv { gap: 3px 10px; }
+
+    /* 5 个按钮固定约 200px，名字容器 flex:1 会被一直压——实测被挤到
+       26px，一个汉字一行。小屏让按钮换行到第二排，名字独占一整行。 */
+    .accrow { flex-wrap: wrap; row-gap: 8px; }
+    /* shrink 必须是 0。
+       写成 `flex: 1 1 calc(100% - 18px)` 时收缩系数还是 1，浏览器会把名字
+       压窄好让两个按钮挤回第一行，结果名字只剩「伊…」、手机号只剩「181」。
+       不允许收缩才能真正撑满一行、把按钮顶到下一排。 */
+    .accname { flex: 1 0 calc(100% - 18px); }
+    .accrow button.mini { flex: 1 1 30%; min-width: 0; padding: 7px 4px; }
   }
 
   /* 触摸设备：交付面积比屏幕宽度更重要，一律放宽到 42px 以上 */
@@ -135,15 +215,34 @@
   /* 手机横屏：屏幕矮，按高度比例放大地图，否则只剩一条缝 */
   @media (orientation: landscape) and (max-height: 520px) {
     .topbar { padding-bottom: 8px; margin-bottom: 10px; }
-    .grid { grid-template-columns: 300px 1fr; }
+    .grid { grid-template-columns: 300px minmax(0, 1fr); }
     #map { height: 72vh; min-height: 180px; }
     #list { max-height: 60vh; }
   }
 
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  /* 一级卡片一律铺满父容器。原来没写，靠 block 默认撑满；显式声明一次，
+     免得哪个面板被 max-width 或内容宽度影响，跟上下的卡片宽度对不上。 */
+  #app > .panel { width: 100%; max-width: none; box-sizing: border-box; }
+  #app > .grid { width: 100%; box-sizing: border-box; }
   .panel h2 {
     font-size: 13px; font-weight: 600; color: var(--dim); margin: 0;
     padding: 14px 16px; border-bottom: 1px solid var(--line); letter-spacing: .3px;
+  }
+  /* 轨迹显隐开关。单独一行 flex，不塞进标题里——标题高度随字号变，
+     复选框尺寸又跟系统设置走，塞进去早晚错位。 */
+  .trackbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 18px;
+    padding: 9px 16px; border-bottom: 1px solid var(--line);
+    font-size: 12px; color: var(--dim);
+  }
+  .trackbar label {
+    display: inline-flex; align-items: center; gap: 6px;
+    cursor: pointer; user-select: none;
+  }
+  .trackbar input {
+    accent-color: #22d3a6; cursor: pointer; margin: 0;
+    width: 15px; height: 15px; flex: none;
   }
   #list { max-height: 62vh; overflow-y: auto; }
   .rec {
@@ -159,41 +258,7 @@
   .rec .r2 { color: var(--dim); font-size: 12px; margin-top: 4px; display: flex; gap: 12px; flex-wrap: wrap; }
   .empty { padding: 30px 16px; text-align: center; color: var(--dim); font-size: 13px; }
 
-  #map { height: 42vh; min-height: 300px; background: #0b0d11; }
-  #detail { padding: 14px 16px; font-size: 13px; }
-  .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; }
-  .kv span:nth-child(odd) { color: var(--dim); }
-  .hint { color: var(--dim); font-size: 12px; padding: 0 16px 14px; }
-  code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .spin {
-    width: 15px; height: 15px; border: 2px solid var(--line); border-top-color: var(--accent);
-    border-radius: 50%; animation: sp .7s linear infinite; display: inline-block; vertical-align: -2px;
-  }
-  @keyframes sp { to { transform: rotate(360deg); } }
 
-.runform { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 12px; }
-.runform label { display: flex; flex-direction: column; font-size: 12px; color: #93a4b8; gap: 4px; }
-.runform input { width: 84px; padding: 7px 9px; background: #0e141c; border: 1px solid #223041;
-  border-radius: 7px; color: #e6edf3; font-size: 14px; }
-.runform button { padding: 8px 16px; background: #22d3a6; color: #06121a; border: 0;
-  border-radius: 7px; font-weight: 600; cursor: pointer; height: 36px; }
-.runform button:disabled { opacity: .5; cursor: default; }
-.planout { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 14px; }
-.planout:empty { display: none; }
-.kv { display: flex; justify-content: space-between; font-size: 13px; padding: 3px 0;
-  border-bottom: 1px solid #161f2b; }
-.kv span { color: #7d8ea3; }
-.kv b { color: #e6edf3; font-weight: 600; }
-.kv b.mono { font-family: ui-monospace, monospace; font-size: 11px; }
-.planout .note { grid-column: 1/-1; margin-top: 8px; font-size: 12px; color: #6b7c91; }
-button.mini{padding:3px 8px;font-size:11px;line-height:1.6}
-button.mini:disabled{opacity:.35}
-button.danger{background:#dc2626;border-color:#dc2626;color:#fff}
-button.danger:hover{background:#b91c1c}
-button.danger:disabled{opacity:.5}
-button.primary{background:#238636;border-color:#2ea043;color:#fff}
-button.primary:hover{background:#2ea043}
-button.primary:disabled{opacity:.5}
 </style>
 </head>
 <body>
@@ -274,7 +339,7 @@ button.primary:disabled{opacity:.5}
           <input id="rPaceMax" type="number" value="6.6" step="0.1" min="2" max="12" style="width:64px">
         </span>
       </label>
-      <label title="按上面的配速区间随机取一个配速，乘距离得到时长；每次提交都重新随机">
+      <label class="chkline" title="按上面的配速区间随机取一个配速，乘距离得到时长；每次提交都重新随机">
         <input id="rAutoDur" type="checkbox" checked> 时长自动
         <span id="durHint" class="hint"></span>
       </label>
@@ -334,6 +399,10 @@ button.primary:disabled{opacity:.5}
     <div>
       <div class="panel">
         <h2>轨迹地图</h2>
+        <div class="trackbar">
+          <label><input type="checkbox" id="showTrack"> 预览轨迹</label>
+          <label><input type="checkbox" id="showRec" checked> 记录轨迹</label>
+        </div>
         <div id="map"></div>
         <div id="detail" class="hint">选择左侧一条记录查看轨迹</div>
       </div>
@@ -648,6 +717,8 @@ function setOut(t, err) {
 }
 let lastCheckpoints = [];
 let lastFence = null;
+// 预览轨迹单独一层，默认不上图（见 drawPreview）
+let trackLayer = null;
 
 function drawPreview(coords, fence, checkpoints) {
   if (!map) return;
@@ -665,9 +736,14 @@ function drawPreview(coords, fence, checkpoints) {
     group.addLayer(poly);
   }
 
-  // 轨迹
+  // 轨迹单独一层，默认不显示。
+  // 原来它跟围栏、打卡点挤在同一个 group 里，规划完就一直挂着，切记录也
+  // 不消失，叠两三条就看不见底下的路。
+  if (trackLayer) { map.removeLayer(trackLayer); trackLayer = null; }
   if (coords && coords.length) {
-    group.addLayer(L.polyline(coords, { color: '#22d3a6', weight: 4, opacity: 0.9 }));
+    trackLayer = L.layerGroup();
+    L.polyline(coords, { color: '#22d3a6', weight: 4, opacity: 0.9 }).addTo(trackLayer);
+    if ($('showTrack') && $('showTrack').checked) trackLayer.addTo(map);
   }
 
   // 打卡点
@@ -729,7 +805,7 @@ function renderAccounts(r) {
       : (a.hasPassword ? (a.enabled ? '待登录' : '已停用') : '无密码');
     return `<div class="accrow" data-id="${a.id}" style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #161b22${a.current ? ';background:#161b22;border-radius:6px;padding-left:8px' : ''}">
       <span style="width:8px;height:8px;border-radius:50%;background:${dot};flex:none"></span>
-      <div style="flex:1;min-width:0">
+      <div class="accname" style="flex:1;min-width:0">
         <b style="font-size:13px">${a.label}${a.current ? ' <span style="color:#22d3a6;font-size:11px">当前</span>' : ''}</b>
         <div class="hint" style="font-size:11px">${a.username} · ${a.school || '—'} · ${state}</div>
       </div>
@@ -949,7 +1025,8 @@ function initMap() {
   roadMap.addTo(map);
   L.control.layers({ '高德路网': roadMap, '高德卫星': satLayer }, null,
     { position: 'topright' }).addTo(map);
-  layer = L.layerGroup().addTo(map);
+  layer = L.layerGroup();
+  if (!$('showRec') || $('showRec').checked) layer.addTo(map);
   initDrawing();
   initBlockers();
   // 定位控件单独初始化：原先挂在 initDrawing 末尾，而 initDrawing 开头有
@@ -1432,6 +1509,17 @@ function initDrawing() {
       `已采用 ${(strokesLength() / 1000).toFixed(2)} km，点“生成轨迹”或直接提交`;
   };
 }
+
+/* 两个轨迹开关：勾上立刻上图，取消立刻摘下来，不用重新规划 */
+document.addEventListener('change', (e) => {
+  const id = e.target && e.target.id;
+  if (id === 'showTrack' && trackLayer) {
+    e.target.checked ? trackLayer.addTo(map) : map.removeLayer(trackLayer);
+  }
+  if (id === 'showRec' && layer) {
+    e.target.checked ? layer.addTo(map) : map.removeLayer(layer);
+  }
+});
 
 /* ---------- 记录列表 ---------- */
 async function loadRecords() {
