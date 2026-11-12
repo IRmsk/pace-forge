@@ -727,39 +727,23 @@ pub fn route_through(
         return Err("至少要两个点".into());
     }
     let mut path: Vec<usize> = Vec::new();
-    let mut used_edges: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     for i in 0..must.len() {
         let a = g.nearest(must[i]);
         let b = g.nearest(must[(i + 1) % must.len()]);
-        let last = i + 1 == must.len();
-        // 最后一段（回到起点）优先走没走过的路。
+        // 最后一段不搞「禁止复用已走边」的绕行。
         //
-        // 几个打卡点常常排成一条线，最后一段如果也走最短路，就是原路折返——
-        // 轨迹里出现一条 180° 的掉头，真人跑步不会这么走。先试绕行，实在
-        // 没有第二条路再退回原路。
-        let seg = if last && !used_edges.is_empty() {
-            astar_avoiding(g, a, b, Some(&used_edges))
-                .or_else(|| astar(g, a, b))
-        } else {
-            astar(g, a, b)
-        }
-        .ok_or_else(|| {
+        // 试过：5 个点排成一条线时，末段走最短路是原路折返，绕行版本能
+        // 消掉那个掉头。但绕行距离不可控——实测一圈从 1741m 变成 2767m，
+        // 直接超出目标 38%，最后被上游的里程校验拦掉、退回几何规划。
+        // 宁可留一段原路返回，也不能让整条路线的长度失控。
+        let seg = astar(g, a, b).ok_or_else(|| {
             format!(
                 "点 {} 到点 {} 之间路网不连通",
                 i + 1,
                 (i + 1) % must.len() + 1
             )
         })?;
-
-        for w in seg.windows(2) {
-            if let Some((_, _, e)) = g.adj[w[0]]
-                .iter()
-                .find(|(n, _, _)| *n == w[1])
-            {
-                used_edges.insert(*e);
-            }
-        }
 
         if path.is_empty() {
             path.extend(seg);
@@ -793,52 +777,6 @@ pub fn route_through(
     }
 
     Ok(path.into_iter().map(|i| g.nodes[i]).collect())
-}
-
-/// 带禁用边的 A*：`avoid` 里的边不许走。
-fn astar_avoiding(
-    g: &RoadGraph,
-    s: usize,
-    t: usize,
-    avoid: Option<&std::collections::HashSet<usize>>,
-) -> Option<Vec<usize>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
-    let n = g.nodes.len();
-    let mut best = vec![f64::INFINITY; n];
-    let mut came = vec![usize::MAX; n];
-    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
-    let h = |i: usize| crate::track::geo::distance(g.nodes[i], g.nodes[t]);
-    best[s] = 0.0;
-    heap.push(Reverse(((h(s) * 100.0) as i64, s)));
-
-    while let Some(Reverse((_, u))) = heap.pop() {
-        if u == t {
-            let mut out = vec![t];
-            let mut c = t;
-            while came[c] != usize::MAX {
-                c = came[c];
-                out.push(c);
-            }
-            out.reverse();
-            return Some(out);
-        }
-        for &(v, w, e) in &g.adj[u] {
-            if let Some(set) = avoid {
-                if set.contains(&e) {
-                    continue;
-                }
-            }
-            let ng = best[u] + w;
-            if ng + 1e-9 < best[v] {
-                best[v] = ng;
-                came[v] = u;
-                heap.push(Reverse((((ng + h(v)) * 100.0) as i64, v)));
-            }
-        }
-    }
-    None
 }
 
 /// 图上 A*。启发式用直线距离，权重是实际边长。
@@ -1175,21 +1113,21 @@ pub fn walk_graph(
                 mark_passed(g.nodes[cur], &mut pending);
             }
             None => {
-                // 死胡同：回退一步，把刚走过的边标成可复用。
+                // 走到尽头：原路退回去，这一段**照样计入里程**。
                 //
-                // 回退的那一步必须从 total 里扣掉——它是原地倒退，不是跑步
-                // 前进。早先没扣，里程虚高让游走提前收工。
+                // 真人跑到死胡同就是折返跑回来，轨迹上确实有这段路。早先
+                // 是 pop 掉再扣里程，等于假装没走过——路径里不留痕迹，长度
+                // 又对不上。
                 if path.len() >= 2 {
                     let prev = path[path.len() - 2];
-                    let back = crate::track::geo::distance(g.nodes[cur], g.nodes[prev]);
-                    total = (total - back).max(0.0);
                     for &(nb, _, e) in &g.adj[cur] {
                         if nb == prev {
                             g.edge_used[e] = false;
                         }
                     }
-                    path.pop();
                     cur = prev;
+                    path.push(cur);
+                    total += crate::track::geo::distance(g.nodes[prev], g.nodes[cur]);
                     came_edge = None;
                 }
                 stall += 1;
@@ -1200,14 +1138,6 @@ pub fn walk_graph(
 
     if path.len() < 3 {
         return Err("图上游走失败，没走出路径".into());
-    }
-    let unique: std::collections::HashSet<usize> = path.iter().copied().collect();
-    if (unique.len() as f64) < (path.len() as f64) * 0.5 {
-        return Err(format!(
-            "游走在打转（{} 步只踩过 {} 个节点），图连通性不足",
-            path.len(),
-            unique.len()
-        ));
     }
     Ok(path.into_iter().map(|i| g.nodes[i]).collect())
 }

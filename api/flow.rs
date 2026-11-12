@@ -158,8 +158,11 @@ fn try_route_on_tiles(
     log(&format!("[tiles] 围栏内路网 {total:.0}m，按瓦片道路规划"));
 
     let start = must.first().copied().unwrap_or(fence[0]);
-    // 碎片化路网不能用 route_on_roads 的「跳段」模型，也不能用贪心游走
-    // （会来回走同一条边，制造 180° 尖刺）。按打卡点顺序跑 A* 最短路。
+    // 路线走 A* 最短路：不走死胡同、不绕冤枉路，只在打卡点之间连最合理的
+    // 一条。之前试过贪心漫游，虽然形状自然了，但会钻进支路再折返——那是
+    // 为了凑里程而绕路，不是人跑步的样子。
+    //
+    // 「不生硬」交给 soften：横向摆动 + 轻度平滑，让轨迹偏离道路中心线。
     let graph = tileroad::build_graph(&clipped, 25.0);
     let _ = start;
     let _ = seed;
@@ -177,8 +180,12 @@ fn try_route_on_tiles(
                 log(&format!("[tiles] 走出 {max_gap:.0}m 的跳变，改用几何规划"));
                 return None;
             }
-            // 里程差太多说明图不连通，硬用会被服务端判里程不符
-            if (length_m - want_m).abs() / want_m > 0.25 {
+            // 只在「明显短于目标」时判为图不连通。
+            //
+            // 原来用 abs() 判双向 25%，结果闭环绕行把一圈拉到 2767m（超出
+            // 38%）也被拦掉，整条瓦片路网被丢弃、退回几何规划——用户看到
+            // 的「乱跑」就是几何规划那条路。长一点由内部截断处理，不该拒绝。
+            if length_m < want_m * 0.6 {
                 log(&format!(
                     "[tiles] 图上只走出 {length_m:.0}m（目标 {want_m:.0}m），图不连通，改用几何规划"
                 ));
@@ -727,8 +734,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             // 幅度压在路宽以内。
             crate::track::tileroad::soften(
                 &rounded,
-                6,
-                1.2,
+                2,
+                2.6,
                 if p.seed != 0 { p.seed } else { start_ms as u64 },
             )
         } else {
