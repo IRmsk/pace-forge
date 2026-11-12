@@ -1498,36 +1498,21 @@ fn handle_run(
     let (clat, clng) = match (lat, lng) {
         (Some(a), Some(b)) => (a, b),
         _ => match crate::api::fence::fetch_fences(&client) {
-            Ok(fs) if !fs.is_empty() => {
-                let centroid = |r: &[(f64, f64)]| {
-                    let n = r.len() as f64;
-                    let s = r.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
-                    (s.0 / n, s.1 / n)
-                };
-                // 优先围栏环中心；环为空时退到必经打卡点中心
-                // （有的学校只在围栏响应里下发 passPoints，环是空的）
-                if !fs[0].ring.is_empty() {
-                    centroid(&fs[0].ring)
-                } else {
-                    let pts: Vec<(f64, f64)> = fs
-                        .iter()
-                        .flat_map(|f| f.pass_points.iter())
-                        .map(|p| (p.lat, p.lon))
-                        .collect();
-                    if pts.is_empty() {
-                        return json_err(
-                            request,
-                            "围栏既没有边界也没有打卡点，无法确定校区位置；请稍后重试",
-                        );
-                    }
-                    centroid(&pts)
-                }
+            // fetch_fences 只在解析出至少一个成环围栏时才返回 Ok，
+            // 每个 Fence 的 ring 都 >= 3 个点，所以直接取首个围栏的
+            // 环心即可，不需要再兜底到 passPoints。
+            Ok(fs) => {
+                let ring = &fs[0].ring;
+                let n = ring.len() as f64;
+                let s = ring
+                    .iter()
+                    .fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+                (s.0 / n, s.1 / n)
             }
-            Ok(_) => {
-                return json_err(request, "服务端没返回围栏，无法确定校区位置；请稍后重试")
-            }
+            // 错误信息自带诊断（geoFences 个数、各围栏点数、字段名），
+            // 用户直接贴过来就能判断是「服务端没数据」还是「字段改名了」。
             Err(e) => {
-                return json_err(request, &format!("拉取围栏失败，无法确定校区位置: {e}"))
+                return json_err(request, &format!("无法确定校区位置: {e}"));
             }
         },
     };

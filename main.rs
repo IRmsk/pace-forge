@@ -162,25 +162,19 @@ fn dry_run(dist_km: f64, dur_min: f64) {
     // CLI 原来走 RunParams::default()，center 是 (0.0, 0.0)——赤道的几内亚湾。
     // 围栏选择按「最近」兜底，会选中 2677 公里外的学校，再交给
     // route_through_in_order 就算出 7640 公里、152 万个点的鬼轨迹。
-    let center: Option<(f64, f64)> = match pace_forge::api::fence::fetch_fences(&client) {
-        Ok(fs) if !fs.is_empty() => fs[0].ring.first().map(|_| {
-            let n = fs[0].ring.len() as f64;
-            let s = fs[0]
-                .ring
+    // fetch_fences 保证返回的每个围栏都已成环（点数 >= 3），
+    // 所以这里不需要再判断 ring 是否为空。
+    let (clat, clng) = match pace_forge::api::fence::fetch_fences(&client) {
+        Ok(fs) => {
+            let ring = &fs[0].ring;
+            let n = ring.len() as f64;
+            let s = ring
                 .iter()
                 .fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
             (s.0 / n, s.1 / n)
-        }),
-        Ok(_) => None,
-        Err(e) => {
-            eprintln!("拉围栏失败: {e}");
-            None
         }
-    };
-    let (clat, clng) = match center {
-        Some(c) => c,
-        None => {
-            eprintln!("拿不到围栏中心点，无法规划轨迹");
+        Err(e) => {
+            eprintln!("拿不到围栏中心点，无法规划轨迹: {e}");
             std::process::exit(1);
         }
     };
@@ -469,16 +463,16 @@ fn run_with_start(dist_km: f64, dur_min: f64, start_at: Option<i64>, yes: bool) 
 
     // 中心点同样必须从真实围栏反推，不能用默认的 (0,0)。
     let (clat, clng) = match pace_forge::api::fence::fetch_fences(&client) {
-        Ok(fs) if !fs.is_empty() && !fs[0].ring.is_empty() => {
-            let n = fs[0].ring.len() as f64;
-            let t = fs[0]
-                .ring
+        Ok(fs) => {
+            let ring = &fs[0].ring;
+            let n = ring.len() as f64;
+            let t = ring
                 .iter()
                 .fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
             (t.0 / n, t.1 / n)
         }
-        _ => {
-            eprintln!("拿不到围栏中心点，无法规划轨迹");
+        Err(e) => {
+            eprintln!("拿不到围栏中心点，无法规划轨迹: {e}");
             std::process::exit(1);
         }
     };

@@ -146,6 +146,10 @@ pub struct FencePick {
 }
 
 /// 拉取围栏列表。
+///
+/// 服务端返回了围栏但解析不出边界时，这里返回 `Err` 并在消息里带上
+/// 诊断——「没返回围栏」和「返回了但不成环」对用户是两种完全不同的
+/// 处境，而前者那句提示只会让人反复重试。
 pub fn fetch_fences(client: &Client) -> Result<Vec<Fence>, String> {
     let raw = client.request(
         "POST",
@@ -153,7 +157,55 @@ pub fn fetch_fences(client: &Client) -> Result<Vec<Fence>, String> {
         Some(&json!({ "geoFenceUpdateTime": 0 })),
     )?;
     let v = expect_ok(&raw)?;
-    parse_fences(&v)
+    let fences = parse_fences(&v)?;
+    if fences.is_empty() {
+        return Err(format!("服务端下发的围栏不成边界（{}）", fence_diag(&v)));
+    }
+    Ok(fences)
+}
+
+/// 围栏响应诊断：说明到底返回了什么、为什么解析不出环。
+///
+/// 只用于错误信息，不参与业务逻辑。字段名一并列出——服务端若把
+/// `points` 改名成别的，光看「点数为 0」是查不出来的。
+fn fence_diag(v: &Value) -> String {
+    let data = v.get("data").unwrap_or(v);
+    let raw = data
+        .get("geoFences")
+        .or_else(|| v.get("geoFences"));
+
+    let Some(raw) = raw else {
+        return "响应里没有 geoFences 字段".into();
+    };
+    let items: Vec<Value> = match raw {
+        Value::Array(a) => a.clone(),
+        Value::String(s) => serde_json::from_str(s).unwrap_or_default(),
+        _ => return "geoFences 既不是数组也不是 JSON 字符串".into(),
+    };
+    if items.is_empty() {
+        return "geoFences 是空数组".into();
+    }
+
+    let counts: Vec<String> = items
+        .iter()
+        .map(|f| {
+            f.get("points")
+                .and_then(|p| p.as_array())
+                .map_or(0, |a| a.len())
+                .to_string()
+        })
+        .collect();
+    let keys: Vec<String> = items[0]
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+
+    format!(
+        "geoFences={}，各围栏点数=[{}]，首个围栏字段=[{}]",
+        items.len(),
+        counts.join(","),
+        keys.join(",")
+    )
 }
 
 /// 解析围栏响应。
@@ -453,6 +505,44 @@ mod tests {
         });
         // 只有 2 个点，构不成环
         assert!(parse_fences(&v).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fence_diag_names_the_actual_cause() {
+        // 三条互不相同的失败原因，必须能区分开——用户看到哪一句，
+        // 决定了他该等一会儿重试还是该来找我。
+
+        // 1. 压根没有这个字段
+        let missing = json!({ "code": 0, "data": {} });
+        assert!(fence_diag(&missing).contains("没有 geoFences"));
+
+        // 2. 字段在，但是空数组
+        let empty = json!({ "data": { "geoFences": [] } });
+        assert!(fence_diag(&empty).contains("空数组"));
+
+        // 3. 有围栏但点数不够成环，且要能报出字段真名
+        let degenerate = json!({
+            "data": {
+                "geoFences": [
+                    { "id": 7, "points": [{"lat": 47.38, "lon": 123.95}] },
+                    { "id": 8, "points": [] }
+                ]
+            }
+        });
+        let d = fence_diag(&degenerate);
+        assert!(d.contains("geoFences=2"), "应报出围栏个数: {d}");
+        assert!(d.contains("[1,0]"), "应报出每个围栏的点数: {d}");
+        assert!(d.contains("points"), "应列出字段名: {d}");
+    }
+
+    #[test]
+    fn fetch_fences_rejects_degenerate_instead_of_empty() {
+        // 解析不出环不该安静地返回空数组——上游拿不到区别，
+        // 只能给用户一句「没返回围栏」，查不下去。
+        let v = json!({ "data": { "geoFences": [{ "id": 1, "points": [] }] } });
+        assert!(parse_fences(&v).unwrap().is_empty());
+        let diag = fence_diag(&v);
+        assert!(diag.contains("geoFences=1"));
     }
 
     #[test]
