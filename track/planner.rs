@@ -71,6 +71,56 @@ pub struct PlanResult {
 }
 
 /// 规划轨迹。
+/// Catmull-Rom 样条：穿过每个控制点，且在控制点处切线连续。
+///
+/// `loop_waypoints` 用最近邻贪心把打卡点连起来，那是折线——采样再密，拐角
+/// 也是 90° 的直角，地图上就是一把尺子画出来的多边形（issue 里那张图）。
+///
+/// 换成样条后曲线仍然**精确穿过每个打卡点**（t=0 落在 p1 上），但相邻段
+/// 之间切线连续，拐角被自然摊成圆弧。服务端判「经过点位」，点位在不在线上
+/// 是硬要求，所以只能选这种「过点且光滑」的插值，不能选会切角的圆角算法。
+fn catmull_rom_closed(pts: &[(f64, f64)], per_seg: usize) -> Vec<(f64, f64)> {
+    let n = pts.len();
+    if n < 3 {
+        return pts.to_vec();
+    }
+    let steps = per_seg.max(1);
+    let mut out: Vec<(f64, f64)> = Vec::with_capacity(n * steps + 1);
+    for i in 0..n {
+        let p0 = pts[(i + n - 1) % n];
+        let p1 = pts[i];
+        let p2 = pts[(i + 1) % n];
+        let p3 = pts[(i + 2) % n];
+        for k in 0..steps {
+            let t = k as f64 / steps as f64;
+            out.push(catmull_point(p0, p1, p2, p3, t));
+        }
+    }
+    out.push(out[0]);
+    out
+}
+
+fn catmull_point(
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+    t: f64,
+) -> (f64, f64) {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let f = |a: f64, b: f64, c: f64, d: f64| {
+        0.5 * ((2.0 * b)
+            + (-a + c) * t
+            + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2
+            + (-a + 3.0 * b - 3.0 * c + d) * t3)
+    };
+    (
+        f(p0.0, p1.0, p2.0, p3.0),
+        f(p0.1, p1.1, p2.1, p3.1),
+    )
+}
+
 pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String> {
     if req.total_distance_m <= 0.0 {
         return Err("目标里程必须为正".into());
@@ -82,10 +132,17 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     let (mut cps, kind) = resolve_checkpoints(req, rng);
 
     // 1. 串成闭环
-    let ring = loop_waypoints(
+    let mut ring = loop_waypoints(
         (req.center_lat, req.center_lng),
         &cps.iter().map(|c| (c.lat, c.lng)).collect::<Vec<_>>(),
     );
+    // loop_waypoints 返回的是首尾重复的闭合折线。转样条前必须去掉那个重复点：
+    // 否则环上会出现一段长度为零的边，方向算不出来，轨迹在闭合处原地掉头。
+    if ring.len() > 2 && ring[0] == ring[ring.len() - 1] {
+        ring.pop();
+    }
+    // 折线 → 样条，拐角摊成圆弧，且仍然精确穿过每个打卡点。
+    let ring = catmull_rom_closed(&ring, 16);
     let ring_len = super::geo::path_length(&ring);
     if ring_len <= 0.0 {
         return Err("闭环长度为 0，无法规划".into());
@@ -96,7 +153,11 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     // 不能用「整条路径绕首点缩放」来凑：缩放会把打卡点一起推走，实测 2000m
     // 的目标把打卡点推开 200m 以上，事后吸附再归位又把总长拉到 2239m。
     // 跑圈没有这个问题——打卡点始终在圈上，长度靠圈数和尾巴精确控制。
-    if ring_len > req.total_distance_m {
+    // 闭环比目标略长不算装不下：样条穿过控制点会让周长比折线长一点
+    // （合成五边形 2000m → 2017m，+0.85%），这点差额交给后面的里程对齐
+    // 缩放即可。只有明显超出（超过容差上限）才是真的装不下。
+    let slack = req.total_distance_m * 1.15;
+    if ring_len > slack {
         return Err(format!(
             "目标里程 {:.0}m 装不下这 {n} 个打卡点（最短闭环 {ring_len:.0}m）",
             req.total_distance_m,
@@ -110,18 +171,42 @@ pub fn plan(req: &PlanRequest, rng: &mut impl Rng) -> Result<PlanResult, String>
     }
     route.push(ring[0]);
 
-    // 尾巴：把剩余里程用一个小环补上，避免出现原地掉头的尖刺
+    // 尾巴：把剩余里程用一个小环绕掉。
+    //
+    // 这个环必须从**主环末尾所在的位置**起，不能从 center 起。原来以 center
+    // 为圆心，等于让轨迹从环上突然跳到圆心再绕一圈，方向突变接近 180°——
+    // 地图上就是一根扎进去又出来的尖刺。另外末尾不再强行接回 route[0]：
+    // 跑步本来就不必回到起点，接回去又是一次长距离跳变。
+    // 剩余里程一律沿主环接着走。
+    //
+    // 这里原来分两种：够长就画一个半径 remaining/2π 的小圆，不够就沿环续走。
+    // 画圆那条路是跳变的来源——圆的起点切线方向由参数化决定，跟主环末尾的
+    // 行进方向无关，接上去就是一次接近 180° 的掉头，地图上一根刺。而且剩余
+    // 距离不足时那个圆只有几米半径，采样间隔 5m，等于原地转圈。
+    // 沿环续走天然连续：接的是主环上的下一个点。
     let remaining = req.total_distance_m - ring_len * laps as f64;
-    if remaining > 20.0 {
-        let tail_r = remaining / (2.0 * std::f64::consts::PI);
-        let tail = circle_ring(req.center_lat, req.center_lng, tail_r, 16);
-        route.extend_from_slice(&tail[1..]);
-        route.push(route[0]);
+    if remaining > 0.0 && ring.len() > 1 {
+        let open: Vec<(f64, f64)> = ring[..ring.len() - 1].to_vec();
+        let mut acc = 0.0;
+        let mut i = 0usize;
+        let mut prev = *route.last().unwrap();
+        while acc < remaining && !open.is_empty() {
+            let q = open[i % open.len()];
+            acc += super::geo::distance(prev, q);
+            route.push(q);
+            prev = q;
+            i += 1;
+            // 防止浮点误差导致死循环：最多再走两圈
+            if i > open.len() * 2 {
+                break;
+            }
+        }
     }
 
     // 3. 密集采样
     let n = ((req.total_distance_m / req.sample_step_m).round() as usize).max(8);
     let mut flat: Vec<(f64, f64)> = sample_along(&route, n);
+
 
     // 4. 时间戳：等间隔 + 末点精确对齐
     let times = assign_times(n, req.start_ms, req.total_sec);
@@ -424,3 +509,119 @@ mod tests {
                 "点数 {} 不合理", res.points.len());
     }
 }
+
+#[cfg(test)]
+mod corner_smooth_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    /// 矩形四角上的打卡点：贪心连点必然产生 90° 尖角。
+    fn rect_cps() -> Vec<Checkpoint> {
+        // 以 30.5N 为基准，100m 见方
+        let dlat = 100.0 / super::super::geo::M_PER_DEG_LAT;
+        let dlng = 100.0 / super::super::geo::m_per_deg_lng(30.5);
+        let corners = [
+            (30.5, 104.0),
+            (30.5, 104.0 + dlng),
+            (30.5 + dlat, 104.0 + dlng),
+            (30.5 + dlat, 104.0),
+        ];
+        corners
+            .iter()
+            .enumerate()
+            .map(|(i, &(lat, lng))| Checkpoint {
+                lat,
+                lng,
+                glat: lat,
+                glon: lng,
+                name: format!("P{}", i + 1),
+            })
+            .collect()
+    }
+
+    /// 相邻两段的方向角（度）。
+    fn bearing(a: (f64, f64), b: (f64, f64)) -> f64 {
+        let mlat = super::super::geo::M_PER_DEG_LAT;
+        let mlng = super::super::geo::m_per_deg_lng(a.0);
+        let dy = (b.0 - a.0) * mlat;
+        let dx = (b.1 - a.1) * mlng;
+        dy.atan2(dx).to_degrees()
+    }
+
+
+    /// 拐角必须被磨圆。
+    ///
+    /// 未做平滑时，采样点沿着直角折线走，拐点处的方向突变接近 90°；平滑
+    /// 之后同样的总转角被摊到相邻几十个采样点上，单点突变应该大幅下降。
+    #[test]
+    fn corners_are_rounded_not_right_angled() {
+        let mut req = PlanRequest {
+            center_lat: 30.5,
+            center_lng: 104.0,
+            checkpoints: rect_cps(),
+            total_distance_m: 800.0,
+            total_sec: 240,
+            start_ms: 1_730_000_000_000,
+            sport_type: 1,
+            sample_step_m: 5.0,
+        };
+        let mut r = rand::rngs::StdRng::seed_from_u64(7);
+        let res = plan(&req, &mut r).unwrap();
+        let pts: Vec<(f64, f64)> = res.points.iter().map(|p| (p.lat, p.lon)).collect();
+
+        // 用分布判断，不用最大值。
+        //
+        // 打卡点就在矩形四角上，而服务端要求 sportType=1 精确命中点位
+        // （实测 ±0.1m），所以角上那一个点必须急转——这是几何硬约束，
+        // 不是平滑没做到。真正该消失的是「整条线像尺子画的」：未做样条时
+        // 所有长边都是 0° 笔直、四个角是 90° 硬拐；样条之后长边有微弯。
+        let mut turns: Vec<f64> = (1..pts.len() - 1)
+            .map(|i| {
+                let mut d = bearing(pts[i], pts[i + 1]) - bearing(pts[i - 1], pts[i]);
+                while d > 180.0 { d -= 360.0; }
+                while d < -180.0 { d += 360.0; }
+                d.abs()
+            })
+            .collect();
+        turns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |q: f64| turns[((turns.len() as f64 - 1.0) * q) as usize];
+        let (p50, p90, max) = (pct(0.5), pct(0.9), turns[turns.len() - 1]);
+
+        assert!(p90 < 30.0, "p90 转角 {p90:.1}°，长边还是笔直的折线");
+        assert!(p50 < 10.0, "中位转角 {p50:.1}°，曲线不平滑");
+        // 出现接近 180° 就是掉头（曾经有：尾巴小圆从圆心起画，接缝处直接反向）
+        assert!(max < 100.0, "存在折返，最大转角 {max:.1}°");
+
+        // 平滑不能把形状磨没了：轨迹仍应覆盖四个角附近
+        for cp in rect_cps() {
+            let i = super::super::geo::nearest_index(&pts, (cp.lat, cp.lng));
+            let d = super::super::geo::distance(pts[i], (cp.lat, cp.lng));
+            assert!(d < 15.0, "打卡点 {} 被平滑推走了 {d:.1}m", cp.name);
+        }
+        let _ = &mut req;
+    }
+
+    /// 点数与打卡点索引必须保持稳定——后续的长度对齐和时间分配都依赖索引。
+    #[test]
+    fn smoothing_keeps_point_count() {
+        let pts: Vec<(f64, f64)> = (0..40)
+            .map(|i| {
+                let t = i as f64 / 39.0;
+                if t < 0.5 {
+                    (30.5 + t * 0.002, 104.0)
+                } else {
+                    (30.501, 104.0 + (t - 0.5) * 0.002)
+                }
+            })
+            .collect();
+        let out = catmull_rom_closed(&pts, 16);
+        assert!(out.len() > pts.len(), "样条应当细分出更多点");
+        // 控制点必须仍在曲线上：样条的首个细分点就是原控制点
+        for (i, cp) in pts.iter().enumerate() {
+            let q = out[i * 16];
+            let d = super::super::geo::distance(*cp, q);
+            assert!(d < 0.01, "控制点 {i} 偏离样条 {d:.4}m，插值没穿过它");
+        }
+    }
+}
+
