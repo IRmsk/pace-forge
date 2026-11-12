@@ -1398,7 +1398,8 @@ mod live_tests {
         let s = 10.0 / 111320.0;
         let mut hit = std::collections::HashMap::new();
         for p in &pts {
-            let k = ((p.0 / s).round() as i64, (p.1 / (s * 0.68)).round() as i64);
+            let so = 10.0 / (111320.0 * p.0.to_radians().cos());
+            let k = ((p.0 / s).round() as i64, (p.1 / so).round() as i64);
             *hit.entry(k).or_insert(0) += 1;
         }
         let vis: i64 = hit.values().sum();
