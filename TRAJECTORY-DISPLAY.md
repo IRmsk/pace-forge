@@ -1,9 +1,21 @@
 # App 里的轨迹线：证据、结论、未定项
 
-> **状态：待定 —— 只剩一件事没做**（2026-11-12）
+> **状态：候选 B 已排除，差在 OBS 里某个字段**（2026-11-12 晚）
 >
-> 唯一阻塞项是「判定实验」：在 **App 详情页**点开 `1360341003` 看有没有线。
-> 两条记录、两分钟。除此之外的部分都查清了：
+> **新证据**：用户报告「别的手机跑的记录在这台手机上也能播放」。本机本地库
+> 里不可能有另一台手机的轨迹文件，所以 App **确实会从网络取**——候选 B
+> （只读本地 Room）排除了。
+>
+> 那么刷的记录播不了，就只剩「OBS 里的数据哪里不对」。已经对比过：轨迹点
+> 齐全（406 点、`flag` 全不重复且递增、坐标有效、28 字段全在），速度曲线、
+> 步频曲线、圈数据也都有。**空的只有三个**：`segment_json` 是 `[]`、
+> `extension_json` 和 `runFaceCheck` 是空串，另外 `run_data.useZip` 是 `false`
+> 但内容确实是 gzip。
+>
+> 缺真机样本做对照——账号里 20 条全是刷的。**最省事的下一步是找一条真机
+> 记录（别的手机跑的那条），把它的 rrid 发我**，下载下来逐字段比。
+>
+> 其余部分已经查清：
 >
 > - 服务端判定已修复并验证（`complete=true`，`reasonList` 五项全过）
 > - 轨迹对象确实在 OBS 里，字段分布已实测（见文末「真实轨迹对象长什么样」）
@@ -183,6 +195,43 @@ CREATE TABLE `RunData` (
   laps_json, runId, extension_json, isUploadSuccess
 )
 ```
+
+## 附：OBS 对象的结构（下载实测，2026-11-12）
+
+`/api/obs/fetch` 换签名下载回来的是一层包装，不是直接的点数组：
+
+```
+{rrid, uuid, uid, run_data, fixed_point_json, segment_json,
+ speed_json, step_freq_json, laps_json, extension_json, runFaceCheck}
+```
+
+**`run_data` 是 base64(gzip(JSON))**，解开是：
+
+```json
+{"allLocJson": "[{...406 个点...}]", "useZip": false}
+```
+
+也就是说轨迹点确实在 OBS 里，只是藏在 `run_data` 这一层里，不是顶层
+字段。详情接口回的 `allLocJson: null` 指的是**它自己不回**，不是服务端没存。
+
+各字段实测（rrid `1362680775`，2026-11-12 04:37，pace 刷的）：
+
+| 字段 | 内容 | 备注 |
+|---|---|---|
+| `run_data` | gzip，内含 406 个点 | `useZip` 字段却是 `false` |
+| `fixed_point_json` | `{"fivePointJson": "[...5 个点...]"}` | 有 `isPass/position/flag` |
+| `speed_json` | 1s 一个桶，含 distance/beginTime/endTime | 有内容 |
+| `step_freq_json` | 1s 一个桶，含 stepsNum/beginTime/endTime | 有内容 |
+| `laps_json` | 每公里一圈，含 avgCadence/avgPace/avgStride | 有内容 |
+| `segment_json` | **`[]` 空数组** | 可疑 |
+| `extension_json` | **空串** | 可疑 |
+| `runFaceCheck` | **空串** | 可疑 |
+
+轨迹点本身没问题：406 个点、`flag` 406 个互不相同且严格递增、`lat/lng`
+是真实 BD-09 坐标、28 个字段齐全。
+
+**所以现在的问题精确定位到「三个空字段 + useZip=false」**，而不是轨迹本身。
+缺真机样本做对照，账号里 20 条全是刷的。
 
 ## 附：真实轨迹对象长什么样（从 OBS 下载的实测）
 
