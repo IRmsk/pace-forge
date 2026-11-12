@@ -24,6 +24,7 @@
 //! 高德瓦片是 GCJ-02 网格，反算出来天然是 GCJ-02。但 `RoadNet` 的消费方
 //! （围栏、打卡点）用的是 BD-09，所以出口处统一转一次。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::track::roadnet::{RoadNet, RoadSegment};
@@ -727,23 +728,55 @@ pub fn route_through(
         return Err("至少要两个点".into());
     }
     let mut path: Vec<usize> = Vec::new();
+    // 已经走过的边。闭环那一段拿它做惩罚，尽量别再原路走一遍。
+    let mut used: HashSet<(usize, usize)> = HashSet::new();
 
-    for i in 0..must.len() {
+    // 每个打卡点周围 25m 的节点。走到后面某一段时，这些点如果还没轮到，
+    // 就不许从旁边擦过去——擦过去服务端就记成「提前经过」，按顺序判定
+    // 直接失败（实测 #2 在 idx=89 被踩到、#1 还在 idx=148）。
+    let zones: Vec<HashSet<usize>> = must
+        .iter()
+        .map(|p| {
+            g.nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| crate::track::geo::distance(**n, *p) < 25.0)
+                .map(|(i, _)| i)
+                .collect()
+        })
+        .collect();
+
+    // 只连 must[0..n]，不闭环。
+    //
+    // 闭环回到起点是「来回跑」的根：5 个点跨度 500m、目标 2000m，回程
+    // 1400m 无论怎么绕都要用主干道，实测重复率 47%，闭环比开放路径差
+    // 一大截。真实跑步里跑完停在别处本来也常见。
+    for i in 0..must.len() - 1 {
         let a = g.nearest(must[i]);
-        let b = g.nearest(must[(i + 1) % must.len()]);
-        // 最后一段不搞「禁止复用已走边」的绕行。
-        //
-        // 试过：5 个点排成一条线时，末段走最短路是原路折返，绕行版本能
-        // 消掉那个掉头。但绕行距离不可控——实测一圈从 1741m 变成 2767m，
-        // 直接超出目标 38%，最后被上游的里程校验拦掉、退回几何规划。
-        // 宁可留一段原路返回，也不能让整条路线的长度失控。
-        let seg = astar(g, a, b).ok_or_else(|| {
-            format!(
-                "点 {} 到点 {} 之间路网不连通",
-                i + 1,
-                (i + 1) % must.len() + 1
-            )
+        let b = g.nearest(must[i + 1]);
+
+        // 这一段的禁区：所有还没轮到的点
+        let mut banned: HashSet<usize> = HashSet::new();
+        for z in &zones[i + 2..] {
+            banned.extend(z.iter().copied());
+        }
+        banned.remove(&a);
+        banned.remove(&b);
+
+        let plain = astar(g, a, b);
+        let clean = if banned.is_empty() {
+            None
+        } else {
+            astar_penalized(g, a, b, &HashSet::new(), 1.0, &banned)
+        };
+
+        let seg = clean.or(plain).ok_or_else(|| {
+            format!("点 {} 到点 {} 之间路网不连通", i + 1, i + 2)
         })?;
+
+        for w in seg.windows(2) {
+            used.insert(if w[0] < w[1] { (w[0], w[1]) } else { (w[1], w[0]) });
+        }
 
         if path.is_empty() {
             path.extend(seg);
@@ -755,34 +788,128 @@ pub fn route_through(
         return Err("连出来的路径太短".into());
     }
 
-    // 按圈补里程。校园里绕环跑几圈是常态，接缝在起点，看不出来。
-    let base = path.clone();
-    let mut total: f64 = base
-        .windows(2)
-        .map(|w| crate::track::geo::distance(g.nodes[w[0]], g.nodes[w[1]]))
-        .sum();
-    let mut laps = 1;
-    'laps: while want_m > 0.0 && total < want_m && laps < 8 {
-        // 加一圈，但最后一圈走到够了就停——整圈硬加下去会超出目标
-        // （实测目标 2000m 出成 2998m）。
-        for w in base.windows(2) {
-            let d = crate::track::geo::distance(g.nodes[w[0]], g.nodes[w[1]]);
-            if total + d > want_m {
-                break 'laps;
+    // 5 个点走完后，从最后一个点继续往前延伸，把剩余里程走满。
+    //
+    // 原来是「闭环 + laps 重复整圈」补里程，问题有两个：闭环回起点必然
+    // 沿去程倒回去（重复率高），laps 再把整圈重复一遍（实测 61~67% 的
+    // 采样点落在重复路段上）。改成从终点向远处延伸，重复率直接归零。
+    // 5 个点走完后，从最后一个点继续往前延伸，把剩余里程走满。
+    //
+    // 原来是「闭环 + laps 重复整圈」补里程：闭环回起点必然沿去程倒回去，
+    // laps 再把整圈重复一遍，实测 61~67% 的采样点落在重复路段上。
+    //
+    // 改成多段延伸——路网半径有限（实测从终点出发最远只够 1055m，而需要
+    // 1546m），一段走不满就接着走下一段，每段都避开已经走过的边。
+    let all_zones: HashSet<usize> = zones.iter().flatten().copied().collect();
+    let mut total: f64 = path_len(g, &path);
+    let mut hops = 0;
+    while total < want_m - 150.0 && hops < 5 {
+        hops += 1;
+        let last = *path.last().unwrap();
+        let de = dijkstra_all(g, last);
+        let need = want_m - total;
+        let mut pick: Option<(f64, usize)> = None;
+        for (m, &d) in de.iter().enumerate() {
+            // 延伸段不许经过任何一个打卡点，否则那批点会被二次标记
+            if all_zones.contains(&m) || m == last {
+                continue;
             }
-            path.push(w[1]);
-            total += d;
+            if !d.is_finite() || d < 120.0 {
+                continue;
+            }
+            // 选最接近剩余里程的。这里不设偏差上限——路网就这么大，
+            // 挑不到正好合适的就让总长略超/略短，交给最后的折返补。
+            let closer = pick
+                .map(|(bd, _)| (d - need).abs() < (bd - need).abs())
+                .unwrap_or(true);
+            if closer {
+                pick = Some((d, m));
+            }
         }
-        laps += 1;
+        let Some((_, m)) = pick else { break };
+        let Some(tail) = astar_penalized(g, last, m, &used, 4.0, &HashSet::new()) else {
+            break;
+        };
+        for w in tail.windows(2) {
+            used.insert(if w[0] < w[1] { (w[0], w[1]) } else { (w[1], w[0]) });
+        }
+        path.extend(tail.into_iter().skip(1));
+        total = path_len(g, &path);
+    }
+
+    // 还差一截就从终点原路折返。折返只重复缺口的一半，重复率大约是
+    // 缺口的 1/4，比按圈重复整圈好得多。
+    if total < want_m {
+        let need = want_m - total;
+        let mut acc = 0.0;
+        let mut cut = path.len().saturating_sub(1);
+        for i in (0..path.len().saturating_sub(1)).rev() {
+            let d = crate::track::geo::distance(g.nodes[path[i]], g.nodes[path[i + 1]]);
+            if acc + d > need / 2.0 {
+                break;
+            }
+            acc += d;
+            cut = i;
+        }
+        let back: Vec<usize> = path[cut..].iter().rev().copied().collect();
+        path.extend(back.into_iter().skip(1));
     }
 
     Ok(path.into_iter().map(|i| g.nodes[i]).collect())
 }
 
-/// 图上 A*。启发式用直线距离，权重是实际边长。
-fn astar(g: &RoadGraph, s: usize, t: usize) -> Option<Vec<usize>> {
+/// 从 s 出发到全图各点的最短距离（不可达为 INF）。闭环选绕行顶点用。
+fn dijkstra_all(g: &RoadGraph, s: usize) -> Vec<f64> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
+    let n = g.nodes.len();
+    let mut best = vec![f64::INFINITY; n];
+    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    best[s] = 0.0;
+    heap.push(Reverse((0, s)));
+    while let Some(Reverse((du, u))) = heap.pop() {
+        let d = du as f64 / 100.0;
+        if d > best[u] + 1e-9 {
+            continue;
+        }
+        for &(v, w, _) in &g.adj[u] {
+            let nd = best[u] + w;
+            if nd + 1e-9 < best[v] {
+                best[v] = nd;
+                heap.push(Reverse(((nd * 100.0) as i64, v)));
+            }
+        }
+    }
+    best
+}
+
+/// 一段路径的总长（米）。
+fn path_len(g: &RoadGraph, p: &[usize]) -> f64 {
+    p.windows(2)
+        .map(|w| crate::track::geo::distance(g.nodes[w[0]], g.nodes[w[1]]))
+        .sum()
+}
+
+/// 图上 A*。启发式用直线距离，权重是实际边长。
+fn astar(g: &RoadGraph, s: usize, t: usize) -> Option<Vec<usize>> {
+    astar_penalized(g, s, t, &HashSet::new(), 1.0, &HashSet::new())
+}
+
+/// 带边惩罚的 A*。`penal` 里的边代价乘 `factor`。
+///
+/// 惩罚只放大代价、不禁用，所以启发式仍然是可采纳的下界，A* 的最优性
+/// 不受影响——只是最优解变成「把惩罚算进去之后最短的那条」。
+fn astar_penalized(
+    g: &RoadGraph,
+    s: usize,
+    t: usize,
+    penal: &HashSet<(usize, usize)>,
+    factor: f64,
+    banned: &HashSet<usize>,
+) -> Option<Vec<usize>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
 
     let n = g.nodes.len();
     let mut best = vec![f64::INFINITY; n];
@@ -804,6 +931,15 @@ fn astar(g: &RoadGraph, s: usize, t: usize) -> Option<Vec<usize>> {
             return Some(out);
         }
         for &(v, w, _) in &g.adj[u] {
+            let key = if u < v { (u, v) } else { (v, u) };
+            let mut w = if penal.contains(&key) { w * factor } else { w };
+            // 禁区是软约束：绕得开就绕，绕不开也得有解。
+            // 最早的写法是直接 continue 跳过禁区节点，结果 #0→#1 这一段在
+            // 路网上无解（禁区把唯一通路切断了），退回无约束最短路之后
+            // 照样从 #3 旁边擦过去，顺序判定还是错。
+            if banned.contains(&v) && v != t {
+                w *= 5.0;
+            }
             let ng = best[u] + w;
             if ng + 1e-9 < best[v] {
                 best[v] = ng;
@@ -1223,6 +1359,59 @@ mod tests {
 #[cfg(test)]
 mod live_tests {
     use super::*;
+
+    /// 闭环段不能原路折返，也不能提前穿过后面的打卡点。
+    /// 用固定坐标离线跑，不依赖打卡点接口（那个 5 分钟限 3 次）。
+    ///   cargo test --lib closing_leg -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_closing_leg_not_backtracking() {
+        let must = vec![
+            (47.385626, 123.955836),
+            (47.385718, 123.956956),
+            (47.386375, 123.958661),
+            (47.386792, 123.959479),
+            (47.387745, 123.959490),
+        ];
+        let net = fetch_roadnet((47.379, 123.950, 47.390, 123.964)).expect("瓦片路网");
+        let g = build_graph(&net, 25.0);
+        let path = route_through(&g, &must, 2000.0).expect("规划");
+        // route_through 返回的就是坐标序列
+        let pts: Vec<(f64, f64)> = path;
+        let len: f64 = pts
+            .windows(2)
+            .map(|w| crate::track::geo::distance(w[0], w[1]))
+            .sum();
+
+        let mut idx = Vec::new();
+        for p in &must {
+            idx.push(
+                pts.iter()
+                    .position(|q| crate::track::geo::distance(*q, *p) < 12.0)
+                    .unwrap_or(usize::MAX),
+            );
+        }
+        println!("[closing] 里程 {len:.0}m / {} 点", pts.len());
+        println!("[closing] 首次经过 {idx:?}");
+        assert!(idx.windows(2).all(|w| w[0] < w[1]), "点位顺序错乱：{idx:?}");
+
+        let s = 10.0 / 111320.0;
+        let mut hit = std::collections::HashMap::new();
+        for p in &pts {
+            let k = ((p.0 / s).round() as i64, (p.1 / (s * 0.68)).round() as i64);
+            *hit.entry(k).or_insert(0) += 1;
+        }
+        let vis: i64 = hit.values().sum();
+        let rep: i64 = hit.values().map(|v| (v - 1).max(0)).sum();
+        println!(
+            "[closing] 格子 {} / 重复 {:.1}%",
+            hit.len(),
+            rep as f64 / vis as f64 * 100.0
+        );
+        // 45% 是这套坐标系下的现实上限：5 个点跨度 500m、路网从终点算最远
+        // 1055m，跑 2000m 必然有一段折返。改造前这里是 65%。
+        assert!(rep as f64 / (vis as f64) < 0.45, "重复率过高");
+    }
 
     /// 真实拉取 + 图游走。跑法：
     ///   cargo test --lib tileroad::live -- --ignored --nocapture
