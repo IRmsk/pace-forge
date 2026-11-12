@@ -122,6 +122,79 @@ fn try_route_on_roads(
     }
 }
 
+/// 第二级路网来源：高德瓦片。
+///
+/// OSM 在国内校园基本是空白，`try_route_on_roads` 十有八九降级到几何规划。
+/// 但这类学校在地图 App 上是有路的——服务端用的就是高德底图，同一套瓦片
+/// 直接可见。这里把瓦片截图里的白色路面提成路网，再走同一个沿路规划器。
+///
+/// 与 OSM 那条路的区别只有数据来源；产出同样是 `FenceRoute`，下游不用
+/// 区分。质量门槛也照搬：拼接跳变超过 50m 就放弃，宁可退回几何规划。
+fn try_route_on_tiles(
+    fence: &[(f64, f64)],
+    must: &[(f64, f64)],
+    want_m: f64,
+    seed: u64,
+    log: &mut dyn FnMut(&str),
+) -> Option<crate::track::fence_route::FenceRoute> {
+    use crate::track::{roadnet, tileroad};
+    let bbox = roadnet::bbox_of(fence, 60.0);
+    let net = match tileroad::fetch_roadnet(bbox) {
+        Ok(n) => n,
+        Err(e) => {
+            log(&format!("[tiles] 瓦片路网没拿到（{e}）"));
+            return None;
+        }
+    };
+    let clipped = net.clip_to_fence(fence);
+    let total = clipped.total_length_m();
+    if clipped.is_empty() || total < 300.0 {
+        log(&format!(
+            "[tiles] 瓦片上只有 {total:.0}m 可用道路，改走几何规划"
+        ));
+        return None;
+    }
+    log(&format!("[tiles] {}", net.source));
+    log(&format!("[tiles] 围栏内路网 {total:.0}m，按瓦片道路规划"));
+
+    let start = must.first().copied().unwrap_or(fence[0]);
+    // 碎片化路网不能用 route_on_roads 的「跳段」模型，改成图上走
+    let mut graph = tileroad::build_graph(&clipped, 25.0);
+    match tileroad::walk_graph(&mut graph, start, must, want_m, seed) {
+        Ok(points) => {
+            let max_gap = points
+                .windows(2)
+                .map(|w| crate::track::geo::distance(w[0], w[1]))
+                .fold(0.0f64, f64::max);
+            let length_m = points
+                .windows(2)
+                .map(|w| crate::track::geo::distance(w[0], w[1]))
+                .sum::<f64>();
+            if max_gap > 50.0 {
+                log(&format!("[tiles] 走出 {max_gap:.0}m 的跳变，改用几何规划"));
+                return None;
+            }
+            // 里程差太多说明图不连通，硬用会被服务端判里程不符
+            if (length_m - want_m).abs() / want_m > 0.25 {
+                log(&format!(
+                    "[tiles] 图上只走出 {length_m:.0}m（目标 {want_m:.0}m），图不连通，改用几何规划"
+                ));
+                return None;
+            }
+            log(&format!("[tiles] 沿瓦片道路 {length_m:.0}m（目标 {want_m:.0}m）"));
+            Some(crate::track::fence_route::FenceRoute {
+                points,
+                length_m,
+                lines: 1,
+            })
+        }
+        Err(e) => {
+            log(&format!("[tiles] 图上走不通（{e}）"));
+            None
+        }
+    }
+}
+
 impl RunParams {
     /// 统一校验。CLI、Web、库调用都必须走这里。
     ///
@@ -589,8 +662,13 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             v
         };
 
+        // 路网来源两级：OSM 优先（有真实道路等级和拓扑），拿不到再试高德
+        // 瓦片。两级都失败才退回几何规划。
         let on_roads = if p.prefer_roads {
-            try_route_on_roads(&fence_ring, &must, p.distance_m, seed, &mut *log)
+            match try_route_on_roads(&fence_ring, &must, p.distance_m, seed, &mut *log) {
+                Some(r) => Some(r),
+                None => try_route_on_tiles(&fence_ring, &must, p.distance_m, seed, &mut *log),
+            }
         } else {
             None
         };
@@ -624,14 +702,33 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             log("[track] 没有打卡点，沿围栏内缩 25m 跑");
             crate::track::fence_route::route_along_fence(&fence_ring, p.distance_m, 25.0, &must)?
         };
-        // 沿边界是贴着围墙的折线，拐角磨圆 + 轻微摆动，别像尺子画的
-        let rounded = crate::track::fence_route::round_corners(&route.points, 20.0, 6);
-        let wandered = crate::track::fence_route::add_wander(
-            &rounded,
-            6.0,
-            120.0,
-            if p.seed != 0 { p.seed } else { start_ms as u64 },
-        );
+        // 沿边界是贴着围墙的稀疏折线，拐角磨圆 + 轻微摆动，别像尺子画的。
+        //
+        // 但沿路网生成的路径本身就是密集点（瓦片图游走平均 1.2m 一个点），
+        // 再跑圆角会把每个点都当成拐角，点数爆炸、长度翻倍（实测 2000m
+        // 被拉成 4098m）。按平均间距判断：够密就说明本来就贴着真实道路，
+        // 什么都不用做。
+        let avg_step = if route.points.is_empty() {
+            f64::MAX
+        } else {
+            route.length_m / route.points.len() as f64
+        };
+        let dense = avg_step < 10.0;
+        let rounded = if dense {
+            route.points.clone()
+        } else {
+            crate::track::fence_route::round_corners(&route.points, 20.0, 6)
+        };
+        let wandered = if dense {
+            rounded
+        } else {
+            crate::track::fence_route::add_wander(
+                &rounded,
+                6.0,
+                120.0,
+                if p.seed != 0 { p.seed } else { start_ms as u64 },
+            )
+        };
         // 建筑避让放在摆动之后：add_wander 会把点横推 ±6m，先避让再摆动
         // 等于白做。这里逐点推出楼体 + 逐段插贴边绕行，外扩 3m 当作墙根。
         let wandered = if blockers.is_empty() {

@@ -6,6 +6,7 @@ pub mod buckets;
 pub mod detect;
 pub mod fence_route;
 pub mod roadnet;
+pub mod tileroad;
 pub mod biomech;
 pub mod kinematics;
 pub mod preflight;

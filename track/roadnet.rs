@@ -542,6 +542,22 @@ pub fn route_on_roads(
     want_m: f64,
     seed: u64,
 ) -> Result<RoadRoute, String> {
+    route_on_roads_with(net, start_hint, must, want_m, seed, 250.0)
+}
+
+/// 同上，但能指定「相邻两段之间允许多大的断开」。
+///
+/// OSM 的段是完整 way，端点未必严格相接，250m 的宽容度能多串一些路；
+/// 而瓦片路网是像素骨架提出的碎片，只保留真正连通的段——宽容度给大了
+/// 就会跨着空地跳，`route_on_roads` 输出过 119m 的瞬移。
+pub fn route_on_roads_with(
+    net: &RoadNet,
+    start_hint: (f64, f64),
+    must: &[(f64, f64)],
+    want_m: f64,
+    seed: u64,
+    max_hop_m: f64,
+) -> Result<RoadRoute, String> {
     if net.is_empty() {
         return Err("路网为空".into());
     }
@@ -621,7 +637,7 @@ pub fn route_on_roads(
         } else {
             seg.points.clone()
         };
-        if distance(cur, pts[0]) > 250.0 {
+        if distance(cur, pts[0]) > max_hop_m {
             // 断开太远，标记这段已用，换下一段
             used[idx] = true;
             legs += 1;
