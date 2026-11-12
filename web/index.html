@@ -296,6 +296,20 @@ button.danger:disabled{opacity:.5}
         <button id="drawUse">用这条轨迹</button>
         <span id="drawInfo" class="hint" style="margin-left:8px"></span>
       </div>
+      <div id="locWrap" style="flex-basis:100%;display:flex;gap:8px;align-items:flex-end;
+           flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid #1b2430">
+        <label style="margin:0">纬度<input id="llLat" type="number" step="0.000001" placeholder="留空用围栏" style="width:118px"></label>
+        <label style="margin:0">经度<input id="llLng" type="number" step="0.000001" placeholder="留空用围栏" style="width:118px"></label>
+        <label style="margin:0">坐标来自<select id="llCoord">
+          <option value="gcj02">高德 / 腾讯</option>
+          <option value="bd09">百度</option>
+          <option value="wgs84">GPS 原始</option>
+        </select></label>
+        <button id="llPick" class="ghost" type="button">在地图上点选</button>
+        <button id="llClear" class="ghost" type="button">清空</button>
+        <span id="llInfo" class="hint"></span>
+      </div>
+
       <div id="blockWrap" style="flex-basis:100%;margin-top:6px">
         <button id="blockStart" class="ghost">标注禁区（画楼）</button>
         <button id="blockUndo" class="ghost">撤销上一块</button>
@@ -480,6 +494,7 @@ $('planBtn').onclick = async () => {
         mode: $('rMode').value, lane: parseInt($('rLane').value, 10) || 1,
         runMode: parseInt($('rRunMode').value, 10) || 1,
         startAtMs: (st ? st.startMs : undefined),
+        ...locBody(),
         customPath: $('rMode').value === 'draw'
           ? (() => { const m = useDrawing(); return m && m.length >= 2 ? m : undefined; })()
           : undefined
@@ -594,6 +609,7 @@ $('runBtn').onclick = async () => {
         mode: $('rMode').value,
         lane: parseInt($('rLane').value, 10) || 1,
         startAtMs: (st ? st.startMs : undefined),
+        ...locBody(),
         // 手绘模式把坐标带上；后端按 WGS84 解析并转 BD-09
         customPath: $('rMode').value === 'draw'
           ? (() => {
@@ -919,6 +935,70 @@ function initMap() {
 }
 
 
+/* ---------- 校区定位（围栏拿不到时手动指定） ----------
+ * 服务端围栏接口对部分学校是空的，没有中心点就规划不了。这里让人自己
+ * 说校门在哪儿：手输，或者直接在地图上点一下。
+ *
+ * 这一带的底图是高德瓦片，Leaflet 的 latlng 数值就是 GCJ-02，所以点选
+ * 出来的坐标标成 GCJ-02，交给后端统一转 BD-09。
+ */
+let pickMode = false;
+let locMarker = null;
+
+function readLocInputs() {
+  const lat = parseFloat($('llLat').value);
+  const lng = parseFloat($('llLng').value);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  if (Math.abs(lat) < 1e-9 && Math.abs(lng) < 1e-9) return null;
+  return { lat: lat, lng: lng, coord: $('llCoord').value };
+}
+
+// 只把有值的字段塞进请求体；留空时后端照旧走围栏
+function locBody() {
+  const v = readLocInputs();
+  return v ? { lat: v.lat, lng: v.lng, coord: v.coord } : {};
+}
+
+function setPickMode(on) {
+  pickMode = !!on;
+  $('llPick').textContent = pickMode ? '点地图上的位置…' : '在地图上点选';
+  if (map) map.getContainer().style.cursor = pickMode ? 'crosshair' : '';
+  // 和手绘、禁区互斥：一次点击不能被两个模式抢
+  if (pickMode && drawMode) setDrawMode(false);
+  if (pickMode && blockMode) setBlockMode(false);
+}
+
+function setPickLocation(lat, lng, fromMap) {
+  $('llLat').value = lat.toFixed(6);
+  $('llLng').value = lng.toFixed(6);
+  if (fromMap) $('llCoord').value = 'gcj02';
+  if (map) {
+    if (locMarker) map.removeLayer(locMarker);
+    locMarker = L.circleMarker([lat, lng], {
+      radius: 8, color: '#f5b942', fillColor: '#f5b942', fillOpacity: .5, weight: 2,
+    }).addTo(map).bindTooltip('校区中心');
+  }
+  $('llInfo').textContent = fromMap ? '已取到地图点（GCJ-02），提交时自动换算' : '';
+}
+
+function clearLoc() {
+  $('llLat').value = '';
+  $('llLng').value = '';
+  if (locMarker && map) { map.removeLayer(locMarker); locMarker = null; }
+  $('llInfo').textContent = '已清空，改回用围栏中心';
+}
+
+function initLoc() {
+  $('llPick').onclick = () => setPickMode(!pickMode);
+  $('llClear').onclick = clearLoc;
+  // 手改数字就当是手动输入，别留着地图点的痕迹误导
+  ['llLat', 'llLng', 'llCoord'].forEach(id => {
+    $(id).oninput = () => { $('llInfo').textContent = ''; };
+    $(id).onchange = () => { $('llInfo').textContent = ''; };
+  });
+}
+
 /* ---------- 手绘轨迹 ---------- */
 
 // 手绘状态。strokes 是若干条独立笔画，用户可能分几次画完整个圈。
@@ -1105,6 +1185,13 @@ function initDrawing() {
   };
 
   el.addEventListener('pointerdown', ev => {
+    if (pickMode) {
+      ev.preventDefault();
+      const ll = toLatLng(ev);
+      setPickLocation(ll.lat, ll.lng, true);
+      setPickMode(false);
+      return;
+    }
     if (blockMode) {
       ev.preventDefault();
       blockStart = toLatLng(ev);
@@ -1172,6 +1259,8 @@ function initDrawing() {
     $('drawInfo').textContent =
       `已采用 ${(strokesLength() / 1000).toFixed(2)} km，点“生成轨迹”或直接提交`;
   };
+
+  initLoc();
 }
 
 /* ---------- 记录列表 ---------- */

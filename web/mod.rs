@@ -468,6 +468,26 @@ fn handle_login(request: tiny_http::Request, state: Shared, body: &Value) -> Res
 ///
 /// 这一步能验证轨迹几何、分桶、签名是否合规，但**不会**真的提交——
 /// 真实提交需要先拿服务端的规则/围栏/打卡点，且要过静默期。
+/// 把用户在界面上填的中心点统一转成 BD-09。
+///
+/// 服务端的围栏、打卡点，以及规划器内部的几何全是 BD-09；前端地图用的
+/// 却是高德瓦片（GCJ-02 网格）。所以外部坐标进规划器之前必须先落到
+/// BD-09，否则整条轨迹会整体平移 400~600 米，看起来「跑了但点全错」。
+fn input_to_bd09(lat: f64, lng: f64, sys: &str) -> Result<(f64, f64), String> {
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+        return Err(format!("经纬度超出范围: ({lat}, {lng})"));
+    }
+    if lat.abs() < 1e-9 && lng.abs() < 1e-9 {
+        return Err("(0, 0) 不是有效位置；请填校区经纬度，或点「在地图上点选」".into());
+    }
+    Ok(match sys {
+        "wgs84" => crate::api::coord::wgs84_to_bd09(lat, lng),
+        "bd09" => (lat, lng),
+        // 默认按 GCJ-02：国内能复制到的坐标九成来自高德/腾讯
+        _ => crate::api::coord::gcj02_to_bd09(lat, lng),
+    })
+}
+
 fn handle_plan(
     request: tiny_http::Request,
     state: Shared,
@@ -483,28 +503,45 @@ fn handle_plan(
         .filter(|v| *v > 0)
         .map(|v| v as i32);
     let sport_type = body["sportType"].as_i64().unwrap_or(1) as i32;
-    let mut lat = body["lat"].as_f64().unwrap_or(0.0);
-    let mut lng = body["lng"].as_f64().unwrap_or(0.0);
     let run_mode = body["runMode"].as_i64().unwrap_or(1);
     let start_at_ms = body["startAtMs"].as_i64().filter(|v| *v > 0);
 
-    // 没传坐标就用围栏中心，别用写死的成都坐标
-    if lat == 0.0 || lng == 0.0 {
-        let st = state.lock().map_err(|e| e.to_string())?;
-        if let Some(client) = st.client() {
-            if let Ok(fs) = crate::api::fence::fetch_fences(client) {
-                if let Some(f) = fs.first() {
-                    if !f.ring.is_empty() {
-                        let n = f.ring.len() as f64;
-                        let sum = f.ring.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
-                        lat = sum.0 / n;
-                        lng = sum.1 / n;
-                    }
+    // 中心点：请求里给的坐标 → 围栏环心 → 明确报错。
+    //
+    // 这里原来兜底 `(30.5, 104.0)`（成都）。校区在齐齐哈尔，围栏一旦拉不到
+    // 就规划出一条跨省轨迹，用户看到的是「能生成、但点全错」。兜底坐标不该
+    // 出现在业务路径上——报错比假轨迹有用。
+    //
+    // 顺带修掉上一版的问题：原来持着 state 锁调 fetch_fences 做网络请求，
+    // 会把 /api/accounts 之类的请求全部堵住，页面看起来像卡死。
+    let coord_sys = body["coord"].as_str().unwrap_or("gcj02");
+    let (lat, lng) = match (body["lat"].as_f64(), body["lng"].as_f64()) {
+        (Some(a), Some(b)) => match input_to_bd09(a, b, coord_sys) {
+            Ok(c) => c,
+            Err(e) => return json_err(request, &e),
+        },
+        _ => {
+            let client = {
+                let st = state.lock().map_err(|e| e.to_string())?;
+                st.client().cloned()
+            };
+            let Some(client) = client else {
+                return json_err(
+                    request,
+                    "未登录时必须在表单里填写校区经纬度，否则不知道往哪儿规划",
+                );
+            };
+            match crate::api::fence::fetch_fences(&client) {
+                Ok(fs) => {
+                    let ring = &fs[0].ring;
+                    let n = ring.len() as f64;
+                    let s = ring.iter().fold((0.0, 0.0), |a, q| (a.0 + q.0, a.1 + q.1));
+                    (s.0 / n, s.1 / n)
                 }
+                Err(e) => return json_err(request, &format!("无法确定校区位置: {e}")),
             }
         }
-        if lat == 0.0 { lat = 30.5; lng = 104.0; }
-    }
+    };
 
     if distance_km <= 0.0 || distance_km > 42.0 {
         return json_err(request, "距离需在 0~42 公里之间");
@@ -1495,8 +1532,12 @@ fn handle_run(
     //
     // 兜底坐标不该出现在业务路径上：拿不到真实位置就明确报错，别静默
     // 生成一条荒唐轨迹——错误信息比一条假轨迹有用。
+    let coord_sys = body["coord"].as_str().unwrap_or("gcj02");
     let (clat, clng) = match (lat, lng) {
-        (Some(a), Some(b)) => (a, b),
+        (Some(a), Some(b)) => match input_to_bd09(a, b, coord_sys) {
+            Ok(c) => c,
+            Err(e) => return json_err(request, &e),
+        },
         _ => match crate::api::fence::fetch_fences(&client) {
             // fetch_fences 只在解析出至少一个成环围栏时才返回 Ok，
             // 每个 Fence 的 ring 都 >= 3 个点，所以直接取首个围栏的
@@ -1840,5 +1881,55 @@ mod device_scope_tests {
         for _ in 0..3 {
             assert_eq!(device_scope("13900000000"), device_scope("13900000000"));
         }
+    }
+}
+
+#[cfg(test)]
+mod center_input_tests {
+    use super::input_to_bd09;
+    use crate::track::geo::distance;
+
+    /// 三个坐标系喂同一个地点，转成 BD-09 后彼此相差几百米——这正是
+    /// 不转换的代价。若哪天有人把转换删了，这条会立刻炸。
+    #[test]
+    fn each_coord_system_lands_somewhere_different() {
+        let (lat, lng) = (47.3864, 123.9586);
+        let gcj = input_to_bd09(lat, lng, "gcj02").unwrap();
+        let wgs = input_to_bd09(lat, lng, "wgs84").unwrap();
+        let bd = input_to_bd09(lat, lng, "bd09").unwrap();
+
+        // bd09 原样透传
+        assert_eq!(bd, (lat, lng));
+
+        // BD-09 相对 GCJ-02 的偏移随纬度变化（经度方向被 cos(lat) 压缩，
+        // 这个纬度上实测 855m），所以只断言量级，不断言具体值。
+        let d_gcj = distance((lat, lng), gcj);
+        assert!(d_gcj > 100.0 && d_gcj < 1500.0, "gcj02→bd09 偏移异常: {d_gcj}m");
+
+        // WGS-84 多叠一层，和 GCJ-02 的结果必须真的不一样——两者若被
+        // 当成同一套处理，说明转换链有一环没接上。
+        let d_wgs = distance((lat, lng), wgs);
+        assert!(d_wgs > 100.0 && d_wgs < 2000.0, "wgs84→bd09 偏移异常: {d_wgs}m");
+        assert!(
+            (d_wgs - d_gcj).abs() > 50.0,
+            "两套转换结果几乎重合，可能有一层没生效: {d_wgs}m vs {d_gcj}m"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_center() {
+        // (0,0) 是几内亚湾，不是任何一所学校
+        assert!(input_to_bd09(0.0, 0.0, "gcj02").is_err());
+        assert!(input_to_bd09(91.0, 123.0, "gcj02").is_err());
+        assert!(input_to_bd09(47.0, 181.0, "gcj02").is_err());
+        assert!(input_to_bd09(-91.0, 0.0, "wgs84").is_err());
+    }
+
+    #[test]
+    fn unknown_system_falls_back_to_gcj02() {
+        // 前端下拉以外的值不该让整个请求炸掉，按最常见的 GCJ-02 处理
+        let a = input_to_bd09(47.3864, 123.9586, "whatever").unwrap();
+        let b = input_to_bd09(47.3864, 123.9586, "gcj02").unwrap();
+        assert_eq!(a, b);
     }
 }
