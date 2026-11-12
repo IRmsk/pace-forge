@@ -191,6 +191,9 @@ button.mini:disabled{opacity:.35}
 button.danger{background:#dc2626;border-color:#dc2626;color:#fff}
 button.danger:hover{background:#b91c1c}
 button.danger:disabled{opacity:.5}
+button.primary{background:#238636;border-color:#2ea043;color:#fff}
+button.primary:hover{background:#2ea043}
+button.primary:disabled{opacity:.5}
 </style>
 </head>
 <body>
@@ -305,6 +308,7 @@ button.danger:disabled{opacity:.5}
           <option value="bd09">百度</option>
           <option value="wgs84">GPS 原始</option>
         </select></label>
+        <button id="llGo" class="primary" type="button">定位</button>
         <button id="llPick" class="ghost" type="button">在地图上点选</button>
         <button id="llClear" class="ghost" type="button">清空</button>
         <span id="llInfo" class="hint"></span>
@@ -679,6 +683,19 @@ function drawPreview(coords, fence, checkpoints) {
     }
   }
 
+  // 用户手填的中心点单独标出来。
+  //
+  // 规划器会往打卡点靠，所以轨迹中心常常离填的坐标有几百米。只画轨迹的话
+  // 用户会觉得「坐标没生效」——把锚点也画上，一眼就能看出是「锚点在这、
+  // 轨迹在那」，而不是「我的输入被忽略了」。
+  const anchor = readLocInputs();
+  if (anchor) {
+    const ag = toGcj02(anchor.lat, anchor.lng, anchor.coord);
+    group.addLayer(L.circleMarker(ag, {
+      radius: 9, color: '#a855f7', fillColor: '#a855f7', fillOpacity: .35, weight: 3,
+    }).bindPopup('你指定的中心点（' + anchor.coord.toUpperCase() + ' 数值）'));
+  }
+
   previewLayer = group.addTo(map);
   try {
     const b = group.getBounds();
@@ -909,7 +926,10 @@ function initMap() {
   // 关键：高德瓦片是按 GCJ-02 网格切的，Leaflet 会把传进去的经纬度直接
   // 当作瓦片坐标算 z/x/y。所以喂给 Leaflet 的必须是 GCJ-02——点位用
   // gcjLat/gcjLng，手绘出来的也是 GCJ-02，不能混用 BD-09。
-  map = L.map('map', { zoomControl: true }).setView([47.3842, 123.9583], 16);
+  // 初始视野不能钉死任何一所学校。这里原来写的是开发时那所校区的坐标，
+  // 别人一打开就看到自己没去过的城市。先给全国范围，登录后由
+  // fitToAccountArea() 按真实围栏自动缩到本校。
+  map = L.map('map', { zoomControl: true }).setView([34.5, 108.9], 4);
 
   const roadMap = L.tileLayer(
     'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',
@@ -932,6 +952,35 @@ function initMap() {
   layer = L.layerGroup().addTo(map);
   initDrawing();
   initBlockers();
+  // 定位控件单独初始化：原先挂在 initDrawing 末尾，而 initDrawing 开头有
+  // `map.__drawBound` 守卫，一旦地图被重复初始化就再也不执行，「定位」按钮
+  // 的点击处理器根本没绑上，点了毫无反应。
+  initLoc();
+  fitToAccountArea();
+}
+
+// 把视野挪到当前账号真实所在的校区。
+//
+// 没有围栏的学校（issue #2 那种 geoFences=null）拿不到边界，这时保持全国
+// 视图不动——宁可不缩放，也不要猜一个坐标。
+async function fitToAccountArea() {
+  try {
+    const r = await api('/api/fences');
+    const fences = r.fences || [];
+    if (!fences.length || !map) return;
+    const g = L.featureGroup();
+    let added = 0;
+    for (const f of fences) {
+      if (!f.ring || f.ring.length < 3) continue;
+      g.addLayer(L.polygon(f.ring, { opacity: 0, fillOpacity: 0 }));
+      added++;
+    }
+    if (!added) return;
+    const b = g.getBounds();
+    if (b.isValid()) map.fitBounds(b, { padding: [40, 40] });
+  } catch (e) {
+    // 没登录或接口异常都走这里，保持全国视图即可
+  }
 }
 
 
@@ -989,14 +1038,144 @@ function clearLoc() {
   $('llInfo').textContent = '已清空，改回用围栏中心';
 }
 
+// 把输入框里的坐标同步到地图：画标记 + 把视野移过去。
+// 少了这一步，用户填完坐标看地图还是原来那片区域，会以为没生效。
+/* ---------- 坐标系换算（与 api/coord.rs 同一套公式） ----------
+ * 地图用的是高德瓦片，Leaflet 的 latlng 必须按 GCJ-02 网格解释。用户在
+ * 下拉里选百度（BD-09）或 GPS 原始（WGS-84）时，直接把数字丢给 setView
+ * 会跳到偏几百米的地方——看着像「没跳到我说的地方」。所以先换算再定位。
+ */
+const COORD_PI = Math.PI;
+const COORD_A = 6378245.0;
+const COORD_EE = 0.00669342162296594323;
+const COORD_X_PI = Math.PI * 3000.0 / 180.0;
+
+function _outOfChina(lat, lng) {
+  return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271;
+}
+function _tLat(x, y) {
+  let r = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x));
+  r += (20.0 * Math.sin(6.0 * x * COORD_PI) + 20.0 * Math.sin(2.0 * x * COORD_PI)) * 2.0 / 3.0;
+  r += (20.0 * Math.sin(y * COORD_PI) + 40.0 * Math.sin(y / 3.0 * COORD_PI)) * 2.0 / 3.0;
+  r += (160.0 * Math.sin(y / 12.0 * COORD_PI) + 320 * Math.sin(y * COORD_PI / 30.0)) * 2.0 / 3.0;
+  return r;
+}
+function _tLng(x, y) {
+  let r = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x));
+  r += (20.0 * Math.sin(6.0 * x * COORD_PI) + 20.0 * Math.sin(2.0 * x * COORD_PI)) * 2.0 / 3.0;
+  r += (20.0 * Math.sin(x * COORD_PI) + 40.0 * Math.sin(x / 3.0 * COORD_PI)) * 2.0 / 3.0;
+  r += (150.0 * Math.sin(x / 12.0 * COORD_PI) + 300.0 * Math.sin(x / 30.0 * COORD_PI)) * 2.0 / 3.0;
+  return r;
+}
+function wgs84ToGcj02(lat, lng) {
+  if (_outOfChina(lat, lng)) return [lat, lng];
+  let dLat = _tLat(lng - 105.0, lat - 35.0);
+  let dLng = _tLng(lng - 105.0, lat - 35.0);
+  const radLat = lat / 180.0 * COORD_PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - COORD_EE * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = (dLat * 180.0) / ((COORD_A * (1 - COORD_EE)) / (magic * sqrtMagic) * COORD_PI);
+  dLng = (dLng * 180.0) / (COORD_A / sqrtMagic * Math.cos(radLat) * COORD_PI);
+  return [lat + dLat, lng + dLng];
+}
+function gcj02ToBd09(lat, lng) {
+  const z = Math.sqrt(lng * lng + lat * lat) + 0.00002 * Math.sin(lat * COORD_X_PI);
+  const t = Math.atan2(lat, lng) + 0.000003 * Math.cos(lng * COORD_X_PI);
+  return [z * Math.sin(t) + 0.006, z * Math.cos(t) + 0.0065];
+}
+function bd09ToGcj02(lat, lng) {
+  const x = lng - 0.0065, y = lat - 0.006;
+  const z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * COORD_X_PI);
+  const t = Math.atan2(y, x) - 0.000003 * Math.cos(x * COORD_X_PI);
+  return [z * Math.sin(t), z * Math.cos(t)];
+}
+
+// 任意坐标系 → GCJ-02（地图能直接定位的那套）
+function toGcj02(lat, lng, sys) {
+  if (sys === 'bd09') return bd09ToGcj02(lat, lng);
+  if (sys === 'wgs84') return wgs84ToGcj02(lat, lng);
+  return [lat, lng];
+}
+
+function syncLocToMap() {
+  if (!map) return;
+  const v = readLocInputs();
+  if (!v) {
+    if (locMarker) { map.removeLayer(locMarker); locMarker = null; }
+    $('llInfo').textContent = '';
+    return;
+  }
+  // 换算到 GCJ-02 再定位：地图是高德瓦片，数值必须按 GCJ-02 解释
+  try {
+    const g = toGcj02(v.lat, v.lng, v.coord);
+    if (locMarker) map.removeLayer(locMarker);
+    locMarker = L.circleMarker(g, {
+      radius: 8, color: '#f5b942', fillColor: '#f5b942', fillOpacity: .5, weight: 2,
+    }).addTo(map).bindTooltip('校区中心');
+    // 容器显示出来之前尺寸是 0，setView 会算错中心，先让它重新量一次
+    map.invalidateSize();
+    // 已经放大得比 15 级更近就别缩回去，避免每次都把手动缩放重置
+    const z = Math.max(map.getZoom() || 15, 15);
+    map.setView(g, z);
+    $('llInfo').textContent = v.coord === 'gcj02'
+      ? '已定位到 ' + g[0].toFixed(5) + ', ' + g[1].toFixed(5)
+      : '已定位到 ' + g[0].toFixed(5) + ', ' + g[1].toFixed(5) +
+        '（' + v.coord.toUpperCase() + ' 已换算到高德底图）';
+  } catch (e) {
+    $('llInfo').textContent = '定位失败：' + e.message;
+  }
+}
+
+let locSyncTimer = null;
+
 function initLoc() {
+  if (!map || map.__locBound) return;
+  map.__locBound = true;
+
+  // 明确的「定位」：填完数字点一下，地图立刻跳过去。
+  // 防抖那套是打字时顺手跟着动，但用户要的是一个确定的动作，
+  // 点下去必须立刻有反应，不能等 500 毫秒。
+  $('llGo').onclick = () => {
+    const v = readLocInputs();
+    if (!v) {
+      $('llInfo').textContent = '纬度和经度都要填，范围别越界';
+      return;
+    }
+    syncLocToMap();
+  };
   $('llPick').onclick = () => setPickMode(!pickMode);
   $('llClear').onclick = clearLoc;
-  // 手改数字就当是手动输入，别留着地图点的痕迹误导
-  ['llLat', 'llLng', 'llCoord'].forEach(id => {
-    $(id).oninput = () => { $('llInfo').textContent = ''; };
-    $(id).onchange = () => { $('llInfo').textContent = ''; };
+
+  // 打字过程中不要每敲一位就跳一次地图，停下来再同步
+  ['llLat', 'llLng'].forEach(id => {
+    $(id).oninput = () => {
+      $('llInfo').textContent = '';
+      clearTimeout(locSyncTimer);
+      locSyncTimer = setTimeout(syncLocToMap, 500);
+    };
+    // 回车等同点「定位」，输完直接敲回车最顺手
+    $(id).onkeydown = ev => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        clearTimeout(locSyncTimer);
+        $('llGo').click();
+      }
+    };
   });
+  $('llCoord').onchange = () => syncLocToMap();
+
+  // 点选改走 Leaflet 的 click：它自己区分了「拖动地图」和「点一下」，
+  // 比在 pointerdown 上抢事件可靠——拖动结束时的 pointerdown 会被误判成点选。
+  map.on('click', ev => {
+    if (!pickMode) return;
+    setPickLocation(ev.latlng.lat, ev.latlng.lng, true);
+    setPickMode(false);
+  });
+
+  // 绑定成功留个可见痕迹：看不到这句说明控件没初始化，别去猜别的原因
+  const info = $('llInfo');
+  if (info && !info.textContent) info.textContent = '填经纬度后点「定位」';
 }
 
 /* ---------- 手绘轨迹 ---------- */
@@ -1185,13 +1364,6 @@ function initDrawing() {
   };
 
   el.addEventListener('pointerdown', ev => {
-    if (pickMode) {
-      ev.preventDefault();
-      const ll = toLatLng(ev);
-      setPickLocation(ll.lat, ll.lng, true);
-      setPickMode(false);
-      return;
-    }
     if (blockMode) {
       ev.preventDefault();
       blockStart = toLatLng(ev);
@@ -1259,8 +1431,6 @@ function initDrawing() {
     $('drawInfo').textContent =
       `已采用 ${(strokesLength() / 1000).toFixed(2)} km，点“生成轨迹”或直接提交`;
   };
-
-  initLoc();
 }
 
 /* ---------- 记录列表 ---------- */
