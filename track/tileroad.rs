@@ -423,7 +423,10 @@ fn trace_lines(bits: &[bool], w: usize, h: usize) -> Vec<Vec<(usize, usize)>> {
                     None => break,
                 }
             }
-            if path.len() >= 3 {
+            // 太短的段是细化留下的毛刺，保留下来会在轨迹里制造尖刺。
+            // 阈值不能太大：8 px（约 11m）会把路口之间的小连接段一起删掉，
+            // 图就直接碎成孤岛（实测游走只踩到 67 个节点）。
+            if path.len() >= 5 {
                 lines.push(path);
             }
         }
@@ -704,6 +707,212 @@ fn merge_segments(mut segs: Vec<RoadSegment>, tol_m: f64) -> Vec<RoadSegment> {
 
 // ------------------------------------------------------------------ 图游走
 
+/// 沿路网把打卡点按顺序连起来（A* 最短路），输出全程贴路的轨迹。
+///
+/// 为什么不用贪心游走：游走走到死胡同要 `pop` 回退，回退之后往往又从同一条
+/// 边走出去，路径里出现 A→B→A 的重复。那就是轨迹里那些 180° 的尖刺，也会
+/// 让里程虚高（声明的 2001m 空间上只展开 1338m）。
+///
+/// A* 最短路天然不会来回走：每一步都在靠近目标。点与点之间的连接都是真实
+/// 道路，串起来就是一条能跑的路。
+///
+/// 里程不足 `want_m` 时不硬凑——`totalDis` 报的是实测值，服务端按实测校验，
+/// 差一点没关系。
+pub fn route_through(
+    g: &RoadGraph,
+    must: &[(f64, f64)],
+    want_m: f64,
+) -> Result<Vec<(f64, f64)>, String> {
+    if must.len() < 2 {
+        return Err("至少要两个点".into());
+    }
+    let mut path: Vec<usize> = Vec::new();
+    let mut used_edges: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    for i in 0..must.len() {
+        let a = g.nearest(must[i]);
+        let b = g.nearest(must[(i + 1) % must.len()]);
+        let last = i + 1 == must.len();
+        // 最后一段（回到起点）优先走没走过的路。
+        //
+        // 几个打卡点常常排成一条线，最后一段如果也走最短路，就是原路折返——
+        // 轨迹里出现一条 180° 的掉头，真人跑步不会这么走。先试绕行，实在
+        // 没有第二条路再退回原路。
+        let seg = if last && !used_edges.is_empty() {
+            astar_avoiding(g, a, b, Some(&used_edges))
+                .or_else(|| astar(g, a, b))
+        } else {
+            astar(g, a, b)
+        }
+        .ok_or_else(|| {
+            format!(
+                "点 {} 到点 {} 之间路网不连通",
+                i + 1,
+                (i + 1) % must.len() + 1
+            )
+        })?;
+
+        for w in seg.windows(2) {
+            if let Some((_, _, e)) = g.adj[w[0]]
+                .iter()
+                .find(|(n, _, _)| *n == w[1])
+            {
+                used_edges.insert(*e);
+            }
+        }
+
+        if path.is_empty() {
+            path.extend(seg);
+        } else {
+            path.extend(seg.into_iter().skip(1));
+        }
+    }
+    if path.len() < 3 {
+        return Err("连出来的路径太短".into());
+    }
+
+    // 按圈补里程。校园里绕环跑几圈是常态，接缝在起点，看不出来。
+    let base = path.clone();
+    let mut total: f64 = base
+        .windows(2)
+        .map(|w| crate::track::geo::distance(g.nodes[w[0]], g.nodes[w[1]]))
+        .sum();
+    let mut laps = 1;
+    'laps: while want_m > 0.0 && total < want_m && laps < 8 {
+        // 加一圈，但最后一圈走到够了就停——整圈硬加下去会超出目标
+        // （实测目标 2000m 出成 2998m）。
+        for w in base.windows(2) {
+            let d = crate::track::geo::distance(g.nodes[w[0]], g.nodes[w[1]]);
+            if total + d > want_m {
+                break 'laps;
+            }
+            path.push(w[1]);
+            total += d;
+        }
+        laps += 1;
+    }
+
+    Ok(path.into_iter().map(|i| g.nodes[i]).collect())
+}
+
+/// 带禁用边的 A*：`avoid` 里的边不许走。
+fn astar_avoiding(
+    g: &RoadGraph,
+    s: usize,
+    t: usize,
+    avoid: Option<&std::collections::HashSet<usize>>,
+) -> Option<Vec<usize>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = g.nodes.len();
+    let mut best = vec![f64::INFINITY; n];
+    let mut came = vec![usize::MAX; n];
+    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    let h = |i: usize| crate::track::geo::distance(g.nodes[i], g.nodes[t]);
+    best[s] = 0.0;
+    heap.push(Reverse(((h(s) * 100.0) as i64, s)));
+
+    while let Some(Reverse((_, u))) = heap.pop() {
+        if u == t {
+            let mut out = vec![t];
+            let mut c = t;
+            while came[c] != usize::MAX {
+                c = came[c];
+                out.push(c);
+            }
+            out.reverse();
+            return Some(out);
+        }
+        for &(v, w, e) in &g.adj[u] {
+            if let Some(set) = avoid {
+                if set.contains(&e) {
+                    continue;
+                }
+            }
+            let ng = best[u] + w;
+            if ng + 1e-9 < best[v] {
+                best[v] = ng;
+                came[v] = u;
+                heap.push(Reverse((((ng + h(v)) * 100.0) as i64, v)));
+            }
+        }
+    }
+    None
+}
+
+/// 图上 A*。启发式用直线距离，权重是实际边长。
+fn astar(g: &RoadGraph, s: usize, t: usize) -> Option<Vec<usize>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = g.nodes.len();
+    let mut best = vec![f64::INFINITY; n];
+    let mut came = vec![usize::MAX; n];
+    let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
+    let h = |i: usize| crate::track::geo::distance(g.nodes[i], g.nodes[t]);
+    best[s] = 0.0;
+    heap.push(Reverse(((h(s) * 100.0) as i64, s)));
+
+    while let Some(Reverse((_, u))) = heap.pop() {
+        if u == t {
+            let mut out = vec![t];
+            let mut c = t;
+            while came[c] != usize::MAX {
+                c = came[c];
+                out.push(c);
+            }
+            out.reverse();
+            return Some(out);
+        }
+        for &(v, w, _) in &g.adj[u] {
+            let ng = best[u] + w;
+            if ng + 1e-9 < best[v] {
+                best[v] = ng;
+                came[v] = u;
+                heap.push(Reverse((((ng + h(v)) * 100.0) as i64, v)));
+            }
+        }
+    }
+    None
+}
+
+/// 把沿路路径磨圆 + 轻微摆动，别像尺子画的。
+///
+/// 瓦片路网的骨架是**直线段**：一条街就是一串严格共线的点，拐弯是直角。
+/// 直接拿去当跑步轨迹有两个毛病——拐角太硬，沿路又太直，一看就是程序
+/// 生成的。
+///
+/// 分两步：
+///   1. 保端点的 1-2-1 加权平均，把直角摊成圆弧
+///   2. `add_wander` 按弧长加小幅横向摆动（真人跑步本来就有左右晃）
+///
+/// 幅度都压在路宽以内（合计 6~7m），偏移太多就会跑到路外面去。
+/// 打卡点由下游的 `resample_with_checkpoints` 再钉一次。
+pub fn soften(points: &[(f64, f64)], passes: usize, amp_m: f64, seed: u64) -> Vec<(f64, f64)> {
+    if points.len() < 4 {
+        return points.to_vec();
+    }
+    let n = points.len();
+    let mut cur = points.to_vec();
+    for _ in 0..passes {
+        let mut next = cur.clone();
+        // 首尾各留两个点不动：起点/终点要精确，另外平滑边界会因为
+        // 缺少邻居而向外偏
+        for i in 2..n - 2 {
+            next[i] = (
+                (cur[i - 1].0 + 2.0 * cur[i].0 + cur[i + 1].0) / 4.0,
+                (cur[i - 1].1 + 2.0 * cur[i].1 + cur[i + 1].1) / 4.0,
+            );
+        }
+        cur = next;
+    }
+    if amp_m > 0.0 {
+        cur = crate::track::fence_route::add_wander(&cur, amp_m, 45.0, seed);
+    }
+    cur
+}
+
 /// 把线段集合焊成一张可走的图。
 ///
 /// `route_on_roads` 那套「每段只用一次、用完跳到最近的段」的模型是为 OSM
@@ -908,40 +1117,56 @@ pub fn walk_graph(
             })
             .copied();
 
-        let mut best: Option<(usize, f64, usize, f64)> = None; // (邻居, 边长, 边号, 评分)
-        for &(nb, w, e) in &g.adj[cur] {
-            // 马上原路返回：除非没有别的出口，否则不走
-            if Some(e) == came_edge && g.adj[cur].len() > 1 {
-                continue;
-            }
-            // 走过的边不禁止，只加惩罚。
-            //
-            // 早先是直接 `continue` 跳过，结果走完一个连通分量就再也动不了
-            // （实测目标 2000m 只走出 891m）。路网本来就是网状，回头路是
-            // 常态，禁掉等于把图砍成一条线。
-            let penalty = if g.edge_used[e] { 400.0 } else { 0.0 };
-            // 朝向目标的边优先
-            let base = match goal {
-                Some(t) => {
-                    let before = crate::track::geo::distance(g.nodes[cur], t);
-                    let after = crate::track::geo::distance(g.nodes[nb], t);
-                    if after < before {
-                        -500.0 + w
-                    } else {
-                        w + 200.0
-                    }
+        // 分两轮挑：第一轮只走「还有别的出口」的节点，第二轮才允许进死胡同。
+        //
+        // 骨架图的枝杈末端是度 1 的点，走进去必然要原路退出来——这一进一出
+        // 就是轨迹里那个 180° 的掉头。先走主干和环，末梢留到最后。
+        let mut chosen: Option<(usize, f64, usize)> = None;
+        for pass in 0..2 {
+            let mut best: Option<(usize, f64, f64)> = None; // (邻居, 边长, 评分)
+            for &(nb, w, e) in &g.adj[cur] {
+                if pass == 0 && g.adj[nb].len() <= 1 {
+                    continue;
                 }
-                None => w,
-            };
-            let jitter = (next_rand() % 1000) as f64 / 1000.0;
-            let score = base + penalty + jitter * 0.5;
-            if best.map(|b| score < b.3).unwrap_or(true) {
-                best = Some((nb, w, e, score));
+                // 马上原路返回：除非没有别的出口，否则不走
+                if Some(e) == came_edge && g.adj[cur].len() > 1 {
+                    continue;
+                }
+                // 走过的边不禁止，只加惩罚。路网本来就是网状，回头路是常态，
+                // 禁掉等于把图砍成一条线（实测目标 2000m 只走出 891m）。
+                let penalty = if g.edge_used[e] { 400.0 } else { 0.0 };
+                let base = match goal {
+                    Some(t) => {
+                        let before = crate::track::geo::distance(g.nodes[cur], t);
+                        let after = crate::track::geo::distance(g.nodes[nb], t);
+                        if after < before {
+                            -500.0 + w
+                        } else {
+                            w + 200.0
+                        }
+                    }
+                    None => w,
+                };
+                let jitter = (next_rand() % 1000) as f64 / 1000.0;
+                let score = base + penalty + jitter * 0.5;
+                if best.map(|b| score < b.2).unwrap_or(true) {
+                    best = Some((nb, w, score));
+                }
+            }
+            if let Some((nb, w, _)) = best {
+                // 找回对应的边号
+                let e = g.adj[cur]
+                    .iter()
+                    .find(|(n, _, _)| *n == nb)
+                    .map(|(_, _, e)| *e)
+                    .unwrap_or(0);
+                chosen = Some((nb, w, e));
+                break;
             }
         }
 
-        match best {
-            Some((nb, w, e, _)) => {
+        match chosen {
+            Some((nb, w, e)) => {
                 g.edge_used[e] = true;
                 came_edge = Some(e);
                 cur = nb;
@@ -953,8 +1178,7 @@ pub fn walk_graph(
                 // 死胡同：回退一步，把刚走过的边标成可复用。
                 //
                 // 回退的那一步必须从 total 里扣掉——它是原地倒退，不是跑步
-                // 前进。早先没扣，里程虚高让游走提前收工（目标 2000m 实测
-                // 只跑出 1719m）。
+                // 前进。早先没扣，里程虚高让游走提前收工。
                 if path.len() >= 2 {
                     let prev = path[path.len() - 2];
                     let back = crate::track::geo::distance(g.nodes[cur], g.nodes[prev]);
@@ -972,6 +1196,7 @@ pub fn walk_graph(
             }
         }
     }
+
 
     if path.len() < 3 {
         return Err("图上游走失败，没走出路径".into());
@@ -1129,4 +1354,61 @@ mod live_tests {
         }
         assert_eq!(hit, 5, "只跑到 {hit}/5 个打卡点");
     }
+
+    /// 磨圆前后的转角分布对比，并导出图像供人工核对。
+    #[test]
+    #[ignore]
+    fn live_soften_shape() {
+        let bbox = (47.3796, 123.9514, 47.3888, 123.9631);
+        let net = fetch_roadnet(bbox).expect("拉取失败");
+        let cps = [
+            (47.385626, 123.955836),
+            (47.385718, 123.956956),
+            (47.386375, 123.958661),
+            (47.386792, 123.959479),
+            (47.387745, 123.959490),
+        ];
+        let g = build_graph(&net, 25.0);
+        let raw = route_through(&g, &cps, 2000.0).expect("连点失败");
+
+        let stat = |name: &str, pts: &[(f64, f64)]| {
+            let mut t: Vec<f64> = Vec::new();
+            for i in 1..pts.len() - 1 {
+                let b = |a: (f64, f64), c: (f64, f64)| {
+                    let ml = 111320.0;
+                    let mlng = ml * a.0.to_radians().cos();
+                    ((c.0 - a.0) * ml).atan2((c.1 - a.1) * mlng).to_degrees()
+                };
+                let mut d = b(pts[i], pts[i + 1]) - b(pts[i - 1], pts[i]);
+                while d > 180.0 { d -= 360.0; }
+                while d < -180.0 { d += 360.0; }
+                t.push(d.abs());
+            }
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |q: f64| t[((t.len() as f64 - 1.0) * q) as usize];
+            let len: f64 = pts.windows(2).map(|w| crate::track::geo::distance(w[0], w[1])).sum();
+            println!(
+                "{name}: {} 点 / {:.0}m | 中位 {:.1}° p90 {:.1}° p99 {:.1}° 最大 {:.1}°",
+                pts.len(), len, pct(0.5), pct(0.9), pct(0.99), t[t.len() - 1]
+            );
+        };
+        stat("原始骨架 ", &raw);
+        let soft = soften(&raw, 3, 1.2, 20261112);
+        stat("磨圆+摆动", &soft);
+
+        // 打卡点必须还在附近
+        for (i, cp) in cps.iter().enumerate() {
+            let d = soft.iter().map(|p| crate::track::geo::distance(*p, *cp)).fold(f64::INFINITY, f64::min);
+            println!("  打卡点 #{} 最近 {:.1} m", i + 1, d);
+        }
+
+        // 导出坐标给外部画图
+        let dump = |pts: &[(f64, f64)]| -> String {
+            pts.iter().map(|p| format!("{:.7},{:.7}", p.0, p.1)).collect::<Vec<_>>().join(";")
+        };
+        let _ = std::fs::write("/tmp/shape_raw.txt", dump(&raw));
+        let _ = std::fs::write("/tmp/shape_soft.txt", dump(&soft));
+        println!("已导出 /tmp/shape_raw.txt 与 /tmp/shape_soft.txt");
+    }
+
 }

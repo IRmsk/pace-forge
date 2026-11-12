@@ -158,9 +158,12 @@ fn try_route_on_tiles(
     log(&format!("[tiles] 围栏内路网 {total:.0}m，按瓦片道路规划"));
 
     let start = must.first().copied().unwrap_or(fence[0]);
-    // 碎片化路网不能用 route_on_roads 的「跳段」模型，改成图上走
-    let mut graph = tileroad::build_graph(&clipped, 25.0);
-    match tileroad::walk_graph(&mut graph, start, must, want_m, seed) {
+    // 碎片化路网不能用 route_on_roads 的「跳段」模型，也不能用贪心游走
+    // （会来回走同一条边，制造 180° 尖刺）。按打卡点顺序跑 A* 最短路。
+    let graph = tileroad::build_graph(&clipped, 25.0);
+    let _ = start;
+    let _ = seed;
+    match tileroad::route_through(&graph, must, want_m) {
         Ok(points) => {
             let max_gap = points
                 .windows(2)
@@ -720,7 +723,14 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             crate::track::fence_route::round_corners(&route.points, 20.0, 6)
         };
         let wandered = if dense {
-            rounded
+            // 沿路的骨架是直线段，光跳过圆角会显得又硬又直。磨圆 + 微摆动，
+            // 幅度压在路宽以内。
+            crate::track::tileroad::soften(
+                &rounded,
+                6,
+                1.2,
+                if p.seed != 0 { p.seed } else { start_ms as u64 },
+            )
         } else {
             crate::track::fence_route::add_wander(
                 &rounded,
