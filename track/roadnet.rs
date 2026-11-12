@@ -33,6 +33,10 @@ pub struct RoadNet {
     pub segments: Vec<RoadSegment>,
     /// 数据来源描述，用于日志。
     pub source: String,
+    /// 道路栅格（只有瓦片来源才有）。段间连边用它校验两点之间的直线
+    /// 是不是真的贴着路面——不加这一步，两条路各自贴着楼的两侧、节点
+    /// 相距 12m 内就被连上，A* 会直接从楼中间穿过去。
+    pub mask: Option<crate::track::tileroad::Mask>,
 }
 
 impl RoadNet {
@@ -66,6 +70,7 @@ impl RoadNet {
         }
         RoadNet {
             source: format!("{} · 围栏内 {} 段", self.source, segments.len()),
+            mask: self.mask.clone(),
             segments,
         }
     }
@@ -167,6 +172,7 @@ pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
 
     let net = RoadNet {
         source: format!("OSM/Overpass · {} 段", segments.len()),
+        mask: None,
         segments,
     };
     cache_put(bbox, &net);
@@ -220,6 +226,7 @@ fn cache_get(bbox: (f64, f64, f64, f64)) -> Option<RoadNet> {
     }
     Some(RoadNet {
         source: format!("本地缓存 · {} 段", segments.len()),
+        mask: None,
         segments,
     })
 }
@@ -746,7 +753,7 @@ mod tests {
                 .collect(),
             kind: "path".into(),
         });
-        RoadNet { segments: segs, source: "test".into() }
+        RoadNet { segments: segs, source: "test".into(), mask: None }
     }
 
     #[test]

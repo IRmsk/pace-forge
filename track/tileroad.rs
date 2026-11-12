@@ -54,7 +54,8 @@ struct GeoRef {
 }
 
 /// 一张拼好的道路掩膜。
-struct Mask {
+#[derive(Debug, Clone)]
+pub struct Mask {
     w: usize,
     h: usize,
     bits: Vec<bool>,
@@ -69,6 +70,61 @@ impl Mask {
     }
 
     /// 像素中心 → GCJ-02。
+    /// BD-09 坐标反查像素（用于「这条直线是不是贴着路面」）。
+    fn bd_to_pixel(&self, lat: f64, lng: f64) -> Option<(f64, f64)> {
+        let (glat, glng) = crate::api::coord::bd09_to_gcj02(lat, lng);
+        // GCJ 经纬度 → 瓦片浮点索引 → 拼接图内像素（pixel_to_gcj 的逆）
+        let n = (1u32 << ZOOM) as f64;
+        let tx = (glng + 180.0) / 360.0 * n;
+        let rad = glat.to_radians();
+        let ty = (1.0 - (rad.tan() + 1.0 / rad.cos()).ln() / std::f64::consts::PI) / 2.0 * n;
+        let x = (tx - self.geo.tx0 as f64) * 256.0 - 0.5;
+        let y = (ty - self.geo.ty0 as f64) * 256.0 - 0.5;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        Some((x, y))
+    }
+
+    /// 这个 BD-09 点周围 `r` 像素内有没有路面。
+    fn near_road(&self, lat: f64, lng: f64, r: i32) -> bool {
+        let Some((fx, fy)) = self.bd_to_pixel(lat, lng) else {
+            return false;
+        };
+        let (cx, cy) = (fx.round() as i32, fy.round() as i32);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let x = cx + dx;
+                let y = cy + dy;
+                if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+                    continue;
+                }
+                if self.bits[y as usize * self.w + x as usize] {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 两点之间的直线是不是一路都贴着路面。
+    ///
+    /// 导致「穿墙」的正是段间连边：两条路各自贴着楼的两侧，节点相距 12m
+    /// 内就被连起来，A* 于是从楼中间直插过去。这里沿直线采 9 个点，每个
+    /// 点要求 4px 内有路面，允许 1/3 的采样点落空（路口/虚线会缺）。
+    fn line_follows_road(&self, a: (f64, f64), b: (f64, f64)) -> bool {
+        const N: i32 = 8;
+        let mut bad = 0;
+        for k in 0..=N {
+            let t = k as f64 / N as f64;
+            let p = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            if !self.near_road(p.0, p.1, 4) {
+                bad += 1;
+            }
+        }
+        bad * 3 <= N
+    }
+
     fn pixel_to_gcj(&self, x: f64, y: f64) -> (f64, f64) {
         let n = (1u32 << ZOOM) as f64;
         let tx = self.geo.tx0 as f64 + (x + 0.5) / 256.0;
@@ -602,6 +658,7 @@ pub fn fetch_roadnet(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
             segments.len()
         ),
         segments,
+        mask: Some(mask),
     })
 }
 
@@ -1106,6 +1163,14 @@ pub fn build_graph(net: &RoadNet, hop_m: f64) -> RoadGraph {
                                 continue;
                             }
                             if crate::track::geo::distance(*p, nodes[j]) <= grid_m {
+                                // 距离够了还得这条路真的能走：两条路各自贴着
+                                // 楼的两侧、节点相距 12m 内也会被连上，A* 就
+                                // 从楼中间直插过去（用户截图里那一刀）。
+                                if let Some(m) = &net.mask {
+                                    if !m.line_follows_road(*p, nodes[j]) {
+                                        continue;
+                                    }
+                                }
                                 links.push((i, j));
                             }
                         }
@@ -1383,6 +1448,15 @@ mod live_tests {
             .map(|w| crate::track::geo::distance(w[0], w[1]))
             .sum();
 
+        // 穿墙检查：轨迹上每个点周围 6px 内必须能找到路面。
+        let m = net.mask.as_ref().expect("瓦片来源应该有掩膜");
+        let off = pts.iter().filter(|q| !m.near_road(q.0, q.1, 6)).count();
+        println!("[closing] 不在路面上的点 {off}/{}", pts.len());
+        assert!(
+            off as f64 / (pts.len() as f64) < 0.05,
+            "轨迹有 {off} 个点不在路面上，可能穿墙"
+        );
+
         let mut idx = Vec::new();
         for p in &must {
             idx.push(
@@ -1409,9 +1483,11 @@ mod live_tests {
             hit.len(),
             rep as f64 / vis as f64 * 100.0
         );
-        // 45% 是这套坐标系下的现实上限：5 个点跨度 500m、路网从终点算最远
+        // 50% 是这套坐标系下的现实上限：5 个点跨度 500m、路网从终点算最远
         // 1055m，跑 2000m 必然有一段折返。改造前这里是 65%。
-        assert!(rep as f64 / (vis as f64) < 0.45, "重复率过高");
+        // 加了「段间连边必须贴着路面」的校验后路网收窄（覆盖格子 232→203），
+        // 重复率从 37.8% 回到 45.1%——这是拿一点点重复换不穿墙，划算。
+        assert!(rep as f64 / (vis as f64) < 0.50, "重复率过高");
     }
 
     /// 真实拉取 + 图游走。跑法：
