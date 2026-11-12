@@ -121,7 +121,7 @@ fn main() {
         "help" | "-h" | "--help" => {
             println!("pace-forge {} — 运动世界校园协议工具\n", pace_forge::VERSION);
             println!("用法:");
-            println!("  pace-forge web [addr]          启动 Web 控制台（默认 127.0.0.1:9998）");
+            println!("  pace-forge web [addr]          启动 Web 控制台（默认 127.0.0.1:9999）");
             println!("  pace-forge semester            查学期进度（记分跑）");
             println!("  pace-forge run [km] [min] [-y] 刷跑并提交（-y 跳过确认）");
             println!("  pace-forge check [km] [min]    离线体检轨迹（不联网、不登录）");

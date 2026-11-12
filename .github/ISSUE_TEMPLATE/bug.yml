@@ -21,7 +21,6 @@ body:
       options:
         - Web 控制台（浏览器）
         - CLI（命令行）
-        - Android APK
     validations:
       required: true
 
