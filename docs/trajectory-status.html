@@ -9,6 +9,14 @@
 <span style="font-size:13px;color:#6b7280;">判定实验未做，全文不给"App 会不会画线"的结论</span>
 </div>
 
+<div style="background:#fff;border:1px solid #e7e9e6;border-left:3px solid #0f766e;border-radius:6px;padding:11px 13px;margin-bottom:18px;font-size:13px;line-height:1.75;color:#5b6472;">
+<div style="font-weight:700;color:#1a1d21;margin-bottom:6px;">除了这两分钟，别的都查清了</div>
+<div>· 服务端判定已修：<span style="font-family:ui-monospace,Consolas,monospace;color:#0f766e;">complete=true</span>，<span style="font-family:ui-monospace,Consolas,monospace;color:#0f766e;">reasonList</span> 五项全过</div>
+<div>· 轨迹确实在 OBS 里，425 点，字段分布已实测</div>
+<div>· 真实记录的 <span style="font-family:ui-monospace,Consolas,monospace;">flag</span> 全同、<span style="font-family:ui-monospace,Consolas,monospace;">bdA</span> 恒 1.0、<span style="font-family:ui-monospace,Consolas,monospace;">bdD</span> 恒 0.0、<span style="font-family:ui-monospace,Consolas,monospace;">bdS</span> 恒 1.0 —— 比本工具生成的还"假"。<b style="color:#b42318;">所以「调字段让线出来」这条路是死的</b>，字段不是变量</div>
+<div>· 往 App 本地库写记录的七条路径全部走不通（无 root、无 mock location、无 import 入口）</div>
+</div>
+
 <div style="font-size:15px;font-weight:700;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #e7e9e6;">判定实验：两条记录，两分钟</div>
 
 <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
