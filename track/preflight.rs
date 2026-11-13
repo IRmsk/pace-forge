@@ -116,6 +116,12 @@ pub struct Check<'a> {
     /// 原来这里硬编码 [100, 230]，而服务端实发 60~250。拿着一把更窄的
     /// 假尺子量自己，会误拦合法步频，也放过了真正越界的区间。
     pub step_range: Option<(i64, i64)>,
+    /// 本次配置的上报间隔（秒），`None` 按真机的 [`SAMPLE_INTERVAL_SEC`] 算。
+    ///
+    /// 这是 `SAMPLE_RATE` 那条检查的**期望值**：采样器跑出来的中位间隔
+    /// 必须贴着它。注意这里比的是「采样器有没有实现错」，不是「配置对不对」；
+    /// 配置本身偏离真机只报警告（`SAMPLE_RATE_DEVICE`）。
+    pub expected_interval_sec: Option<f64>,
 }
 
 /// 执行全部检查。
@@ -287,6 +293,53 @@ pub fn inspect(c: &Check) -> Report {
         }
     }
 
+    // ── 五之二、上报采样节奏 ──
+    //
+    // 这条检查以前只写在文档和注释里（「硬判定在 preflight 的 SAMPLE_RATE」），
+    // 代码里根本没有——于是把 `sample_interval_sec` 配错、或者采样器把拐角
+    // 点插爆，本地全绿、上线才发现节奏不对。现在把它写成真的：
+    //
+    // - 采样器坏了（中位间隔偏离期望值 >30%，或出现真机没有的 1~2 秒间隔）→ Fatal；
+    // - 配置本身偏离真机（间隔不在 4~6 秒）→ 只警告，不拦。
+    //
+    // `expected_interval_sec` 为 `None` 时整段跳过：调用方没交代配置，
+    // 拿 5 秒去量一条刻意做密的合成轨迹只会误报。生产路径（`flow::dry_run`
+    // 与 `web`）都显式传了 `Some(params.sample_interval_sec)`。
+    if let Some(expect) = c.expected_interval_sec.filter(|_| c.points.len() >= 3) {
+        let mut dts: Vec<f64> = c
+            .points
+            .windows(2)
+            .map(|w| (w[1].time_ms - w[0].time_ms) as f64 / 1000.0)
+            .collect();
+        dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = dts.get(dts.len() / 2).copied().unwrap_or(0.0);
+        if expect > 0.0 && (median - expect).abs() > expect * 0.3 {
+            issues.push(Issue::fatal(
+                "SAMPLE_RATE",
+                format!("上报间隔中位数 {median:.2}s，与配置的 {expect:.2}s 相差超过 30%（采样器实现有偏差）"),
+            ));
+        }
+        // 真机的 ΔtotalTime 只出现 0/3/4/5 秒，1~2 秒一次都没有。
+        // 期望间隔本身 ≥4 秒时还冒出 <3 秒的间隔，就是采样轴出了问题
+        // （典型来源：拐角补点按弧长切时切出 1 秒）。
+        if expect >= 4.0 {
+            if let Some(min) = dts.first().copied() {
+                if min < 3.0 {
+                    issues.push(Issue::fatal(
+                        "SAMPLE_RATE_SHORT",
+                        format!("出现 {min:.1}s 的上报间隔，真机最短非零间隔是 3s（→ 采样轴插点过密）"),
+                    ));
+                }
+            }
+        }
+        if !(4.0..=6.0).contains(&expect) {
+            issues.push(Issue::warn(
+                "SAMPLE_RATE_DEVICE",
+                format!("上报间隔配置为 {expect:.2}s，已偏离真机的 5 秒/点，服务端按 ΔtotalTime 分布即可分辨"),
+            ));
+        }
+    }
+
     // ── 六、物理合理性 ──
     let avg_v = c.total_distance_m as f64 / c.total_time_sec.max(1) as f64;
     // 配速：分/公里
@@ -396,6 +449,94 @@ mod tests {
         (t.points, sim, sp)
     }
 
+    /// `SAMPLE_RATE` 必须是**真的在拦**。
+    ///
+    /// 这条规则的注释从第一版就写着「硬判定在 preflight 的 SAMPLE_RATE」，
+    /// 而代码里一直没有它——于是采样轴跑偏（真机 5 秒/点，跑成 2 秒/点）
+    /// 本地全绿。这组测试把三种情形钉死。
+    #[test]
+    fn sample_rate_is_actually_enforced() {
+        let (base, sim, sp) = sample();
+        let start = base[0].time_ms;
+        let retime = |gap_ms: i64| -> Vec<TrackPoint> {
+            base.iter()
+                .enumerate()
+                .map(|(i, p)| TrackPoint {
+                    lat: p.lat,
+                    lon: p.lon,
+                    time_ms: start + i as i64 * gap_ms,
+                })
+                .collect()
+        };
+
+        // ① 采样轴整体跑偏（压成 2 秒/点）：Fatal
+        let pts = retime(2000);
+        let c = Check {
+            points: &pts,
+            sim: &sim,
+            params: &sp,
+            checkpoints: &[],
+            total_distance_m: sim.actual_length_m.round() as i64,
+            total_time_sec: 720,
+            total_steps: 2300,
+            start_time_ms: start,
+            stop_time_ms: start + 720_000,
+            pace_range: None,
+            step_range: None,
+            expected_interval_sec: Some(crate::track::SAMPLE_INTERVAL_SEC),
+        };
+        let r = inspect(&c);
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.code == "SAMPLE_RATE" && i.level == Level::Fatal),
+            "2 秒/点的采样轴必须报 SAMPLE_RATE，实际 {:?}",
+            r.lines()
+        );
+
+        // ② 主体 5 秒、中途夹一个 1 秒间隔（拐角补点切碎了网格）：
+        //    真机一次都没出现过 <3 秒的间隔，必须 Fatal
+        let mut pts = retime(5000);
+        for p in pts.iter_mut().skip(41) {
+            p.time_ms -= 4000;
+        }
+        let c = Check {
+            points: &pts,
+            ..c
+        };
+        let r = inspect(&c);
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.code == "SAMPLE_RATE_SHORT" && i.level == Level::Fatal),
+            "1 秒间隔必须报 SAMPLE_RATE_SHORT，实际 {:?}",
+            r.lines()
+        );
+
+        // ③ 配置本身偏离真机（15 秒/点）：只警告，不拦
+        let pts = retime(15_000);
+        let c = Check {
+            points: &pts,
+            expected_interval_sec: Some(15.0),
+            ..c
+        };
+        let r = inspect(&c);
+        assert!(
+            r.issues
+                .iter()
+                .any(|i| i.code == "SAMPLE_RATE_DEVICE" && i.level == Level::Warn),
+            "15 秒/点应只报警告，实际 {:?}",
+            r.lines()
+        );
+        assert!(
+            !r.issues
+                .iter()
+                .any(|i| i.code.starts_with("SAMPLE_RATE") && i.level == Level::Fatal),
+            "配置偏离不该阻断，实际 {:?}",
+            r.lines()
+        );
+    }
+
     fn check<'a>(
         pts: &'a [TrackPoint],
         sim: &'a SimResult,
@@ -416,6 +557,7 @@ mod tests {
             stop_time_ms: 1_730_000_720_000,
             pace_range: None,
             step_range: None,
+            expected_interval_sec: None,
         }
     }
 

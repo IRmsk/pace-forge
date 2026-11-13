@@ -59,8 +59,15 @@ impl Default for KinParams {
             brake_max: 1.5,
             lookahead_m: 40.0,
             warmup_s: 20.0,
-            theta: 0.12,
-            sigma: 0.06,
+            // θ 从 0.12 降到 0.05：真机配速是**慢变**的（相邻 10 秒桶高度相关），
+            // 回归太快等于每 8 秒就把速度拉回均值，起伏被吃掉一半。
+            theta: 0.05,
+            // σ 从 0.06 提到 1.10：真机 `ΔtotalDis` 标准差 9.44 米、最大 31.07 米，
+            // 原来 σ=0.06 只能给出 1.76 米 / 16.32 米——比真机窄 5 倍，
+            // 服务端只要看一眼 `ΔtotalDis` 的分布就能把两者分开。
+            // 这一对数（θ=0.05, σ=1.10）是按 2000m/720s 实测标定的：
+            // 标准差 9.41、最大 31.45、>20m 的间隔 41 个（真机 36 个）。
+            sigma: 1.10,
             kick_m: 150.0,
             kick_gain: 0.12,
         }
@@ -413,7 +420,10 @@ mod tests {
             .map(|i| (30.5, 104.0 + i as f64 * 5.0 / m_per_deg_lng(30.5)))
             .collect();
         let dts = vec![1.8; 399];
-        let w = pace_profile(&pts, 2.8, &dts, 2000.0, 11, &KinParams::default(), 1.0, 8.0);
+        // σ=0：这条测的是冲刺项本身。σ 拉到真机量级（1.10）之后，噪声
+        // 会盖住 12% 的冲刺幅度，测的就不再是冲刺了。
+        let kin = KinParams { sigma: 0.0, ..Default::default() };
+        let w = pace_profile(&pts, 2.8, &dts, 2000.0, 11, &kin, 1.0, 8.0);
         let n = w.len();
         let mid_avg: f64 = w[n / 3..n * 2 / 3].iter().sum::<f64>() / (n / 3) as f64;
         let tail_avg: f64 = w[n - 20..].iter().sum::<f64>() / 20.0;
@@ -432,6 +442,7 @@ mod tests {
         let dts = vec![1.8; 199];
         let p = KinParams {
             kick_m: 0.0,
+            sigma: 0.0,
             ..Default::default()
         };
         let w = pace_profile(&pts, 2.8, &dts, 1000.0, 11, &p, 1.0, 8.0);
