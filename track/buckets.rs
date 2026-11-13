@@ -282,32 +282,76 @@ mod tests {
     }
 }
 
-/// 提交报文用的桶 id：`60000+i`，`queueNum = i`。
+/// 桶网格上的起步窗口长度（**整桶数**）。
 ///
-/// 服务端在提交时按这个规则校验；和 OBS 对象里的 id 规则**不同**。
+/// 真机 555 秒 → 起步窗口 [`super::startup_sec`] = 86 秒 → `86 / 10 = 8` 个桶：
+/// 前 8 个桶（0~80s）`queueNum` 恒 0、速度桶 `state=2`；第 9 个桶（80~90s）
+/// 真正跨过 86 秒这条线，真机把它算进「已起步」。所以这里取**整桶截断**
+/// （floor），不是四舍五入——`86/10` 用 `round` 会得到 9，前面就多一个 0。
+///
+/// 这个 8 不是从点位那边套过来的：点位 `su=19`（86 秒内的 19 个采样点），
+/// 桶 `su=8`，两者是同一个时间窗口在两张不同网格上的落点。
+pub fn bucket_startup(total_sec: i64) -> usize {
+    (super::startup_sec(total_sec) / 10).max(0) as usize
+}
+
+/// 提交报文用的桶 id：`60000+i`，`queueNum` 走与点位同一个分区函数。
+///
+/// 服务端在提交时按这个规则校验；和 OBS 对象里的 id 规则**不同**（OBS 是
+/// 服务端自增列量级的连续 id）。
+///
+/// `queueNum` 早先写成 `queue_num: i as i32`（桶序号原样），55 个桶于是变成
+/// 0..54 —— 真机全场 `queueNum` 上限是 24，0..54 里有一大半落在不存在的台阶上，
+/// 整个字段语义是错的（不是「差几档」，是另一个量纲）。现在与 OBS 桶、
+/// 与点位共用 [`super::queue_num`]，`su` 用桶自己的起步窗口。
 pub fn apply_submit_ids(speed: &mut [SpeedBucket], steps: &mut [StepBucket]) {
+    let n = speed.len().max(steps.len());
+    let su = bucket_startup((n as i64) * 10);
     for (i, b) in speed.iter_mut().enumerate() {
         b.id = 60000 + i as i64;
-        b.queue_num = i as i32;
+        b.queue_num = super::queue_num(i, n, su);
     }
     for (i, b) in steps.iter_mut().enumerate() {
         b.id = 60000 + i as i64;
-        b.queue_num = i as i32;
+        b.queue_num = super::queue_num(i, n, su);
     }
 }
 
-/// OBS 对象用的桶 id：`(rrid % 100000) * 1000 + endSec`，`queueNum = 0`。
+/// OBS 对象用的桶 id / `queueNum` / `state`。
+///
+/// 真机依据（`evidence/obs_real_20261002.json`，55 个速度桶 + 55 个步频桶）：
+///
+/// - `id` **连续递增**（1628、1629、…、1682），不是按 `endSec` 跳号。
+///   旧实现用 `(rrid%100000)*1000+endSec`，同一个数组里相邻桶的 id 差 10；
+/// - 两个数组共用同一条 id 序列（速度桶和步频桶第 i 项 id 相同）；
+/// - `queueNum` 起步段（前 8 个桶）是 0，之后**每 2 个桶 +1** 到 24
+///   （`8→1、10→2、…、54→24`，55 个桶逐元素与真机一致）；
+/// - `speed_json` 的 `state`：起步段的 8 个桶是 **2**，其余 47 个是 **0**。
+///   起步段（前 86 秒）配速还没起来，App 把这几个桶标成「非正常」；
+/// - `step_freq_json` 的 `state` 恒 0。
 ///
 /// 依赖提交返回的 `rrid`，所以 OBS 必须在提交**之后**上传。
 pub fn apply_obs_ids(speed: &mut [SpeedBucket], steps: &mut [StepBucket], rrid: i64, start_ms: i64) {
-    let base = (rrid % 100_000) * 1000;
-    for b in speed.iter_mut() {
-        b.id = base + (b.end_time - start_ms) / 1000;
-        b.queue_num = 0;
+    // 真机 id 是服务端自增列（1628 起）。客户端只需落在同量级、且同一条
+    // 记录内连续递增，所以按 rrid + 起始时间派生一个稳定偏移。
+    let base = 1600
+        + (((rrid as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ start_ms as u64) % 400) as i64;
+    let n = speed.len().max(steps.len());
+    let total_sec = speed
+        .last()
+        .map(|b| (b.end_time - start_ms) / 1000)
+        .unwrap_or(10)
+        .max(10);
+    let su = bucket_startup(total_sec);
+    for (i, b) in speed.iter_mut().enumerate() {
+        b.id = base + i as i64;
+        b.queue_num = super::queue_num(i, n, su);
+        b.state = if i < su { 2 } else { 0 };
     }
-    for b in steps.iter_mut() {
-        b.id = base + (b.end_time - start_ms) / 1000;
-        b.queue_num = 0;
+    for (i, b) in steps.iter_mut().enumerate() {
+        b.id = base + i as i64;
+        b.queue_num = super::queue_num(i, n, su);
+        b.state = 0;
     }
 }
 
@@ -327,14 +371,87 @@ mod id_tests {
         apply_submit_ids(&mut sp, &mut st);
         assert_eq!(sp[0].id, 60000);
         assert_eq!(sp[1].id, 60001);
-        assert_eq!(sp[0].queue_num, 0);
-        assert_eq!(sp[1].queue_num, 1);
+        // 60 秒 → 起步窗口 9 秒 → 桶网格上 `9/10 = 0` 个整桶，所以没有 0 档；
+        // 6 个桶 / 24 档 → 步长取整为 1，queueNum 是 1..6（不再是桶序号 0..5，
+        // 也不再是「首桶 0」——那个 0 只在有整桶落在起步窗口里时出现）。
+        assert_eq!(bucket_startup(60), 0);
+        assert_eq!(
+            sp.iter().map(|b| b.queue_num).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            st.iter().map(|b| b.queue_num).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
 
         apply_obs_ids(&mut sp, &mut st, 123_456_789, start);
-        // (123456789 % 100000) * 1000 = 56789 * 1000
-        assert_eq!(sp[0].id, 56_789_000 + 10, "首桶 endTime 是 start+10s");
-        assert_eq!(sp[1].id, 56_789_000 + 20);
-        assert_eq!(sp[0].queue_num, 0);
+        // 真机 OBS 的桶 id 是**连续递增**的（1628、1629、…），不是按 endSec 跳号
+        assert_eq!(sp[1].id, sp[0].id + 1, "相邻桶 id 必须差 1");
+        assert!(sp[0].id >= 1600 && sp[0].id < 2000, "id 量级要对齐真机 1628 起");
+        // 速度桶和步频桶共用同一条 id 序列（真机两个数组第 i 项 id 相同）
+        for (a, b) in sp.iter().zip(st.iter()) {
+            assert_eq!(a.id, b.id, "speed/step 桶 id 必须一一对应");
+        }
+    }
+
+    /// 真机 `speed_json[i].queueNum`（55 个桶，rrid 1328288734）：
+    /// 前 8 个桶 0，之后**每 2 个桶 +1** 到 24。整段写在这里逐元素比 ——
+    /// 旧断言只断 `sp[0]==0` / `sp.last()==24`，中间 22/55 的偏移全部漏过
+    /// （`AUDIT-round.md` A5）。
+    const REAL_BUCKET_QUEUE: [i32; 55] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11,
+        11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22,
+        22, 23, 23, 24,
+    ];
+
+    /// OBS 的 `state` / `queueNum`：真机速度桶前 8 个是 2、其余 0，
+    /// 步频桶恒 0；`queueNum` 起步段 0 之后每 2 个桶 +1 到 24，逐元素对拍。
+    #[test]
+    fn obs_states_and_queue_follow_real_device() {
+        let pts: Vec<(f64, f64, i64)> = (0..=111)
+            .map(|i| (30.5 + i as f64 * 1e-5, 104.0, 1_700_000_000_000 + i * 5000))
+            .collect();
+        let start = 1_700_000_000_000i64;
+        let mut sp = speed_buckets(&pts, start, 555);
+        let mut st = step_buckets(start, 555, 670, &[1.0; 56]);
+        apply_obs_ids(&mut sp, &mut st, 1_328_288_734, start);
+
+        assert_eq!(sp.len(), 55, "555 秒应有 55 个 10 秒桶");
+        let two = sp.iter().filter(|b| b.state == 2).count();
+        assert_eq!(two, 8, "起步段（前 80 秒）应有 8 个 state=2 的桶，实际 {two}");
+        assert!(sp[8..].iter().all(|b| b.state == 0), "起步段之后 state 应为 0");
+        assert!(st.iter().all(|b| b.state == 0), "步频桶 state 恒 0");
+        assert_eq!(bucket_startup(555), 8, "555 秒的起步窗口落在 8 个整桶上");
+
+        // 逐元素：速度桶与步频桶都必须与真机序列完全相等
+        assert_eq!(REAL_BUCKET_QUEUE.len(), sp.len());
+        for (i, &real) in REAL_BUCKET_QUEUE.iter().enumerate() {
+            assert_eq!(sp[i].queue_num, real, "速度桶第 {i} 个 queueNum：真机 {real} vs {}", sp[i].queue_num);
+            assert_eq!(st[i].queue_num, real, "步频桶第 {i} 个 queueNum：真机 {real} vs {}", st[i].queue_num);
+        }
+    }
+
+    /// 提交报文里的桶（`speedPerTenSec` / `stepsPerTenSec`）走同一条分区函数：
+    /// 55 个桶必须也是 0..24 的那套台阶，而不是桶序号 0..54。
+    #[test]
+    fn submit_bucket_queue_follows_real_device() {
+        let pts: Vec<(f64, f64, i64)> = (0..=111)
+            .map(|i| (30.5 + i as f64 * 1e-5, 104.0, 1_700_000_000_000 + i * 5000))
+            .collect();
+        let start = 1_700_000_000_000i64;
+        let mut sp = speed_buckets(&pts, start, 555);
+        let mut st = step_buckets(start, 555, 670, &[1.0; 56]);
+        apply_submit_ids(&mut sp, &mut st);
+
+        assert_eq!(sp.len(), REAL_BUCKET_QUEUE.len());
+        for (i, &real) in REAL_BUCKET_QUEUE.iter().enumerate() {
+            assert_eq!(sp[i].id, 60000 + i as i64);
+            assert_eq!(sp[i].queue_num, real, "提交速度桶第 {i} 个 queueNum：真机 {real} vs {}", sp[i].queue_num);
+            assert_eq!(st[i].queue_num, real, "提交步频桶第 {i} 个 queueNum：真机 {real} vs {}", st[i].queue_num);
+        }
+        // 旧实现是桶序号原样，上限会到 54 —— 只要有人改回去，这行立刻红
+        let max = sp.iter().map(|b| b.queue_num).max().unwrap();
+        assert_eq!(max, 24, "全场 queueNum 上限必须是 24，不是桶序号 {max}");
     }
 
     #[test]

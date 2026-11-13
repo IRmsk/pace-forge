@@ -348,16 +348,50 @@ pub fn pick_from_polygons(
     (!pick.fallback).then_some(pick.selected)
 }
 
-/// 围栏环 → `geoFencesJson` 形状（提交报文里回显绿色边界用）。
-pub fn canonical_json_for(ring: &[(f64, f64)]) -> String {
+/// 围栏 → `geoFencesJson` 形状（提交报文里回显这次跑的是哪个围栏）。
+///
+/// 逐字段对齐真机 rrid 1328288734（`evidence/obs_real_20261002.json`）：
+///
+/// ```text
+/// [{"distance":0.0,"id":1668,"name":"学校",
+///   "points":[{"glat":47.382098,"glng":123.952159,"lat":47.388433,"lng":123.958514}, …]}]
+/// ```
+///
+/// 早先只发 `[{"points":[…]}]`，少了 `id` / `name` / `distance` 三个字段。
+/// 这三处里 `id` 最要紧：真机报文里 `runAreaId` 是 `-1`，围栏 id **只**
+/// 出现在这里——缺了它，服务端就没有「这条记录属于哪个围栏」的凭据。
+///
+/// `id` 取围栏响应里的原始 id；围栏响应不带 id 时退回 `run_area_id`
+/// （`select_by_anchor` 在没有围栏 id 时会用 service_area_id 兜底）。
+/// 坐标按真机那样保留 6 位小数（≈0.1m 精度）：BD-09 原样带出，
+/// GCJ-02 由 BD-09 现算，两套都是真值——真机的 `points[]` 里没有 0 或 -1。
+pub fn geo_fence_json(
+    run_area_id: i64,
+    fence_id: Option<i64>,
+    name: &str,
+    ring: &[(f64, f64)],
+) -> String {
+    let round6 = |v: f64| (v * 1e6).round() / 1e6;
     let points: Vec<Value> = ring
         .iter()
         .map(|&(lat, lon)| {
             let (glat, glon) = bd09_to_gcj02(lat, lon);
-            json!({ "lat": lat, "lng": lon, "glat": glat, "glng": glon })
+            // 键序照真机（字母序）：glat / glng / lat / lng
+            json!({
+                "glat": round6(glat),
+                "glng": round6(glon),
+                "lat": round6(lat),
+                "lng": round6(lon),
+            })
         })
         .collect();
-    json!([{ "points": points }]).to_string()
+    json!([{
+        "distance": 0.0,
+        "id": fence_id.unwrap_or(run_area_id),
+        "name": name,
+        "points": points,
+    }])
+    .to_string()
 }
 
 /// 点是否在环内（射线法）。
@@ -545,15 +579,36 @@ mod tests {
         assert!(diag.contains("geoFences=1"));
     }
 
+    /// 围栏对象必须带真机那三个顶层字段（`distance` / `id` / `name`）。
+    ///
+    /// 真机 `geoFencesJson` 是
+    /// `[{"distance":0.0,"id":1668,"name":"学校","points":[…]}]`；
+    /// 我们早先只发 `[{"points":[…]}]`，围栏 id 就整条丢了——而报文里
+    /// `runAreaId` 是 -1，围栏归属只剩这一个字段能表达。
     #[test]
-    fn canonical_json_has_gl_fields() {
+    fn geo_fence_json_matches_device_shape() {
         let ring = square(30.5, 104.0, 0.001);
-        let s = canonical_json_for(&ring);
+        let s = geo_fence_json(1668, Some(1668), "学校", &ring);
         let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v[0]["id"], json!(1668), "围栏 id 必须是真实围栏 id");
+        assert_eq!(v[0]["name"], json!("学校"));
+        assert_eq!(v[0]["distance"], json!(0.0));
         let pts = v[0]["points"].as_array().unwrap();
         assert_eq!(pts.len(), 4);
         assert!(pts[0].get("glat").is_some());
         assert!(pts[0].get("glng").is_some());
+        // 两套坐标都是真值，且 GCJ-02 与 BD-09 不相等
+        let (lat, lng) = (pts[0]["lat"].as_f64().unwrap(), pts[0]["lng"].as_f64().unwrap());
+        let (glat, glng) = (pts[0]["glat"].as_f64().unwrap(), pts[0]["glng"].as_f64().unwrap());
+        assert!(lat != 0.0 && lng != 0.0 && glat != 0.0 && glng != 0.0);
+        assert!((lat - glat).abs() > 1e-4 && (lng - glng).abs() > 1e-4);
+        // 6 位小数：与真机样本的精度一致（≈0.1m）
+        let frac = format!("{glat}").split('.').nth(1).map(|f| f.len()).unwrap_or(0);
+        assert!(frac <= 6, "围栏坐标应保留 6 位小数，实际 {glat}");
+        // 围栏响应没有 id 时退回 runAreaId，不能发 null
+        let s2 = geo_fence_json(1775, None, "", &ring);
+        let v2: Value = serde_json::from_str(&s2).unwrap();
+        assert_eq!(v2[0]["id"], json!(1775));
     }
 
     #[test]
