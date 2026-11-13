@@ -1616,23 +1616,63 @@ async function ungzipB64(b64) {
   return await new Response(out).text();
 }
 
-async function obsTrack(rrid) {
-  const key = 'run_data/' + Math.floor(rrid / 1000000) + '/' + rrid + '.json';
-  try {
-    const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
-    const obj = j.data ?? j;
-    if (!obj || !obj.run_data) return null;
-    const wrap = JSON.parse(await ungzipB64(obj.run_data));
-    const raw = wrap.allLocJson;
-    const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    if (!Array.isArray(arr)) return null;
-    // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
-    return arr
-      .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
-      .filter(p => p.lat && p.lng);
-  } catch (e) {
-    return null;
+/// 把毫秒戳按给定时区偏移格成 YYYYMMDDHH，用来拼 objectKey。
+function stampHour(ms, offSec) {
+  const d = new Date(ms + offSec * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return d.getUTCFullYear() + p(d.getUTCMonth() + 1) + p(d.getUTCDate()) + p(d.getUTCHours());
+}
+
+/// 从对象存储拉轨迹。**候选 key 逐个试**。
+///
+/// 这里原来只试 `run_data/{rrid/1000000}/{rrid}.json` 一种，但上传侧用的
+/// 是 `run_data/{YYYYMMDDHH}/{uuid}.json`——两套根本不是同一个东西。
+/// 一个用 rrid 当文件名、拿前 4 位当「小时段」；另一个用时间戳当小时段、
+/// uuid 当文件名。只试一种，另一边传上去就等于白传。
+///
+/// 所以按可能性从高到低排一串候选，命中就停。真机记录的 key 规则始终
+/// 没有硬证据（obs.rs 和前端注释各说一套，都说自己是实测），穷举比我
+/// 们继续猜便宜——每个对象才几 KB。
+async function obsTrack(rrid, detail) {
+  const d = detail || {};
+  const uuid = d.uuid || d.runUuid || d.run_uuid || d.fileId;
+  const st = num(d.startTime) || num(d.start_time);
+
+  const cands = [];
+  // ① 真机格式（前端注释的说法）：rrid 前 4 位当小时段
+  cands.push('run_data/' + Math.floor(rrid / 1000000) + '/' + rrid + '.json');
+  // ② 我们上传的格式：本地时区（UTC+8）小时段 + uuid
+  if (uuid && st) cands.push('run_data/' + stampHour(st, 8 * 3600) + '/' + uuid + '.json');
+  // ③ 同一套的 UTC 版本（上传时两份都传了）
+  if (uuid && st) cands.push('run_data/' + stampHour(st, 0) + '/' + uuid + '.json');
+  // ④ rrid 前 6 位（万一小时段是 YYYYMM 而不是 YYYYMMDD）
+  cands.push('run_data/' + Math.floor(rrid / 10000) + '/' + rrid + '.json');
+  // ⑤ 兜底目录
+  if (uuid && st) cands.push('runData/' + (d.uid || '') + '/' + (d.sportType || 1) + '/' + Math.floor(st / 1000) + '_' + uuid + '.txt');
+
+  for (const key of cands) {
+    try {
+      const j = await api('/api/obs/fetch', { method: 'POST', body: JSON.stringify({ key }) });
+      const obj = j.data ?? j;
+      if (!obj || !obj.run_data) continue;
+      const wrap = JSON.parse(await ungzipB64(obj.run_data));
+      const raw = wrap.allLocJson;
+      const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!Array.isArray(arr) || arr.length < 2) continue;
+      // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
+      const pts = arr
+        .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
+        .filter(p => p.lat && p.lng);
+      if (pts.length > 1) {
+        console.log('[obs] 命中 key:', key, '点数', pts.length);
+        return pts;
+      }
+    } catch (e) {
+      // 404 就是没这个对象，继续试下一个
+    }
   }
+  console.warn('[obs] 全部候选 key 都没取到轨迹:', cands);
+  return null;
 }
 
 /* ---------- 单条详情 ---------- */
@@ -1652,7 +1692,7 @@ async function selectRec(r, el) {
     // 拉下来 → gzip 解压 → 取 run_data.allLocJson → 就能画线。
     if (pts.length <= 1) {
       $('detail').innerHTML = '<span class="spin"></span> 从 OBS 拉轨迹…';
-      const obs = await obsTrack(rrid);
+      const obs = await obsTrack(rrid, d);
       if (obs && obs.length > 1) pts = obs;
     }
     if (pts.length > 1) {
