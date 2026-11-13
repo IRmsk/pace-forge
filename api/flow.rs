@@ -7,7 +7,7 @@
 //! ② fence    → 选中校区、runAreaId、围栏几何
 //! ③ points   → 打卡点（BD-09）
 //! ④ 规划轨迹 → 必经点全部命中的闭环
-//! ⑤ retime   → 由速度反推时间戳
+//! ⑤ 采样     → 等时间 5 秒沿几何折线取上报点（真机节奏）
 //! ⑥ simulate → 步数、10 秒分桶
 //! ⑦ preflight→ 本地自检，不过就不发
 //! ⑧ OBS      → 上传轨迹明细，拿 objectKey
@@ -26,8 +26,8 @@ use super::obs;
 use super::points::{self, PointsContext};
 use super::policy::{self, PolicyInfo};
 use crate::track::{
-    inspect, plan, retime, simulate, Check, Checkpoint, KinParams, PlanRequest, PlanResult,
-    Report, SimParams, TrackPoint,
+    inspect, plan, simulate, Check, Checkpoint, KinParams, PlanRequest, PlanResult, Report,
+    SimParams, TrackPoint,
 };
 
 /// 一次跑步的参数。
@@ -49,8 +49,18 @@ pub struct RunParams {
     pub steps: Option<i32>,
     /// 随机种子。
     pub seed: u64,
-    /// 采样间距（米）。
+    /// 几何采样间距（米）。
+    ///
+    /// **只管几何**：拐角、绕线、摆动都在这条密采样折线上算。上报节奏由
+    /// [`Self::sample_interval_sec`] 决定，两者不要混——早先这一个字段同时
+    /// 兼任两件事，于是「5 米一个点」就等于「1.65 秒一个点」，采样率是真机
+    /// 的三倍（真机 4.91 秒/点）。
     pub sample_step_m: f64,
+    /// 上报采样间隔（秒/点）。真机实测 4.91 s/点、稳态严格 5 秒。
+    ///
+    /// 这是**报文里那个节奏**：`allLocJson` 相邻点的 `totalTime` 差。
+    /// 改成别的值就等于放弃与真机对齐，`preflight` 的 `SAMPLE_RATE` 会拦。
+    pub sample_interval_sec: f64,
     /// 是否优先沿真实道路规划（OSM）。查不到路网时自动降级。
     pub prefer_roads: bool,
     /// 指定开始时刻（毫秒戳）。`None` 表示现在开跑。
@@ -384,21 +394,49 @@ impl RunParams {
             ));
         }
         if self.sample_step_m <= 0.0 || self.sample_step_m > 100.0 {
-            return Err(format!("采样间距不合理: {} m", self.sample_step_m));
+            return Err(format!("几何采样间距不合理: {} m", self.sample_step_m));
         }
-        // 报文的 totalTime 只到秒，采样间隔必须 ≥ 最快速度下的 1 秒，
-        // 否则反解后相邻点时间戳相同，服务端会看到 0 时长段。
-        // 8 m/s 上限下，1 秒 = 8 米。
-        if self.sample_step_m < 8.0 && self.duration_sec > 0 {
-            let avg_v = self.distance_m / self.duration_sec as f64;
-            let gap = self.sample_step_m / avg_v.max(0.5);
-            if gap < 1.0 {
-                return Err(format!(
-                    "采样间距 {}m 在 {avg_v:.2} m/s 下只有 {gap:.2} 秒，                     报文时间精度是秒，会画出 0 时长段；把间距调到 {:.0}m 以上",
-                    self.sample_step_m,
-                    avg_v.max(0.5)
-                ));
-            }
+        // 上报节奏校验。
+        //
+        // 老代码校验的是「采样间距 ÷ 平均速度 ≥ 1 秒」，也就是只防「两个点
+        // 时间戳相同、画出 0 时长段」这一种显错，5 米（1.65 秒）轻松过关——
+        // **没有任何地方比对真机那个 4.91 秒的节奏**，采样率是真机三倍却
+        // 一路绿灯。现在节奏是独立参数，直接按秒卡：
+        //
+        // - 下界 1 秒：报文 `totalTime` 精度是秒，再小必然出现 0 时长段；
+        // - 上界：与真机 4.9115 s 比，超过 3 倍就不是同一类数据了。
+        //   （硬拦在 15 秒，容忍度留给压测；更严的「必须贴着 5 秒」在
+        //   `preflight::SAMPLE_RATE` 里，那里看的是**生成结果**的分布。）
+        if !self.sample_interval_sec.is_finite() || self.sample_interval_sec < 1.0 {
+            return Err(format!(
+                "上报采样间隔 {}s 不合理：报文时间精度是秒，小于 1 秒会画出 0 时长段",
+                self.sample_interval_sec
+            ));
+        }
+        if self.sample_interval_sec > 15.0 {
+            return Err(format!(
+                "上报采样间隔 {}s 超过真机节奏（{:.2}s）的三倍，点数会明显偏少",
+                self.sample_interval_sec,
+                crate::track::REAL_MEAN_INTERVAL_SEC
+            ));
+        }
+        // 点数下界：一条轨迹至少要有两个点，且起步额外点需要时长够长。
+        let est = crate::track::sample_times(self.duration_sec, 0, self.sample_interval_sec);
+        if est.len() < 4 {
+            return Err(format!(
+                "时长 {}s / 间隔 {}s 只能采出 {} 个点，至少要 4 个",
+                self.duration_sec,
+                self.sample_interval_sec,
+                est.len()
+            ));
+        }
+        if est.len() > 40_000 {
+            return Err(format!(
+                "时长 {}s / 间隔 {}s 会采出 {} 个点，报文过大",
+                self.duration_sec,
+                self.sample_interval_sec,
+                est.len()
+            ));
         }
         Ok(())
     }
@@ -415,16 +453,20 @@ impl Default for RunParams {
             run_mode: 1,
             steps: None,
             seed: 0,
-            // 5m 一个采样点。
+            // 几何采样间距：**只管形状，不管节奏**。
             //
             // 曾经改成 10m，理由抄自 fork「真机 2km 约 200 点」。但从 OBS
             // 里把真机对象取出来数过：1362680775 是 1.93km / **406 点**
             // = 4.75m/点，1361415974 是 1.81km / 375 点 = 4.8m/点，
             // 1360341003 是 2.04km / 419 点 = 4.9m/点。三条都是 4.8m 左右，
-            // 没有一条是 10m。改成 10m 之后我们同距离只出 201 点，间隔
-            // 3453ms，和真机的 1828ms 差一倍——点数这一项反而露馅了。
-            // fork 那句「406 点的那些是更长的距离」是没核对过的。
+            // 没有一条是 10m——但那是**上报点**的间距，不是几何步长。
+            //
+            // 现在两者拆开了：几何继续 5m（拐角、绕楼要密），上报点由
+            // `sample_interval_sec` 沿这条折线按时间取（真机 4.91s/点）。
+            // 5m 几何 + 5s 上报 = 1683m 出 114 点、14.9m/点，与真机同构。
             sample_step_m: 5.0,
+            // 上报节奏：与真机对齐（等时间 5 秒，见 `track::sample_times`）。
+            sample_interval_sec: crate::track::SAMPLE_INTERVAL_SEC,
             prefer_roads: true,
             start_at_ms: None,
             custom_path: None,
@@ -459,6 +501,17 @@ pub struct RunOutcome {
     /// 是否已提交。
     pub submitted: bool,
     pub record_id: Option<i64>,
+    /// 本次报文用的点位数组（28 字段/点，与 `allLocJson` 同构）。
+    ///
+    /// **同一份实例**：`dry_run` 里由 `submit::build_points` 造一次，自检按它
+    /// 校验（`verify_view` / `audit_derived`），`run_full` 把同一份交给报文与
+    /// OBS 明细上传，再也不重建（见 `FIX-A4-SINGLE-POINT-SOURCE.md`）。
+    pub submission_points: Vec<Value>,
+    /// 本次的必到点（服务端点位 → `submit::FixedPoint`）。
+    ///
+    /// 自检与提交共用同一份。早先 probe 传的是空数组，于是 `type=2` 的打卡
+    /// 标记与 `fivePointJson` 的 `isFixed` 只有上传那份才有——自检守着另一份报文。
+    pub fixed: Vec<super::submit::FixedPoint>,
 }
 
 /// 只做到自检为止（不发任何写请求）。
@@ -688,6 +741,14 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     } else {
         None
     };
+
+    // 本次用于避让的障碍轮廓（楼体 + 水面 + 本地禁区）。
+    //
+    // 上报采样要拿它当**穿墙判据**：5m 采样时楼体两端至少有一个点落在里面，
+    // `avoid_blockers` 的逐点推出能兜住；上报点变成 15m 一步之后，会出现
+    // 「两端都在楼外、中间穿过楼」的弦，只能在这一层补点绕开。
+    // 只有围栏支路会算这份（操场/手绘/无围栏都没有障碍数据）。
+    let mut blockers_used: Vec<Vec<(f64, f64)>> = Vec::new();
 
     let track = if let Some(custom) = p.custom_path.as_ref().filter(|v| v.len() >= 2) {
         log(&format!("[track] 采用手绘轨迹 {} 个控制点", custom.len()));
@@ -923,6 +984,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         };
         // 建筑避让放在摆动之后：add_wander 会把点横推 ±6m，先避让再摆动
         // 等于白做。这里逐点推出楼体 + 逐段插贴边绕行，外扩 3m 当作墙根。
+        blockers_used = blockers.clone();
         let wandered = if blockers.is_empty() {
             wandered
         } else {
@@ -982,7 +1044,22 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         (track.actual_length_m - p.distance_m).abs() / p.distance_m * 100.0
     ));
 
-    // ⑤ retime
+    // ⑤ 上报采样：**等时间** 5 秒（真机节奏），几何仍走密采样。
+    //
+    // 这一步换掉的是「按距离采样 + 由几何反推时间」的老做法。
+    //
+    // 真机对象 `evidence/obs_real_20261002.json`（114 点 / 555 秒 / 1683.83m）
+    // 逐点算出来的是：`ΔtotalTime` 109/113 恰好 5 秒（均值 4.9115），
+    // `ΔtotalDis` 在 0~31 m 之间跳（均值 14.90、标准差 9.44，只有 38.9%
+    // 落在 10~20 m）。时间恒定、距离起伏 → 设备是**按时间取样**的。
+    //
+    // 我们原来按距离取样（5 m/点）：同一条轨迹出 337 个点、1.65 秒/点，
+    // 采样率是真机的三倍。形状对、节奏错，服务端看一眼 `ΔtotalTime`
+    // 的分布就能分辨。
+    //
+    // `sample_by_time` 只决定**上报哪几个点**，几何不跟着变：拐角、绕楼、
+    // 摆动都还在密采样的折线上算（`sample_step_m`），所以「拐角要更密」
+    // 与「节奏要 5 秒」不再互斥。
     //
     // 速度上下界由**服务端策略**的配速区间反推，不再硬编码 1.0~8.0。
     // 8.0 m/s = 2:05 配速，学生账号规则通常只给到 3~10 分/公里，
@@ -1002,35 +1079,112 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         None => (1.0, 8.0),
     };
     let xy: Vec<(f64, f64)> = track.points.iter().map(|q| (q.lat, q.lon)).collect();
-    let (times, _speeds, real_len) = retime(
+    // 采样点在弧长空间就对齐到打卡点（详见 `track::sample_by_time`）：
+    // 5 秒网格的相邻点可以差 20m 以上，事后再靠吸附瞬移会扯出大间隔。
+    let cp_pairs: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
+    let times = crate::track::sample_times(p.duration_sec, start_ms, p.sample_interval_sec);
+    let mut track_points = crate::track::sample_by_time(
         &xy,
-        p.duration_sec,
-        start_ms,
+        &times,
         start_ms as u64,
         &KinParams::default(),
         v_floor,
         v_ceil,
+        &blockers_used,
+        &cp_pairs,
     );
-    if times.len() != xy.len() {
-        return Err("时间戳生成失败".into());
+    if track_points.len() < 2 {
+        return Err("上报采样失败：时间轴或几何为空".into());
     }
-    let timed: Vec<(f64, f64, i64)> = xy
-        .iter()
-        .zip(&times)
-        .map(|((a, b), t)| (*a, *b, *t))
-        .collect();
-    let track_points: Vec<crate::track::TrackPoint> = xy
-        .iter()
-        .zip(&times)
-        .map(|((a, b), t)| crate::track::TrackPoint {
-            lat: *a,
-            lon: *b,
-            time_ms: *t,
-        })
-        .collect();
     log(&format!(
-        "√ [retime] 时间跨度 {}s → 平均 {:.3} m/s",
-        (times[times.len() - 1] - times[0]) / 1000,
+        "[sample] 等时间采样 {:.1}s → {} 点（几何折线 {} 点 / 步长 {:.1}m）",
+        p.sample_interval_sec,
+        track_points.len(),
+        xy.len(),
+        p.sample_step_m
+    ));
+
+    // ⑤.5 起步窗口压平。
+    //
+    // 时间轴（retime 的结果）不能动：它已经把 15% 的时长分给了起步期。
+    // 能动的是**几何**——真机起步 86 秒只走了 18.4m，我们原来在这 15% 的
+    // 时长里匀速跑掉了 15% 的里程，`.totalDis` 眼看着涨到两百多米而首段
+    // `distance` 也同步虚高。这里把这批点沿路径压到起始的一小段弧长上，
+    // 时间戳原样保留，于是「15% 时长 / 1.1% 里程」两个比例同时成立。
+    //
+    // 顺序很关键：retime 必须看**压平前**的几何（它是按路径长度分配时间的，
+    // 看压平后的点会把时间也一起压没），所以压平放在 retime 之后。
+    let snap_cps: Vec<(f64, f64)> = cps.iter().map(|c| (c.lat, c.lng)).collect();
+    crate::track::compress_startup(&mut track_points, start_ms, p.duration_sec);
+
+    // ⑤.5 压缩之后沿轨迹**重新对齐一次**采样点。
+    //
+    // 压平会把整条网格按目标弧长重铺（窗口外的点也一起动），起点附近的
+    // 采样点能整体挪出几十米；只靠 ⑤.6 的「吸附」（把点直接拽到点位坐标）
+    // 去救，位移会大到扯出 40m 的相邻间距。先在**弧长空间**把最近的那个
+    // 采样点挪到点位在轨迹上的投影（位移 ≤ 半个步长），吸附只需要收尾。
+    let aligned = crate::track::align_samples_to_checkpoints(&mut track_points, &snap_cps);
+    if aligned > 0 {
+        log(&format!("√ [align] 压缩后按轨迹重新对齐打卡点 {aligned} 个"));
+    }
+
+    // ⑤.6 压缩之后**重新吸附打卡点**。
+    //
+    // `compress_startup` 对**所有**点按目标弧长重新插值（窗口外的点也一样），
+    // 而 `planner` / `resample_with_checkpoints` 是靠「把某个采样点精确放在
+    // 打卡点上」来满足服务端「经过点位」的。压缩一过，那批精确命中的顶点被
+    // 挪到别的弧长位置，最近采样点变成新网格间距内的随机值（实测 0.33~2.24m），
+    // `preflight` 的 `CP_MISS`（0.5m，Fatal）当场把整个提交流程拦死——
+    // `run_full` 第一句就是 `dry_run(...)?`，有必到点的跑一单都发不出去。
+    //
+    // 所以吸附必须放在**压缩之后**（压缩前吸一次没用，会被再打散），而且必须
+    // 放在 `real_len` 重算**之前**：吸附会动坐标，totalDis 得跟最终几何同源。
+    let snap = crate::track::snap_checkpoints(&mut track_points, &snap_cps);
+    if !snap.items.is_empty() {
+        log(&format!(
+            "√ [snap] 压缩后重新吸附打卡点 {}/{}：最近距离 {:.3}m → {:.4}m，单点最大位移 {:.2}m，相邻最大间距 {:.1}m",
+            snap.moved(),
+            snap.items.len(),
+            snap.worst_before(),
+            snap.worst_after(),
+            snap.max_shift_m,
+            snap.max_gap_m
+        ));
+        for ci in &snap.skipped {
+            log(&format!(
+                "⚠ [snap] 打卡点 P{} 距轨迹超过 {:.0}m，不做吸附（轨迹没经过它）",
+                ci + 1,
+                crate::track::CHECKPOINT_SNAP_MAX_M
+            ));
+        }
+    }
+    // 压平后点都落在原折线上，弧长总和几乎不变，但报文的 totalDis 必须
+    // 与 `allLocJson` 末点的 totalDis 同源，所以在这里重算一次。
+    // 吸附改过坐标，这一次重算同时把吸附引起的几米变化算进去。
+    let real_len = crate::track::geo::path_length(
+        &track_points.iter().map(|q| (q.lat, q.lon)).collect::<Vec<_>>(),
+    )
+    .round() as i64;
+
+    let timed: Vec<(f64, f64, i64)> = track_points
+        .iter()
+        .map(|q| (q.lat, q.lon, q.time_ms))
+        .collect();
+    // 上报节奏的实测（与真机 4.9115 s / 14.90 m 对照）。
+    //
+    // 这条日志是给「采样率跑偏」留的现场：点数、平均时间间隔、平均距离间隔
+    // 三个数一摆，是不是真机那个节奏一眼就能看出来。硬判定在
+    // `preflight` 的 `SAMPLE_RATE`（Fatal），这里只是记录。
+    let cad = crate::track::cadence_stats(&track_points);
+    log(&format!(
+        "√ [cadence] {} 点 / 平均 {:.2}s·{:.2}m（真机 {:.2}s·{:.2}m）/ Δt 中位 {:.0}s / 5±0.5s 占 {:.0}% / 平均 {:.3} m/s",
+        cad.points,
+        cad.mean_dt_sec,
+        cad.mean_dd_m,
+        crate::track::REAL_MEAN_INTERVAL_SEC,
+        14.90,
+        cad.median_dt_sec,
+        cad.dt_within_5s * 100.0,
         real_len as f64 / p.duration_sec as f64
     ));
 
@@ -1080,7 +1234,42 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         total_ascent: 0,
         alt_range: p.alt_range,
     };
-    let probe_sub = super::submit::build(&probe, &track_points, &[], &sim)?;
+    // 必到点：这里只挑「是哪个点」（两套坐标 + 名字），**不发号**。
+    //
+    // `position` / `id` / `isFixed` / `flag` 全部交给 submit::fixed_point_items
+    // 按真机规则统一发号，原因见那里的注释与 FIXED-POINT-PARITY.md。
+    // 早先这里把 `position` 填成「该点在轨迹点数组里的首次经过下标」
+    // （实测 0/71/88/170/51），真机填的是 0..N-1 的连续序号；App 详情页按
+    // position 排序/取下标，非连续值就只显示得出其中一部分必到点。
+    //
+    // **这一份必须自检与提交共用**：点位里的 `type=2` 打卡标记、报文
+    // `fivePointJson` 的 `isFixed`/`isPass` 都由它派生。早先 probe 传的是
+    // 空数组，自检校验的点位里一个打卡标记都没有，而上传那份有——两份实例。
+    let fixed: Vec<super::submit::FixedPoint> = pt
+        .points
+        .iter()
+        .map(|raw| {
+            let bd = (
+                raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            );
+            super::submit::FixedPoint {
+                lat: bd.0,
+                lon: bd.1,
+                point_name: raw
+                    .get("pointName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                // 缺 GCJ 坐标（点位接口只给 BD-09）时留 0，由
+                // fixed_point_items 反算——真机两套坐标都是真值。
+                glat: raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                glon: raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            }
+        })
+        .collect();
+
+    let probe_sub = super::submit::build(&probe, &track_points, &fixed, &sim)?;
     let view = super::submit::verify_view(&probe_sub.save_record, &probe_sub.points)?;
     log(&format!(
         "√ [verify] 从报文反解：{} 点 / {:.0}m / {}s / {} 步 / {} 个步数桶",
@@ -1104,6 +1293,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         stop_time_ms: view.stop_time_ms,
         pace_range: pol.pace_range,
         step_range: pol.step_range,
+        expected_interval_sec: Some(p.sample_interval_sec),
     };
     let report = inspect(&check);
     if report.blocked() {
@@ -1116,6 +1306,27 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     for line in report.lines() {
         log(&format!("  {line}"));
     }
+
+    // 自检校验的点位必须带打卡标记。
+    //
+    // `fixed` 一旦传空（早先 probe 就是这样），`checkpoint_track_indexes` 得到
+    // 空列表，点位里一个 `type=2` 都不会有，而上传那份有——这正是「自检守 A、
+    // 上传发 B」的入口（A4）。放在 preflight 之后：真的没经过点位时由
+    // preflight 报 CP_MISS，这里只兜「参数传空」这一种。
+    let marked = probe_sub
+        .points
+        .iter()
+        .filter(|q| q.get("type").and_then(|v| v.as_i64()) == Some(2))
+        .count();
+    if !fixed.is_empty() && marked == 0 {
+        return Err("自检点位里没有任何打卡标记（type=2）：probe 的 fixed 传空了".into());
+    }
+    log(&format!(
+        "√ [points] 自检与上传共用同一份点位：{} 点 / {} 个打卡标记（{} 个必到点）",
+        probe_sub.points.len(),
+        marked,
+        fixed.len()
+    ));
 
     // 服务端「经过点位」到底比哪套坐标？BD-09 的 lat/lon 与 GCJ-02 的
     // glat/glon 差 ~850m，选错一套整条记录的点位项就全是 False。
@@ -1207,6 +1418,8 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         obs_keys: Vec::new(),
         submitted: false,
         record_id: None,
+        submission_points: probe_sub.points,
+        fixed,
     })
 }
 
@@ -1238,6 +1451,8 @@ pub fn run_full(
             &xy,
             &out.sim.speed_buckets,
             crate::track::detect::PointRule::default(),
+            // 起步窗口内点几乎不动是真机行为，不按「站着」判
+            out.start_ms + crate::track::startup_sec(p.duration_sec) * 1000,
         );
         log(&format!("[detect] {}", rep.summary()));
         // 服务端「经过点位」到底比哪套坐标？BD-09 与 GCJ-02 差 850m，
@@ -1290,53 +1505,24 @@ pub fn run_full(
     let uuid = super::client::uuid_v4().to_uppercase();
     let stop_ms = start_ms + p.duration_sec * 1000;
 
-    // fivePointJson 里的点位坐标用哪套？
-    //
-    // allLocJson 的 lat/lon 是 BD-09、gLat/gLng 是 GCJ-02，两套都给了。
-    // fivePointJson 只有一个 lat/lon——服务端拿它和轨迹的哪一套比，
-    // 决定「经过点位」成败，而两套差 850m。可用 PACE_FIXED_GPS=1 切换。
-    let pos_is_index = std::env::var("PACE_POS_MODE").map(|v| v == "idx").unwrap_or(true);
-    let fixed: Vec<super::submit::FixedPoint> = out
-        .points
-        .points
-        .iter()
-        .enumerate()
-        .map(|(i, raw)| {
-            let bd = (
-                raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            );
-            // position 有两种可能语义：点位序号(1..n) 或该点位在轨迹点
-            // 数组里的首次经过索引。默认用后者——服务端要按顺序校验时，
-            // 需要知道每个打卡点落在轨迹的第几个采样点上。
-            let first_idx = out
-                .track
-                .iter()
-                .position(|t| {
-                    crate::track::geo::distance((t.lat, t.lon), bd) < 10.0
-                })
-                .map(|x| x as i32)
-                .unwrap_or(i as i32 + 1);
-            super::submit::FixedPoint {
-                lat: bd.0,
-                lon: bd.1,
-                position: if pos_is_index { first_idx } else { i as i32 + 1 },
-                is_fixed: raw.get("isFixed").and_then(|v| v.as_i64()).unwrap_or(0),
-                point_name: raw
-                    .get("pointName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                glat: raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                glon: raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
-            }
-        })
-        .collect();
-
+    // 必到点直接复用 `dry_run` 那一份（`out.fixed`）：它是点位里 `type=2`
+    // 标记与 `fivePointJson` 的由来，自检和提交必须是同一份输入。
+    // geoFencesJson：真机的围栏对象是
+    // `{distance:0.0, id:1668, name:"学校", points:[{lat,lng,glat,glng}…]}`。
+    // 我们早先只发 `{points:[…]}`，少了 id / name / distance 三个字段——
+    // 围栏 id 在真机报文里是**只**出现在这里的（runAreaId 是 -1），
+    // 缺了它服务端就没有「这次跑的是哪个围栏」的凭据。
     let geo_fences = out
         .fence
         .as_ref()
-        .map(|f| super::fence::canonical_json_for(&f.selected.polygons[0]))
+        .map(|f| {
+            super::fence::geo_fence_json(
+                f.selected.run_area_id,
+                f.selected.fence_id,
+                &f.selected.name,
+                &f.selected.polygons[0],
+            )
+        })
         .unwrap_or_else(|| "[]".into());
 
     let params = super::submit::SubmitParams {
@@ -1353,6 +1539,10 @@ pub fn run_full(
         sel_distance_m: out.policy.min_distance,
         sel_run_time_sec: p.duration_sec,
         policy: out.policy.policy.to_string(),
+        // 这里给的是**真实**围栏 id：save_record 顶层 `runAreaId` 用它（没有
+        // 真机样本证明这个接口也发 -1，不改）。`fixed_point_json` 那个
+        // envelope 里的 `runAreaId` 由 submit::build 单独处理成 -1（真机值），
+        // 见 submit::payload_run_area_id。
         run_area_id: out
             .fence
             .as_ref()
@@ -1365,7 +1555,22 @@ pub fn run_full(
 
     // 报文的桶必须来自 sim，不能在这里重新生成——否则自检、提交、明细
     // 三处数据不一致（见 submit::build 的注释）。
-    let submission = super::submit::build(&params, &out.track, &fixed, &out.sim)?;
+    //
+    // 点位**不重建**：直接用 `dry_run` 里自检校验过的那一份
+    // （`out.submission_points`）。`build_from_points` 原样收下，一个字节都
+    // 不重算，这是 A4「两份实例」的结构性修法。
+    let submission = super::submit::build_from_points(
+        &params,
+        &out.track,
+        &out.fixed,
+        &out.sim,
+        out.submission_points.clone(),
+    )?;
+    // 结构上不可能不等（同一个 Vec 的克隆），但真出现「谁在中途改了点位」
+    // 就是 A4 回归，宁可在这里停住也别把两份数据分别发出去。
+    if submission.points != out.submission_points {
+        return Err("点位数组在自检与提交之间被改动过（A4 回归）".into());
+    }
 
     // 7.4.01 已移除 BODY_SENSORS，报文里不许出现心率字段
     let mut body = submission.save_record.clone();
@@ -1384,6 +1589,33 @@ pub fn run_full(
         ));
     }
     log("√ [selfcheck] 派生字段与点位列自洽（爬升/卡路里/功率/配速/圈）");
+    // 必到点次序回显。App 详情页的「必到点位」就是按这段报文显示的：
+    // position 必须是 0,1,2,… 连续递增、数组同序、isFixed 只有首点为 1。
+    // 只要这一行不对，页面上就一定会少点位，先查这里再查轨迹。
+    if let Ok(env) = serde_json::from_str::<serde_json::Value>(
+        body.get("fivePointJson").and_then(|v| v.as_str()).unwrap_or("{}"),
+    ) {
+        if let Some(inner) = env
+            .get("fivePointJson")
+            .and_then(|v| v.as_str())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+            .and_then(|v| v.as_array().cloned())
+        {
+            let list: Vec<String> = inner
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{}:{}#{}(isFixed={})",
+                        f.get("position").and_then(|v| v.as_i64()).unwrap_or(-1),
+                        f.get("pointName").and_then(|v| v.as_str()).unwrap_or(""),
+                        f.get("id").and_then(|v| v.as_i64()).unwrap_or(-1),
+                        f.get("isFixed").and_then(|v| v.as_i64()).unwrap_or(-1),
+                    )
+                })
+                .collect();
+            log(&format!("[fixed-point] {} 个必到点：{}", list.len(), list.join(" → ")));
+        }
+    }
     log(&format!(
         "√ [submit] 报文已组装，{} 个轨迹点",
         out.track.len()
@@ -1412,7 +1644,16 @@ pub fn run_full(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let payload = detail_payload_rrid(&out.track, &out.sim, p, &uid, rrid, start_ms, &uuid, &five_pt);
+    // 点位原样复用提交报文那一份（同一个 `Vec<Value>` 的引用），不重建。
+    let payload = detail_payload_rrid(
+        &out.sim,
+        &uid,
+        rrid,
+        start_ms,
+        &uuid,
+        &five_pt,
+        &submission.points,
+    );
     // 本地时区和 UTC 各传一份：服务端拼 key 用哪个时区没有确定证据，
     // 猜错就等于轨迹对象不存在，记录点开只有标量数据。
     let keys = vec![
@@ -1511,19 +1752,30 @@ pub fn detail_payload(
 }
 
 /// 带 rrid 的明细载荷（OBS 用，桶 id 走 `(rrid%100000)*1000+endSec`）。
-// OBS 明细要 10 个字段，每个都来自不同的数据源（轨迹、模拟结果、
-// 账号标识、时间窗口、uuid、点位 JSON），拆结构体只会把这些东西
-// 再包一层而不会减少耦合，所以这里保持平铺。
+///
+/// `pts` 是**提交报文用的那一份点位数组**（`submit::Submission::points`，
+/// 由 `submit::build_points` 造过一次）。这里原样放进 `run_data.allLocJson`，
+/// 不再自己拼一份：
+///
+/// 早先这个函数内部又调了一次 `point_json_full`，而且 seed（`start_ms` 而不是
+/// `start_ms ^ φ`）、平滑（不调 `smooth_point_speed`）、打卡点（`checkpoint_idxs`
+/// 传空）三处都与 `submit::build` 不同。同一条轨迹于是有 `id` / `count` /
+/// `radius` / `type` / `bdA` 两套值，而本地自检校验的是 `build` 那一套——
+/// 「自检守 A、上传发 B」（AUDIT-round A4、`FIX-A4-SINGLE-POINT-SOURCE.md`）。
+///
+/// 现在点位与枚举/平滑/打卡标记全部来自同一份数据，这里只做「取用」。
+// OBS 明细要 10 个字段，每个都来自不同的数据源（模拟结果、账号标识、时间
+// 窗口、uuid、点位数组），拆结构体只会把这些东西再包一层而不会减少耦合，
+// 所以这里保持平铺。
 #[allow(clippy::too_many_arguments)]
 pub fn detail_payload_rrid(
-    points: &[crate::track::TrackPoint],
     sim: &crate::track::SimResult,
-    _p: &RunParams,
     uid: &str,
     rrid: i64,
     start_ms: i64,
     uuid: &str,
     five_point_json: &str,
+    pts: &[Value],
 ) -> Value {
     let mut speed = sim.speed_buckets.clone();
     let mut steps = sim.step_buckets.clone();
@@ -1532,50 +1784,21 @@ pub fn detail_payload_rrid(
     // OBS 对象是 10 个 key，每个值都 gzip + base64。
     // 之前传的是明文 JSON，结构也不对，服务端读不出轨迹，详情页就显示
     // 「这条记录没有轨迹坐标」。
-    // OBS 点数集和提交用同一套 28 字段，区别只在 id / queueNum
-    let pts: Vec<Value> = {
-        let n = points.len();
-        let mut prev = points.first().map(|q| (q.lat, q.lon)).unwrap_or((0.0, 0.0));
-        let start_pt = prev;
-        let mut cum = (0.0f64, 0i64, 0i64);
-        let mut prev_time = points.first().map(|q| q.time_ms).unwrap_or(start_ms);
-        // 打卡点索引从同一个 fixed_point_json 里取，保证提交和明细两处
-        // 对「哪个点是打卡点」的判断一致
-        let cp_idxs: Vec<usize> = serde_json::from_str::<Value>(five_point_json)
-            .ok()
-            // 传进来的是 envelope 时取内层 fivePointJson，是裸数组时直接用
-            .and_then(|v| {
-                v.get("fivePointJson")
-                    .and_then(|x| x.as_str())
-                    .and_then(|t| serde_json::from_str::<Value>(t).ok())
-                    .or(Some(v))
-            })
-            .and_then(|v| v.as_array().cloned())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|f| f.get("position").and_then(|x| x.as_i64()))
-                    .filter(|&x| x >= 0 && (x as usize) < n)
-                    .map(|x| x as usize)
-                    .collect()
-            })
-            .unwrap_or_default();
-        points
-            .iter()
-            .enumerate()
-            .map(|(i, q)| {
-                super::submit::point_json_full(
-                    q, i, n, start_ms, start_pt, &mut prev, &mut cum, &mut prev_time,
-                    sim.total_steps as i64, start_ms as u64, &cp_idxs, _p.alt_range,
-                )
-            })
-            .collect()
-    };
+    //
+    // 点位数组直接取调用方给的那一份（`submit::build_points` 的产物，与提交
+    // 报文同源）。`type=2` 的打卡标记在那边已经按坐标标好，这里不再重算，
+    // 也不需要复制——`allLocJson` 直接把这个引用序列化出去。
+
     // 圈数据：真机每 1000m 切一圈（末圈 isFullLap=false）。原来发空数组，
     // 等于告诉服务端「这条轨迹没有分段信息」——而圈配速、分段审核都读它。
-    // 与点位同源：直接从即将上传的 pts 反解 totalDis/totalTime/steps/bdA。
-    let laps = super::submit::build_laps_from_points(&pts, start_ms);
+    // 与点位同源：直接从即将上传的 pts 反解 totalDis/totalTime/bdA，
+    // 步数按里程比例从 totalSteps 分配（真机点位里没有 steps 字段）。
+    let laps = super::submit::build_laps_from_points(pts, start_ms, sim.total_steps as i64);
+    // 分段配速：真机是「起步段 + 20 秒窗口 + 收尾段」，`avgSpeed` 填配速
+    // （分/公里）而不是 m/s。这里和点位同源，段里程之和精确等于 totalDis。
+    let segments = super::submit::build_segments_from_points(pts, start_ms, sim.total_steps as i64);
     let run_wrap = json!({
-        "allLocJson": Value::Array(pts).to_string(),
+        "allLocJson": serde_json::to_string(pts).unwrap_or_else(|_| "[]".into()),
         "useZip": false,
     });
 
@@ -1585,11 +1808,10 @@ pub fn detail_payload_rrid(
         "uid": gz_str(uid),
         "run_data": gz_json(&run_wrap),
         "fixed_point_json": gz_str(five_point_json),
-        // 原来给空字符串。App 的 RunData 表里这列是 `TEXT NOT NULL`，
-        // 真实记录必定有内容；`""` 不是合法 JSON，服务端解析分段时
-        // 会直接失败，点位判定（"经过必经点位"/"至少通过2个普通点位"）
-        // 就永远拿不到依据。至少给一个空数组让它能解析。
-        "segment_json": gz_json(&Value::Array(Vec::<Value>::new())),
+        // 原来发空数组（`[]`）。真机这列是 25 段「起步段 + 20 秒窗口」的
+        // 分段配速；空数组等于告诉服务端「这条轨迹没有分段信息」，分段
+        // 审核和配速曲线都拿不到数据。
+        "segment_json": gz_json(&Value::Array(segments)),
         "speed_json": gz_json(&Value::Array(
             speed.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
         )),
@@ -1597,17 +1819,11 @@ pub fn detail_payload_rrid(
             steps.iter().map(|b| serde_json::to_value(b).unwrap_or(Value::Null)).collect::<Vec<_>>()
         )),
         "laps_json": gz_json(&Value::Array(laps)),
-        // 真机是 11 个键，多这一个。Inverx 的 7.3.92 builder.py:276-288
-        // 和 ydsj-auto 的 gen_sw.py 两处独立实现对拍都确认 OBS_OBJECT_KEYS
-        // 含 extension_json；键数本身是服务端 schema 校验项，少一个可能
-        // 在详情页或审核链被静默丢弃。
-        // extension_json 是**空串**的 gzip，不是 `{}` 的 gzip。
-        //
-        // gzip.compress(b"{}") 和 gzip.compress(b"") 差好几个字节，服务端
-        // OBS 侧 schema 校验按长度/内容做比对时对不上，整条 run_data 会被
-        // 判成「来源不明」，采样点连带被统一打上「未通过校验」的标记。
-        // Inverx 7.3.92 running/builder.py:276-288 给的就是空串。
-        "extension_json": gz(b""),
+        // 真机对象顶层只有 10 个键，**没有** extension_json：固定点位、
+        // 圈、rrid、runFaceCheck、run_data、分段、速度、步频、uid、uuid。
+        // 早先按 Inverx / ydsj-auto 两处实现的说明多发了 extension_json
+        // （空串的 gzip）。现在有真机对象直接对拍，多一个键就是差异，
+        // 删掉最干净。
         "runFaceCheck": gz_str(""),
     })
 }
@@ -1670,16 +1886,16 @@ mod obs_tests {
     /// 之前传的是明文 JSON，键名也不同，服务端读不出轨迹，详情页显示
     /// 「这条记录没有轨迹坐标」。
     #[test]
-    fn obs_payload_is_eleven_gzipped_keys() {
+    fn obs_payload_has_ten_gzipped_keys() {
         use flate2::read::GzDecoder;
         use std::io::Read;
 
-        let p = RunParams { distance_m: 1000.0, duration_sec: 300, ..Default::default() };
+        let start_ms = 1_793_966_000_000i64;
         let pts: Vec<crate::track::TrackPoint> = (0..50)
             .map(|i| crate::track::TrackPoint {
                 lat: 31.23 + i as f64 * 5.0 / 111320.0,
                 lon: 121.47,
-                time_ms: 1_793_966_000_000 + i as i64 * 1500,
+                time_ms: start_ms + i as i64 * 1500,
             })
             .collect();
         let sim = crate::track::SimResult {
@@ -1692,10 +1908,15 @@ mod obs_tests {
             step_buckets: vec![],
             actual_length_m: 1000.0,
         };
-        let v = detail_payload_rrid(&pts, &sim, &p, "123", 99, 1_793_966_000_000, "U", "[]");
+        // 点位走唯一构造点（`build_points`），与提交报文同一份来源
+        let loc = crate::api::submit::build_points(&pts, &[], start_ms, None).expect("points");
+        let v = detail_payload_rrid(&sim, "123", 99, start_ms, "U", "[]", &loc);
 
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(keys.len(), 11, "必须是 11 个键，实际 {keys:?}");
+        // 真机对象顶层就是这 10 个键（evidence/obs_real_20261002.json），
+        // 没有 extension_json——早先按两处参考实现多发了第 11 个键。
+        assert_eq!(keys.len(), 10, "必须是 10 个键，实际 {keys:?}");
+        assert!(v.get("extension_json").is_none(), "真机没有 extension_json");
         for k in ["rrid", "uuid", "uid", "run_data", "fixed_point_json",
                   "segment_json", "speed_json", "step_freq_json", "laps_json", "runFaceCheck"] {
             assert!(v.get(k).is_some(), "缺 key: {k}");
@@ -1872,5 +2093,501 @@ mod fixed_point_payload_tests {
         assert_eq!(extracted, inner);
         let arr: serde_json::Value = serde_json::from_str(&extracted).unwrap();
         assert!(arr.is_array());
+    }
+
+    /// 明细里的打卡点标记必须仍然落在正确的采样点上。
+    ///
+    /// `position` 从「轨迹下标」改成「0..N-1 连续序号」之后，OBS 侧不能
+    /// 再拿它当轨迹下标用（那样会把 type=2 标到轨迹开头几个点上）。这里
+    /// 用一个 `position=0`、但实际落在第 25 个采样点附近的必到点验证：
+    /// 标记必须按坐标匹配出来，落在 23~27 之间。
+    #[test]
+    fn obs_checkpoint_marking_uses_coords_not_position() {
+        use super::detail_payload_rrid;
+        use base64::Engine;
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let start_ms = 1_794_561_660_939i64;
+        let pts: Vec<crate::track::TrackPoint> = (0..50)
+            .map(|i| crate::track::TrackPoint {
+                lat: 31.23 + i as f64 * 5.0 / 111_320.0,
+                lon: 121.47,
+                time_ms: start_ms + i as i64 * 1500,
+            })
+            .collect();
+        let sim = crate::track::SimResult {
+            speeds: vec![3.0; 50],
+            cadences: vec![150.0; 50],
+            strides: vec![1.2; 50],
+            total_steps: 300,
+            avg_cadence: 150.0,
+            speed_buckets: Vec::new(),
+            step_buckets: Vec::new(),
+            actual_length_m: 245.0,
+        };
+        // 必到点坐标 = 第 25 个采样点；报文里 position 是 0（连续序号），
+        // 与轨迹下标 25 毫无关系——这正是改动的核心。
+        let target = &pts[25];
+        let inner = serde_json::json!([{
+            "flag": start_ms,
+            "glat": target.lat,
+            "glon": target.lon,
+            "id": 81,
+            "isFixed": 1,
+            "isPass": true,
+            "lat": target.lat,
+            "lon": target.lon,
+            "pointName": "P25",
+            "position": 0,
+            "state": 0,
+        }]);
+        let five = serde_json::json!({
+            "fivePointJson": inner.to_string(),
+            "freedomShowFence": false,
+            "geoFencesJson": "[]",
+            "runAreaId": -1,
+            "useZip": false,
+        })
+        .to_string();
+
+        // 点位由 `build_points` 造一次（打卡点按坐标匹配），OBS 明细原样复用。
+        // `position` 是连续序号 0..N-1，与轨迹下标毫无关系——真按 position 去标
+        // 就会落到开头几个点上。
+        let fixed = [crate::api::submit::FixedPoint {
+            lat: target.lat,
+            lon: target.lon,
+            point_name: "P25".into(),
+            glat: 0.0,
+            glon: 0.0,
+        }];
+        let loc = crate::api::submit::build_points(&pts, &fixed, start_ms, None).expect("points");
+        let obj = detail_payload_rrid(&sim, "123", 99, start_ms, "U", &five, &loc);
+        let raw = obj["run_data"].as_str().expect("run_data 是 gzip+base64 字符串");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .expect("base64");
+        let mut text = String::new();
+        GzDecoder::new(&bytes[..]).read_to_string(&mut text).expect("gunzip");
+        let run: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let loc: Vec<serde_json::Value> =
+            serde_json::from_str(run["allLocJson"].as_str().unwrap()).unwrap();
+
+        let marked: Vec<usize> = loc
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q["type"].as_i64() == Some(2))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!marked.is_empty(), "打卡点必须被标成 type=2，否则服务端 density 打分不够");
+        // 命中判定半径 10m、采样间距 5m，所以「首次命中」可能是第 24 个点，
+        // 加上 ±2 的标记窗口，形成一段连续标记。
+        //
+        // `type=2` 同时也是「次一级打卡 / 弱定位」，`point_json_full` 会给
+        // 普通采样点按 5% 概率撒这个值（真机分布里 type=2 有 5 个点），所以
+        // 这里不断言「全部标记都落在窗口内」——只断言**打卡点本身**被标到：
+        // 第 25 个点必须在标记集合里，且标记不能整体跑到轨迹开头（那样就是
+        // 又把 `position` 当轨迹下标用了）。
+        assert!(
+            marked.contains(&25),
+            "第 25 个采样点必须被标成打卡点，实际 {marked:?}"
+        );
+        assert!(
+            !marked.iter().any(|&i| i < 20),
+            "打卡标记不该出现在轨迹开头（`position` 又被当成轨迹下标了）：{marked:?}"
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod single_point_source_tests {
+    //! A4：**自检那份点位必须就是上传那份**（`FIX-A4-SINGLE-POINT-SOURCE.md`）。
+    //!
+    //! 修复前同一条轨迹被造了两次点位：
+    //!
+    //! - `submit::build` 那份：`seed = start_ms ^ φ`、做过 `smooth_point_speed`、
+    //!   带打卡点（`type=2` / `isFixed`）；
+    //! - `flow::detail_payload_rrid` 那份（**真正进 OBS 的**）：`seed = start_ms`、
+    //!   不平滑、不带打卡点。
+    //!
+    //! 于是 `id` / `count` / `radius` / `type` / `bdA` 逐点不同，`isFixed`、
+    //! `type=2` 只有上传那份才有——自检守着一份没人会看到的报文。
+    //!
+    //! 这组测试拿一条 1683m / 555 秒、5 个打卡点的离线对象（不联网、不提交）
+    //! 逐元素逐字段比对两份，白名单只允许 envelope 级字段。
+
+    use super::*;
+    use crate::api::submit::{self, FixedPoint, SubmitParams};
+    use base64::Engine;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    /// 真机 rrid 1328288734 的起始毫秒戳（点位 `flag` 用同一个值）。
+    const START_MS: i64 = 1_790_913_882_164;
+    const DURATION_SEC: i64 = 555;
+
+    /// envelope（`save/record` body）层允许不同的字段。
+    ///
+    /// 全部是「必然不同」的身份 / 派生字段：自检用占位 uid/uuid，
+    /// 签名与 geeToken 由它们派生，`runAreaId` 与 `geoFencesJson` 是围栏层。
+    /// **点位数组的字段一个都不在这里**——见 [`POINT_ALLOWED_DIFFS`]。
+    const ENVELOPE_ALLOWED_DIFFS: &[&str] = &[
+        "uid",
+        "selectedUnid",
+        "uuid",
+        "signature",
+        "originalSign",
+        "geeToken",
+        "runAreaId",
+        "fivePointJson",
+    ];
+
+    /// 点位字段的允许差异白名单：**空**。逐元素逐字段必须完全相等。
+    const POINT_ALLOWED_DIFFS: &[&str] = &[];
+
+    /// 点位对象的全部字段名（`point_json_full` 的 27 个键）。
+    ///
+    /// 只用来钉住一件事：**envelope 白名单里不许混进点位字段**。
+    const POINT_FIELDS: &[&str] = &[
+        "avgSpeed", "bdA", "bdD", "bdG", "bdS", "coorType", "count", "dtr", "flag", "gLat",
+        "gLng", "gainTime", "id", "lat", "lng", "locType", "locationId", "queueNum", "radius",
+        "speed", "state", "stepDistance", "totalDis", "totalTime", "type", "validDis",
+        "validTime",
+    ];
+
+    pub(super) struct Fixture {
+        pub track: Vec<crate::track::TrackPoint>,
+        pub fixed: Vec<FixedPoint>,
+        pub sim: crate::track::SimResult,
+        pub real_len: i64,
+    }
+
+    /// 离线造一条 1683m / 555s 的对象，带 5 个打卡点。
+    ///
+    /// 链路与 `flow::dry_run` 的 ④⑤⑥ 完全一致（等时间采样 → compress_startup
+    /// → 吸附 → real_len → simulate），只是不起网络、不碰围栏与账号。
+    ///
+    /// 采样那一环必须是**生产的等时间 5 秒**：下游所有断言（段表、速度三字段、
+    /// 点位字段、必到点与 `queueNum`）都是对着真机 114 点 / 555 秒 / 4.91 秒
+    /// 的节奏标定的，夹具换回等距离 5 米就变成「拿三倍密的点验真机形状」，
+    /// 结论再漂亮也不算数。
+    pub(super) fn fixture() -> Fixture {
+        // 单圈 2×95 + 2π×25 ≈ 347m，4.85 圈 ≈ 1683m。
+        let spec = crate::track::OvalSpec {
+            straight: 95.0,
+            radius: 25.0,
+            heading: 0.3,
+            laps: 4.723,
+        };
+        // 几何仍用 5m 密采样（拐角/形状靠它），上报点按 5 秒取。
+        let xy = crate::track::campus_oval_track((47.3794, 123.9502), &spec, 5.0, 2026);
+        let times =
+            crate::track::sample_times(DURATION_SEC, START_MS, crate::track::SAMPLE_INTERVAL_SEC);
+        let mut track: Vec<TrackPoint> = crate::track::sample_by_time(
+            &xy,
+            &times,
+            START_MS as u64,
+            &KinParams::default(),
+            1.0,
+            8.0,
+            &[],
+            &[],
+        );
+        let st = crate::track::cadence_stats(&track);
+        assert_eq!(
+            st.points, 113,
+            "夹具必须是 5 秒网格那个点数（真机 114 含一个重复时间戳）"
+        );
+        assert!(
+            (st.mean_dt_sec - crate::track::REAL_MEAN_INTERVAL_SEC).abs() < 0.1,
+            "夹具的节奏必须是真机的 4.91s/点，实际 {:.2}s",
+            st.mean_dt_sec
+        );
+        crate::track::compress_startup(&mut track, START_MS, DURATION_SEC);
+
+        // 5 个打卡点直接取轨迹顶点，保证「轨迹真的经过它们」（isPass=true）。
+        let n = track.len();
+        let fixed: Vec<FixedPoint> = (0..5)
+            .map(|k| {
+                let i = (n - 1) * (k + 1) / 6;
+                let q = &track[i];
+                FixedPoint {
+                    lat: q.lat,
+                    lon: q.lon,
+                    point_name: format!("打卡点{}", k + 1),
+                    // 点位接口只给 BD-09，GCJ 留 0 由 fixed_point_items 反算
+                    // （与 `flow::dry_run` 的映射一致）。
+                    glat: 0.0,
+                    glon: 0.0,
+                }
+            })
+            .collect();
+        let snap_cps: Vec<(f64, f64)> = fixed.iter().map(|f| (f.lat, f.lon)).collect();
+        crate::track::align_samples_to_checkpoints(&mut track, &snap_cps);
+        crate::track::snap_checkpoints(&mut track, &snap_cps);
+
+        let real_len = crate::track::geo::path_length(
+            &track.iter().map(|q| (q.lat, q.lon)).collect::<Vec<_>>(),
+        )
+        .round() as i64;
+        let timed: Vec<(f64, f64, i64)> = track.iter().map(|q| (q.lat, q.lon, q.time_ms)).collect();
+        let sp = SimParams {
+            total_distance_m: real_len as f64,
+            total_sec: DURATION_SEC,
+            start_ms: START_MS,
+            target_steps: Some(1500),
+            seed: 2026,
+            ..Default::default()
+        };
+        let sim = simulate(&timed, &sp).expect("simulate");
+        Fixture {
+            track,
+            fixed,
+            sim,
+            real_len,
+        }
+    }
+
+    /// 自检那份的参数（`flow::dry_run` 里的 `probe`：身份是占位符、围栏 -1）。
+    pub(super) fn probe_params(f: &Fixture) -> SubmitParams {
+        SubmitParams {
+            uid: "probe".into(),
+            unid: "0".into(),
+            uuid: "00000000-0000-4000-8000-000000000000".into(),
+            sport_type: 1,
+            total_distance_m: f.real_len,
+            total_time_sec: DURATION_SEC,
+            total_steps: f.sim.total_steps,
+            start_time_ms: START_MS,
+            stop_time_ms: START_MS + DURATION_SEC * 1000,
+            sel_distance_m: 1500,
+            sel_run_time_sec: DURATION_SEC,
+            policy: "test-policy".into(),
+            run_area_id: -1,
+            geo_fences_json: "[]".into(),
+            total_ascent: 0,
+            alt_range: None,
+        }
+    }
+
+    /// 上传那份的参数（`flow::run_full` 里的 `params`：真实身份 + 真实围栏）。
+    pub(super) fn upload_params(f: &Fixture) -> SubmitParams {
+        SubmitParams {
+            uid: "123456".into(),
+            unid: "88".into(),
+            uuid: "0F8FAD5B-D9CB-469F-A165-70867728950E".into(),
+            run_area_id: 1668,
+            geo_fences_json: r#"[{"distance":0.0,"id":1668,"name":"学校","points":[]}]"#.into(),
+            ..probe_params(f)
+        }
+    }
+
+    /// OBS 对象里某个 gzip+base64 值解出明文。
+    fn unzip(v: &Value) -> String {
+        let raw = v.as_str().expect("OBS 每个值都是字符串");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .unwrap_or_else(|e| panic!("base64 解码失败: {e}"));
+        let mut out = String::new();
+        GzDecoder::new(&bytes[..])
+            .read_to_string(&mut out)
+            .unwrap_or_else(|e| panic!("gunzip 失败: {e}"));
+        out
+    }
+
+    /// OBS 上传对象里**真正的点位数组**（`run_data.allLocJson`）。
+    fn uploaded_points(obj: &Value) -> Vec<Value> {
+        let run: Value = serde_json::from_str(&unzip(&obj["run_data"])).expect("run_data 是 JSON");
+        serde_json::from_str(run["allLocJson"].as_str().expect("allLocJson 是字符串"))
+            .expect("allLocJson 是 JSON 数组")
+    }
+
+    /// `save_record.fivePointJson` 的内层点位数组（envelope → 串 → 数组）。
+    fn five_point_items(body: &Value) -> Vec<Value> {
+        let env: Value = serde_json::from_str(
+            body["fivePointJson"].as_str().expect("fivePointJson 是字符串"),
+        )
+        .expect("fivePointJson 是 JSON");
+        serde_json::from_str(env["fivePointJson"].as_str().expect("内层是字符串"))
+            .expect("内层是 JSON 数组")
+    }
+
+    /// 逐元素、逐字段比对两份点位。
+    fn assert_points_identical(a: &[Value], b: &[Value], label: &str) {
+        assert_eq!(a.len(), b.len(), "{label}：点位数不同");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            let (xo, yo) = (
+                x.as_object().unwrap_or_else(|| panic!("{label} 第 {i} 点不是对象")),
+                y.as_object().unwrap_or_else(|| panic!("{label} 第 {i} 点不是对象")),
+            );
+            let ka: Vec<&String> = xo.keys().collect();
+            let kb: Vec<&String> = yo.keys().collect();
+            assert_eq!(ka, kb, "{label} 第 {i} 点字段集合/顺序不同");
+            for k in ka {
+                if POINT_ALLOWED_DIFFS.contains(&k.as_str()) {
+                    continue;
+                }
+                assert_eq!(
+                    xo[k], yo[k],
+                    "{label} 第 {i} 点字段 `{k}` 不同：自检 {:?} vs 上传 {:?}",
+                    xo[k], yo[k]
+                );
+            }
+        }
+    }
+
+    /// 两份 envelope 的差异只允许落在 [`ENVELOPE_ALLOWED_DIFFS`] 里。
+    fn assert_envelope_diff_allowlisted(a: &Value, b: &Value) {
+        let (ao, bo) = (a.as_object().unwrap(), b.as_object().unwrap());
+        let mut unexpected: Vec<String> = Vec::new();
+        for k in ao.keys().chain(bo.keys()) {
+            if ENVELOPE_ALLOWED_DIFFS.contains(&k.as_str()) {
+                continue;
+            }
+            if ao.get(k) != bo.get(k) {
+                unexpected.push(format!(
+                    "{k}: 自检 {:?} vs 上传 {:?}",
+                    ao.get(k).unwrap_or(&Value::Null),
+                    bo.get(k).unwrap_or(&Value::Null)
+                ));
+            }
+        }
+        assert!(
+            unexpected.is_empty(),
+            "envelope 出现了白名单外的差异：\n  {}",
+            unexpected.join("\n  ")
+        );
+    }
+
+    /// **A4 回归**：自检校验的点位 == 真正上传到 OBS 的点位。
+    ///
+    /// 修复前这条断言必红（OBS 那份 `seed` 不同、没有平滑、没有打卡点）。
+    #[test]
+    fn selfcheck_and_upload_points_are_identical() {
+        // 白名单只在 envelope 层，而且不许夹带点位字段
+        assert!(
+            POINT_ALLOWED_DIFFS.is_empty(),
+            "点位字段的允许差异白名单必须是空的"
+        );
+        for f in POINT_FIELDS {
+            assert!(
+                !ENVELOPE_ALLOWED_DIFFS.contains(f),
+                "envelope 白名单里混进了点位字段 `{f}`——点位必须逐字段相等"
+            );
+        }
+
+        let f = fixture();
+
+        // ① 自检那份：与 `flow::dry_run` 的 probe 一字不差地组装
+        let probe = submit::build(&probe_params(&f), &f.track, &f.fixed, &f.sim)
+            .expect("自检报文应能组装");
+        // ② 提交那份（真实身份 / 真实围栏）
+        let up = upload_params(&f);
+        let submission = submit::build(&up, &f.track, &f.fixed, &f.sim).expect("提交报文应能组装");
+        // ③ 真正上传的那份：OBS 明细对象里的 run_data.allLocJson
+        let five = submission.save_record["fivePointJson"]
+            .as_str()
+            .expect("fivePointJson")
+            .to_string();
+        let payload = detail_payload_rrid(
+            &f.sim,
+            &up.uid,
+            1_328_288_734,
+            START_MS,
+            &up.uuid,
+            &five,
+            &submission.points,
+        );
+        let uploaded = uploaded_points(&payload);
+
+        assert_eq!(uploaded.len(), f.track.len(), "OBS 点位数应与轨迹点数一致");
+        assert_points_identical(&probe.points, &uploaded, "自检 vs OBS 上传");
+        assert_points_identical(&probe.points, &submission.points, "自检 vs 提交");
+        assert_points_identical(&submission.points, &uploaded, "提交 vs OBS 上传");
+
+        // 必到点数组（id / isFixed / position / isPass）两份必须一致
+        let fa = five_point_items(&probe.save_record);
+        let fb = five_point_items(&submission.save_record);
+        assert_eq!(fa.len(), 5, "应有 5 个必到点");
+        assert_points_identical(&fa, &fb, "必到点：自检 vs 提交");
+        assert!(
+            fa.iter().any(|p| p["isFixed"] == 1) && fa.iter().any(|p| p["isPass"] == true),
+            "必到点必须带 isFixed/isPass 标记：{fa:?}"
+        );
+
+        // 点位里必须真的带上了打卡点标记（`type=2`），修复前自检那份一个都没有
+        let marked = probe
+            .points
+            .iter()
+            .filter(|p| p["type"].as_i64() == Some(2))
+            .count();
+        assert!(marked > 0, "自检那份点位缺 type=2 打卡标记（probe 传了空 fixed）");
+
+        // envelope 层：差异只允许出现在白名单里
+        assert_envelope_diff_allowlisted(&probe.save_record, &submission.save_record);
+    }
+
+    /// 报告用：把两份点位前 6 个并排打出来（`--nocapture` 才有输出）。
+    #[test]
+    fn print_selfcheck_vs_upload_first_six_points() {
+        let f = fixture();
+        let probe = submit::build(&probe_params(&f), &f.track, &f.fixed, &f.sim).expect("probe");
+        let up = upload_params(&f);
+        let submission = submit::build(&up, &f.track, &f.fixed, &f.sim).expect("submit");
+        let five = submission.save_record["fivePointJson"]
+            .as_str()
+            .expect("fivePointJson")
+            .to_string();
+        let payload = detail_payload_rrid(
+            &f.sim,
+            &up.uid,
+            1_328_288_734,
+            START_MS,
+            &up.uuid,
+            &five,
+            &submission.points,
+        );
+        let uploaded = uploaded_points(&payload);
+
+        let cell = |v: &Value| -> String {
+            v.as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string())
+        };
+        println!(
+            "[fixture] {} 点 / {}m / {}s / {} 步",
+            f.track.len(),
+            f.real_len,
+            DURATION_SEC,
+            f.sim.total_steps
+        );
+        println!("idx | 自检: id / count / radius / type / bdA | OBS 上传: 同五项");
+        for (i, (a, b)) in probe.points.iter().zip(uploaded.iter()).take(6).enumerate() {
+            let row = |q: &Value| {
+                format!(
+                    "{:>14} {:>5} {:>6} {:>5} {:>8}",
+                    cell(&q["id"]),
+                    cell(&q["count"]),
+                    cell(&q["radius"]),
+                    cell(&q["type"]),
+                    cell(&q["bdA"])
+                )
+            };
+            let mark = if a == b { "=" } else { "≠" };
+            println!("{i:>3} | {} | {} {mark}", row(a), row(b));
+        }
+        println!("cp  | 自检: id / isFixed / position | OBS 上传(同一个 envelope): 同三项");
+        for q in five_point_items(&submission.save_record) {
+            println!(
+                "{:>3} | {:>14} {:>5} {:>5} | {}",
+                cell(&q["position"]),
+                cell(&q["id"]),
+                cell(&q["isFixed"]),
+                cell(&q["position"]),
+                q["pointName"].as_str().unwrap_or("")
+            );
+        }
+        assert_points_identical(&probe.points, &uploaded, "自检 vs OBS 上传");
     }
 }

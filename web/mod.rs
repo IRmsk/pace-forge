@@ -733,32 +733,39 @@ fn handle_plan(
         (pts, t.actual_length_m)
     };
 
-    // ── 由速度反推时间戳 ──
-    let (times, _speeds, real_len) = crate::track::retime(
+    // ── 上报采样：等时间 5 秒（真机节奏）──
+    //
+    // 以前是「按 5m 密采样出点 → 由速度反推时间戳」，同一条 1683m/555s 的
+    // 轨迹会在预览里画 337 个点、1.65 秒一个，真机是 114 个点、4.91 秒一个
+    // ——预览和真正提交上去的那份数据不是一个节奏。这里跟 `flow::dry_run`
+    // 走同一条采样路径（几何仍是 5m 密折线，上报点按 5 秒沿折线取）。
+    // 这一支是「自由规划」预览，`PlanRequest.checkpoints` 是空的，
+    // 所以没有点位可对齐（带点位的支路在 `flow::dry_run`）。
+    let cp_pairs: Vec<(f64, f64)> = Vec::new();
+    let times = crate::track::sample_times(total_sec, start_ms, crate::track::SAMPLE_INTERVAL_SEC);
+    let track_points: Vec<crate::track::TrackPoint> = crate::track::sample_by_time(
         &xy,
-        total_sec,
-        start_ms,
+        &times,
         start_ms as u64,
         &crate::track::KinParams::default(),
         1.0,
         8.0,
+        &[],
+        &cp_pairs,
     );
-    if times.len() != xy.len() {
+    if track_points.len() < 2 {
         return json_err(request, "时间戳生成失败");
     }
-    let track_points: Vec<crate::track::TrackPoint> = xy
+    let real_len = crate::track::geo::path_length(
+        &track_points
+            .iter()
+            .map(|q| (q.lat, q.lon))
+            .collect::<Vec<_>>(),
+    )
+    .round() as i64;
+    let pts3: Vec<(f64, f64, i64)> = track_points
         .iter()
-        .zip(&times)
-        .map(|((a, b), t)| crate::track::TrackPoint {
-            lat: *a,
-            lon: *b,
-            time_ms: *t,
-        })
-        .collect();
-    let pts3: Vec<(f64, f64, i64)> = xy
-        .iter()
-        .zip(&times)
-        .map(|((a, b), t)| (*a, *b, *t))
+        .map(|q| (q.lat, q.lon, q.time_ms))
         .collect();
 
     // ── 生物力学合成 ──
@@ -790,6 +797,7 @@ fn handle_plan(
         stop_time_ms: start_ms + total_sec * 1000,
         pace_range: None,
         step_range: None,
+        expected_interval_sec: Some(crate::track::SAMPLE_INTERVAL_SEC),
     };
     let report = crate::track::inspect(&check);
 

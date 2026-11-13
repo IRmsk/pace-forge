@@ -236,13 +236,26 @@ fn local_check(dist_km: f64, dur_min: f64) {
     println!("  轨迹点      {}", xy.len());
     println!("  绕圈        {laps:.2} 圈（单圈 {lap:.1} m）");
 
-    // 时间戳
-    let (times, _sp, real_len) = pace_forge::track::retime(
-        &xy, total_sec, start_ms, start_ms as u64,
-        &KinParams::default(), 1.0, 8.0,
+    // 上报采样：等时间 5 秒（与 `flow::dry_run` 同一条路径）
+    let times = pace_forge::track::sample_times(
+        total_sec,
+        start_ms,
+        pace_forge::track::SAMPLE_INTERVAL_SEC,
     );
-    let pts3: Vec<(f64, f64, i64)> = xy.iter().zip(&times)
-        .map(|((a, b), t)| (*a, *b, *t)).collect();
+    let track_points = pace_forge::track::sample_by_time(
+        &xy, &times, start_ms as u64, &KinParams::default(), 1.0, 8.0, &[], &[],
+    );
+    let real_len = pace_forge::track::geo::path_length(
+        &track_points.iter().map(|q| (q.lat, q.lon)).collect::<Vec<_>>(),
+    ).round() as i64;
+    let cad = pace_forge::track::cadence_stats(&track_points);
+    println!(
+        "  上报节奏    {} 点 / {:.2}s {:.1}m 一点（真机 {:.2}s {:.1}m）",
+        cad.points, cad.mean_dt_sec, cad.mean_dd_m,
+        pace_forge::track::REAL_MEAN_INTERVAL_SEC, 14.9,
+    );
+    let pts3: Vec<(f64, f64, i64)> = track_points.iter()
+        .map(|q| (q.lat, q.lon, q.time_ms)).collect();
 
     // 分桶
     let sb = speed_buckets(&pts3, start_ms, total_sec);
@@ -268,7 +281,12 @@ fn local_check(dist_km: f64, dur_min: f64) {
     println!("  平均步频    {:.1} 步/分", sim.avg_cadence);
 
     // 反检测体检
-    let rep = inspect(&xy, &sb, PointRule::default());
+    let rep = inspect(
+        &pts3.iter().map(|(a, b, _)| (*a, *b)).collect::<Vec<_>>(),
+        &sb,
+        PointRule::default(),
+        start_ms + pace_forge::track::startup_sec(total_sec) * 1000,
+    );
     println!("\n=== 点位体检（模拟 7.4.01 本地规则）===");
     println!("  {}", rep.summary());
     for line in rep.lines().iter().take(8) {
