@@ -773,9 +773,13 @@ function drawPreview(coords, fence, checkpoints) {
   // 打卡点
   if (checkpoints && checkpoints.length) {
     for (const c of checkpoints) {
+      // 高德瓦片是 GCJ-02 网格，所以打点要用 gcjLat/gcjLng（/api/plan 两个
+      // 都给了：lat/lng 是 BD-09，gcjLat/gcjLng 是 GCJ-02）。字段名与有效性
+      // 统一交给 coordOf，取不到有效坐标就跳过，不拿占位值往图上画。
+      const ll = coordOf(c);
+      if (!ll) continue;
       const color = c.passed ? '#22c55e' : '#ef4444';
-      group.addLayer(L.circleMarker([c.gcjLat != null ? c.gcjLat : c.lat,
-                                     c.gcjLng != null ? c.gcjLng : c.lng], {
+      group.addLayer(L.circleMarker(ll, {
         radius: 7, color: color, fillColor: color, fillOpacity: 0.85, weight: 2
       }).bindPopup(
         `打卡点 #${c.index}<br>${c.passed ? '✓ 轨迹经过' : '✗ 未经过'}（最近 ${c.nearest}m）`
@@ -1101,7 +1105,8 @@ function readLocInputs() {
   const lng = parseFloat($('llLng').value);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
-  if (Math.abs(lat) < 1e-9 && Math.abs(lng) < 1e-9) return null;
+  // -1 / 0 是占位哨兵（和点位解析同一套规则），填进来等于没填
+  if (isPlaceholderCoord(lat) || isPlaceholderCoord(lng)) return null;
   return { lat: lat, lng: lng, coord: $('llCoord').value };
 }
 
@@ -1328,10 +1333,15 @@ function redrawStrokes() {
     let hit = 0;
     const missed = [];
     for (const c of lastCheckpoints) {
+      // 手绘点是 Leaflet 给的 GCJ-02，这里也必须拿打卡点的 GCJ-02 来算距离。
+      // 原来写的是 [c.lat, c.lng]（BD-09），两套坐标系混算，500 米上下的偏差
+      // 会让「经过/漏掉」判反。坐标拿不到的按「漏掉」计，分母保持一致。
+      const ll = coordOf(c);
+      if (!ll) { missed.push(`#${c.index}`); continue; }
       let best = Infinity;
       // 点位到任一采样点的距离；采样点本身就够密（3 m 一个）
       for (const q of flat) {
-        const d = metersBetween([c.lat, c.lng], q);
+        const d = metersBetween(ll, q);
         if (d < best) best = d;
       }
       if (best < 25) hit++;
@@ -1691,10 +1701,12 @@ async function obsTrack(rrid, detail) {
       const raw = wrap.allLocJson;
       const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
       if (!Array.isArray(arr) || arr.length < 2) continue;
-      // gLat/gLng 是 GCJ-02，lat/lng 是 BD-09；底图按 GCJ-02 走更贴合
-      const pts = arr
-        .map(p => ({ lat: num(p.gLat) || num(p.lat), lng: num(p.gLng) || num(p.lng) }))
-        .filter(p => p.lat && p.lng);
+      // 走和 findTrack 同一个解析器：gLat/gLng 优先、占位（-1/0）剔除、
+      // 输出 [lat, lng]。
+      // 原来这里是 `num(p.gLat) || num(p.lat)` + `.filter(p => p.lat && p.lng)`：
+      // 判的是「有没有值」，而 -1 是真值，于是 -1,-1 全留下来，整条轨迹
+      // 又被画回几内亚湾——兜底路径本身也是坏的。
+      const pts = parseCoordArray(arr);
       if (pts.length > 1) {
         console.log('[obs] 命中 key:', key, '点数', pts.length);
         return pts;
@@ -1722,10 +1734,16 @@ async function selectRec(r, el) {
     // 服务端详情不带轨迹点（jsonFromObs=1 时 App 也去查手机本地库），
     // 但轨迹对象一直在 OBS 里：key 是 run_data/{rrid/1000000}/{rrid}.json。
     // 拉下来 → gzip 解压 → 取 run_data.allLocJson → 就能画线。
-    if (pts.length <= 1) {
+    //
+    // 兜底判据是「**有没有有效点位**」，不是「数组里有没有东西」：
+    // findTrack → parseCoordArray 只会吐出通过 valid() 的点，所以 pts.length
+    // 就是有效点数，0 才代表接口真的没带坐标。以前写的是 pts.length <= 1，
+    // 而 -1,-1 也算有效点（|-1| ≤ 90 当然过），114 个假点把数组塞满，
+    // 这里永远判不出「没点位」，OBS 兜底就再也走不到了。
+    if (pts.length === 0) {
       $('detail').innerHTML = '<span class="spin"></span> 从 OBS 拉轨迹…';
       const obs = await obsTrack(rrid, d);
-      if (obs && obs.length > 1) pts = obs;
+      if (obs && obs.length) pts = obs;
     }
     if (pts.length > 1) {
       const line = L.polyline(pts, { color: '#4493f8', weight: 4, opacity: .9 }).addTo(layer);
@@ -1738,10 +1756,13 @@ async function selectRec(r, el) {
       // 画不出线时**不要移动地图**。这里原来 setView 到成都 (30.5,104.0)，
       // 一个齐齐哈尔的记录点进去，地图直接跳到四川，比不画线更迷惑。
       // 保持当前视图即可，用户自己知道这条记录在哪跑的。
-      $('detail').innerHTML = detailHtml(d, 0) +
-        '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
-        '要么当时上传失败，要么 objectKey 对不上（旧版时区不稳，实测 11-07 那批 ' +
-        'UTC+8 的 key 全是 404）。这条记录在哪儿都画不出线。</div>';
+      $('detail').innerHTML = detailHtml(d, pts.length) +
+        (pts.length === 1
+          ? '<div style="margin-top:8px;color:var(--dim)">这条记录只有 1 个有效点位，连不成线。' +
+            '（按「有有效点位就不去 OBS」的规则，这里不再兜底。）</div>'
+          : '<div style="margin-top:8px;color:var(--dim)">OBS 里也没有这条记录的轨迹对象：' +
+            '要么当时上传失败，要么 objectKey 对不上（旧版时区不稳，实测 11-07 那批 ' +
+            'UTC+8 的 key 全是 404）。这条记录在哪儿都画不出线。</div>');
     }
   } catch (e) {
     $('detail').innerHTML = '<span style="color:var(--bad)">' + esc(e.message) + '</span>';
@@ -1789,7 +1810,10 @@ function detailHtml(d, n) {
  *   1. 形如 "lng,lat,lng,lat,..." 的字符串
  *   2. 形如 [[lng,lat], ...] 的数组
  *   3. 形如 [{lat,lng|lon|latitude,longitude}, ...] 的对象数组
- * 取点数最多的那一个。
+ *      —— 真机那批点位是 {lat:-1, lng:-1, gLat, gLng}，字段名与占位值都由
+ *      coordOf 处理（gLat/gLng 优先，-1/0 一律当占位丢弃）。
+ * 取**有效点数最多**的那一个（parseCoordArray 只返回通过 valid() 的点，
+ * 所以「数组很长但全是 -1」不会再赢过一段短的真轨迹）。
  */
 function findTrack(obj) {
   let best = [];
@@ -1814,10 +1838,54 @@ function findTrack(obj) {
   return best;
 }
 
+/// 占位坐标的哨兵值。
+///
+/// 真机的点位对象长这样（OBS 里 25 个字段那份，见
+/// re/zjwh740/evidence/obs_real_20261002.json）：
+///   { lat: -1.0, lng: -1.0, gLat: "48.123456", gLng: "124.123456", ... }
+/// `lat`/`lng` 固定填 -1，是 App 的「未定位」哨兵；真实坐标在 gLat/gLng。
+/// 服务端另有一批响应把 lat/lon 填 0（api/coord.rs 顶部注释写了）。
+/// 这两个值都不是坐标，不能拿来画图、也不能算「有点位」。
+function isPlaceholderCoord(v) {
+  return v === 0 || v === -1;
+}
+
 function valid(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng) &&
          Math.abs(lat) <= 90 && Math.abs(lng) <= 180 &&
-         !(lat === 0 && lng === 0);
+         !isPlaceholderCoord(lat) && !isPlaceholderCoord(lng);
+}
+
+/// 取一个坐标字段的数值。空值给 NaN（不是 0，0 在这里是哨兵），字符串
+/// "48.123456" 也认——真机把 gLat/gLng 序列化成字符串，这里必须能转。
+function coordNum(v) {
+  if (v === null || v === undefined || v === '') return NaN;
+  return Number(v);
+}
+
+/// 从任意点位对象里取出 [lat, lng]（有效坐标）；取不到给 null。
+///
+/// 规则：**成对**按优先级找，第一对通过 valid() 的就是它——
+///   ① gLat/gLng   真机与 OBS 的真实坐标（GCJ-02，可能是字符串）
+///   ② gcjLat/gcjLng  /api/plan 的打卡点（GCJ-02，对得上高德瓦片）
+///   ③ glat/glng、glat/glon   围栏 / 采样点的 GCJ-02 写法
+///   ④ lat/lng、lat/lon、latitude/longitude   兜底（多为 BD-09，且常是占位）
+/// 必须成对取：gLat 是 GCJ-02、lat 是 BD-09，跨套拼出来的点会差几百米。
+/// 一对都过不了 valid()（比如全是 -1）就返回 null——这个点没有坐标。
+function coordOf(p) {
+  if (!p || typeof p !== 'object') return null;
+  const pairs = [
+    [p.gLat, p.gLng],
+    [p.gcjLat, p.gcjLng],
+    [p.glat, p.glng], [p.glat, p.glon],
+    [p.lat, p.lng], [p.lat, p.lon],
+    [p.latitude, p.longitude], [p.latitude, p.lon],
+  ];
+  for (const [a, b] of pairs) {
+    const lat = coordNum(a), lng = coordNum(b);
+    if (valid(lat, lng)) return [lat, lng];
+  }
+  return null;
 }
 
 function parseCoordString(s) {
@@ -1850,9 +1918,11 @@ function parseCoordArray(arr) {
   if (first && typeof first === 'object') {
     const out = [];
     for (const p of arr) {
-      const lat = num(p.lat ?? p.latitude);
-      const lng = num(p.lng ?? p.lon ?? p.longitude);
-      if (valid(lat, lng)) out.push([lat, lng]);
+      // 字段名交给 coordOf：gLat/gLng 优先，占位（-1/0）剔除。
+      // 以前这里只认 lat/latitude + lng/lon/longitude，真机那批点位
+      // lat=-1,lng=-1 全部通过 valid()，114 个假点照样当成有效轨迹。
+      const ll = coordOf(p);
+      if (ll) out.push(ll);
     }
     return out;
   }
