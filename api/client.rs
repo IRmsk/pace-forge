@@ -58,10 +58,20 @@ impl DeviceProfile {
     /// `scope` 传账号 uid（或手机号）：同一个账号永远拿到同一个 device_id，
     /// 不同账号拿到不同的，避免被按设备聚合。
     pub fn for_account(scope: &str) -> Self {
-        let device_id = persistent_device_id(scope);
+        Self::for_account_in(&crate::api::session::home_dir(), scope)
+    }
+
+    /// 同上，但 HOME 基目录由调用方指定（测试注入隔离目录用）。
+    pub(crate) fn for_account_in(base: &std::path::Path, scope: &str) -> Self {
+        let device_id = persistent_device_id_in(base, scope);
         let mut d = Self { device_id: device_id.clone(), ..Self::base() };
         d.fill_derived_identity(&device_id);
         d
+    }
+
+    /// 不隔离的默认构造，但 HOME 基目录由调用方指定。
+    pub(crate) fn default_in(base: &std::path::Path) -> Self {
+        Self::for_account_in(base, "")
     }
 
     /// 由 device_id 派生其余设备标识。
@@ -135,10 +145,7 @@ impl DeviceProfile {
 
 impl Default for DeviceProfile {
     fn default() -> Self {
-        let device_id = persistent_device_id("");
-        let mut d = Self { device_id: device_id.clone(), ..Self::base() };
-        d.fill_derived_identity(&device_id);
-        d
+        Self::default_in(&crate::api::session::home_dir())
     }
 }
 
@@ -159,24 +166,27 @@ pub fn uuid_v4() -> String {
     )
 }
 
-/// 持久化的设备标识。
+/// 设备标识文件路径：`<base>/.pace-forge-device-id[-<scope 摘要>]`。
 ///
-/// 必须稳定：服务端按设备判断「是不是同一台机」。每次随机生成会让
-/// 第二次登录被判成「其他设备」，直接返回 10121（账号已在其他设备登录），
-/// 而且退出后一小时内无法再登。
+/// 注意它**不在** `<base>/.pace-forge/` 目录里，而是与数据目录同级的隐藏
+/// 文件——早期版本就是这么放的，改了会让所有老用户被判成新设备（10121）。
 ///
-/// 多账号时按 `scope` 隔离：同一台机器上的不同账号拿到不同 device_id。
-/// 物理上它们当然是同一台手机，但服务端如果按 device_id 做关联分析，
-/// 共享一个标识等于主动告诉厂商「这些号都是同一台机在刷」。
-/// 隔离后每个账号看起来来自一台独立设备。
-fn persistent_device_id(scope: &str) -> String {
-    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+/// **纯路径计算，不碰磁盘。** 测试用它把路径注入到一次性临时目录。
+pub(crate) fn device_id_path_in(base: &std::path::Path, scope: &str) -> std::path::PathBuf {
     let name = if scope.is_empty() {
         ".pace-forge-device-id".to_string()
     } else {
         format!(".pace-forge-device-id-{}", short_hash(scope))
     };
-    let path = std::path::Path::new(&dir).join(name);
+    base.join(name)
+}
+
+/// 同上，但 HOME 基目录由调用方指定（测试注入隔离目录用）。
+///
+/// 写盘走 `session::write_file_private`：父目录不存在时自己建（`$HOME` 正常
+/// 一定存在，但不把「环境一定对」当假设），权限收紧到 0600。
+pub(crate) fn persistent_device_id_in(base: &std::path::Path, scope: &str) -> String {
+    let path = device_id_path_in(base, scope);
 
     if let Ok(s) = std::fs::read_to_string(&path) {
         let t = s.trim().to_string();
@@ -186,10 +196,7 @@ fn persistent_device_id(scope: &str) -> String {
     }
 
     let id = random_hex32();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, &id);
+    let _ = crate::api::session::write_file_private(&path, id.as_bytes());
     id
 }
 
@@ -421,6 +428,7 @@ pub fn expect_ok(body: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assert_isolated, TestDir};
 
     #[test]
     fn nonce_is_uuid_v4_format() {
@@ -431,14 +439,48 @@ mod tests {
 
     #[test]
     fn device_id_is_32_hex() {
-        let d = DeviceProfile::default();
+        // 必须注入临时目录：DeviceProfile::default() 会读/写真实
+        // `$HOME/.pace-forge-device-id`，测试不能碰。
+        let t = TestDir::new("client-device-id");
+        let d = DeviceProfile::default_in(t.home());
         assert_eq!(d.device_id.len(), 32);
         assert!(d.device_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    /// 设备标识必须落在注入目录里，且同一 scope 反复读得到同一个值。
+    #[test]
+    fn device_id_is_persisted_in_isolated_dir() {
+        let t = TestDir::new("client-device-persist");
+        let a = persistent_device_id_in(t.home(), "13800000000");
+        let path = device_id_path_in(t.home(), "13800000000");
+        assert!(path.exists(), "首次应落盘: {}", path.display());
+        assert!(
+            path.starts_with(t.home()),
+            "设备标识必须写在注入基目录下，而不是 .pace-forge/ 里"
+        );
+        assert_eq!(
+            path.parent().unwrap(),
+            t.home(),
+            "设备标识是数据目录的**同级文件**，不是目录内文件"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "设备标识文件权限必须是 600");
+        }
+        assert_eq!(persistent_device_id_in(t.home(), "13800000000"), a, "同一 scope 必须稳定");
+        assert_ne!(
+            persistent_device_id_in(t.home(), "13900000000"),
+            a,
+            "不同 scope 必须是不同设备标识"
+        );
+    }
+
     #[test]
     fn headers_include_signature_and_envelope() {
-        let c = Client::new(DeviceProfile::default());
+        let t = TestDir::new("client-headers");
+        let c = Client::new(DeviceProfile::for_account_in(t.home(), "u1"));
         let (headers, session) = c.build_headers().unwrap();
         let keys: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"tokenSign"), "缺 tokenSign");
@@ -457,11 +499,14 @@ mod tests {
 
     #[test]
     fn headers_carry_credentials_when_set() {
-        let c = Client::new(DeviceProfile::default()).with_credentials(Credentials {
-            uid: Some("123".into()),
-            token: Some("tok".into()),
-            unid: Some("88".into()),
-        });
+        let t = TestDir::new("client-creds");
+        let c = Client::new(DeviceProfile::for_account_in(t.home(), "u1")).with_credentials(
+            Credentials {
+                uid: Some("123".into()),
+                token: Some("tok".into()),
+                unid: Some("88".into()),
+            },
+        );
         let (headers, _) = c.build_headers().unwrap();
         assert!(headers.iter().any(|(k, v)| k == "uid" && v == "123"));
         assert!(headers.iter().any(|(k, v)| k == "token" && v == "tok"));
@@ -471,5 +516,25 @@ mod tests {
     fn expect_ok_accepts_10000() {
         assert!(expect_ok(r#"{"error":10000,"message":"成功","data":1}"#).is_ok());
         assert!(expect_ok(r#"{"error":10121,"message":"设备异常"}"#).is_err());
+    }
+
+    /// 护栏：设备标识的注入路径**绝不能**是真实 `$HOME/.pace-forge-device-id*`。
+    ///
+    /// 模式与 `session::tests::test_data_dir_is_isolated_from_real_home` 一致。
+    /// 注意设备标识是 `$HOME` 下的**同级文件**，不在 `.pace-forge/` 目录里，
+    /// 所以这里单独断言它的基目录不能是真实 `$HOME`。
+    #[test]
+    fn device_id_path_is_isolated_from_real_home() {
+        let t = TestDir::new("client-isolated");
+        assert_isolated(&t.data(), "设备标识注入基目录");
+        let injected = device_id_path_in(t.home(), "");
+        let real = device_id_path_in(&crate::test_support::real_home(), "");
+        assert_ne!(injected, real, "注入路径不能等于生产默认路径");
+        assert_eq!(injected.file_name().unwrap(), ".pace-forge-device-id");
+        assert_eq!(
+            injected.parent().unwrap(),
+            t.home(),
+            "设备标识必须写在注入基目录下"
+        );
     }
 }

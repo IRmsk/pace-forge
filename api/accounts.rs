@@ -9,7 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use super::session::{data_dir_in, ensure_dir, home_dir, write_file_private};
 
 /// 一个账号。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -154,13 +156,12 @@ pub fn ready(&self) -> Vec<&Account> {
 // 落盘
 // ---------------------------------------------------------------------------
 
-fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".pace-forge")
-}
-
-fn book_path() -> PathBuf {
-    data_dir().join("accounts.json")
+/// 给定 HOME 基目录，拼出账号库路径：`<base>/.pace-forge/accounts.json`。
+///
+/// **纯路径计算，不碰磁盘。** 测试用它把路径注入到一次性临时目录，从而完全
+/// 不碰真实 `$HOME/.pace-forge/accounts.json`。
+pub(crate) fn book_path_in(base: &std::path::Path) -> PathBuf {
+    data_dir_in(base).join("accounts.json")
 }
 
 /// 本机密钥：由 hostname + 用户名 + 固定盐派生。
@@ -215,24 +216,15 @@ pub fn open_password(enc: &str) -> Result<String, String> {
 }
 
 /// 读账号库。文件不存在返回空库（不是错误）。
-/// 写文件并收紧权限到 0600（仅属主可读写）。
 ///
-/// `fs::write` 用默认 umask（通常 0644），同机其他用户能读到加密后的
-/// 密码和 token。machine_key 只是混淆，但没有理由让它更差。
-fn write_private(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-    }
-    f.write_all(data)?;
-    f.flush()
+/// 读路径**不建目录**：目录不存在就是「没存过账号」，直接返回空库。
+pub fn load() -> Book {
+    load_in(&home_dir())
 }
 
-pub fn load() -> Book {
-    let p = book_path();
+/// 同上，但 HOME 基目录由调用方指定（测试注入隔离目录用）。
+pub(crate) fn load_in(base: &Path) -> Book {
+    let p = book_path_in(base);
     let Ok(text) = std::fs::read_to_string(&p) else {
         return Book::default();
     };
@@ -245,36 +237,49 @@ pub fn load() -> Book {
     }
 }
 
-/// 写账号库。权限 600。
+/// 写账号库。目录不存在时自动建出来，权限 600。
+///
+/// 目录创建走 [`ensure_dir`]，文件写入走 [`write_file_private`]（0600）——
+/// 与 `session.json` 用的是同一套原语，不再各写一遍。
 pub fn save(book: &Book) -> Result<(), String> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("建目录失败: {e}"))?;
-    let p = book_path();
+    save_in(&home_dir(), book)
+}
+
+/// 同上，但 HOME 基目录由调用方指定。
+///
+/// **测试必须用这个而不是 `save()`**：`save()` 写的是真实
+/// `$HOME/.pace-forge/accounts.json`。
+pub(crate) fn save_in(base: &Path, book: &Book) -> Result<(), String> {
+    let dir = data_dir_in(base);
+    // 首次运行目录还不存在，这里负责建出来（写前必须确保）
+    ensure_dir(&dir)?;
+    let p = dir.join("accounts.json");
     let text = serde_json::to_string_pretty(book).map_err(|e| e.to_string())?;
 
     // 先写临时文件再改名，避免写一半断电把库毁了
     let tmp = p.with_extension("json.tmp");
-    write_private(&tmp, text.as_bytes()).map_err(|e| format!("写账号库失败: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
+    write_file_private(&tmp, text.as_bytes()).map_err(|e| format!("写账号库失败: {e}"))?;
     std::fs::rename(&tmp, &p).map_err(|e| format!("替换账号库失败: {e}"))?;
     Ok(())
 }
 
 /// 清掉本地所有账号的 token 并落盘。
 pub fn clear_tokens() -> Result<usize, String> {
-    let mut book = load();
+    clear_tokens_in(&home_dir())
+}
+
+/// 同上，但 HOME 基目录由调用方指定。
+pub(crate) fn clear_tokens_in(base: &Path) -> Result<usize, String> {
+    let mut book = load_in(base);
     let n = book.clear_tokens();
-    save(&book)?;
+    save_in(base, &book)?;
     Ok(n)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assert_isolated, TestDir};
 
     #[test]
     fn password_roundtrip() {
@@ -368,5 +373,109 @@ mod tests {
         let a = back.get("x").unwrap();
         assert_eq!(open_password(&a.password_enc).unwrap(), "pw");
         assert_eq!(a.token, "tok");
+    }
+
+    fn sample_book() -> Book {
+        let mut b = Book::default();
+        b.upsert(Account {
+            id: "x".into(),
+            username: "13812348888".into(),
+            password_enc: seal_password("pw").unwrap(),
+            token: "tok".into(),
+            uid: "42".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        b
+    }
+
+    /// 账号库往返必须落在**注入目录**里，不碰真实 `$HOME`。
+    #[test]
+    fn book_roundtrip_in_isolated_dir() {
+        let t = TestDir::new("accounts-roundtrip");
+        save_in(t.home(), &sample_book()).unwrap();
+
+        let path = book_path_in(t.home());
+        assert!(path.exists(), "应写在隔离目录里: {}", path.display());
+        assert!(path.starts_with(t.home()), "路径必须在注入基目录下");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "账号库含 token，权限必须是 600");
+        }
+
+        let back = load_in(t.home());
+        let a = back.get("x").expect("应读回账号");
+        assert_eq!(a.token, "tok");
+        assert_eq!(open_password(&a.password_enc).unwrap(), "pw");
+        assert!(
+            !book_path_in(t.home()).with_extension("json.tmp").exists(),
+            "临时文件应已改名，不该残留"
+        );
+    }
+
+    /// 首次运行：数据目录不存在时，`save_in` 必须自己把它建出来。
+    ///
+    /// 这是「`data_dir()` 去掉 create_dir_all 副作用之后，谁负责建目录」的
+    /// 回归测试——建目录的责任落在 `save_in`（经 `ensure_dir`）。
+    #[test]
+    fn save_creates_data_dir_on_first_write() {
+        let t = TestDir::new("accounts-first-run");
+        let data = t.data();
+        assert_eq!(data.file_name().unwrap(), ".pace-forge");
+        assert!(!data.exists(), "注入目录下不该预先存在 .pace-forge");
+
+        save_in(t.home(), &sample_book()).unwrap();
+
+        assert!(data.exists(), "首次落盘必须自动创建数据目录");
+        assert!(data.join("accounts.json").exists());
+        assert_eq!(load_in(t.home()).accounts.len(), 1);
+    }
+
+    /// 从未写过账号库时返回空库，且**不**因为读而创建目录。
+    #[test]
+    fn missing_book_is_empty_and_creates_nothing() {
+        let t = TestDir::new("accounts-missing");
+        let b = load_in(t.home());
+        assert!(b.accounts.is_empty());
+        assert!(!t.data().exists(), "读路径不该创建数据目录");
+    }
+
+    /// `clear_tokens_in` 只改注入目录里的账号库。
+    #[test]
+    fn clear_tokens_works_on_isolated_dir() {
+        let t = TestDir::new("accounts-clear");
+        save_in(t.home(), &sample_book()).unwrap();
+        assert_eq!(clear_tokens_in(t.home()).unwrap(), 1);
+        let back = load_in(t.home());
+        let a = back.get("x").unwrap();
+        assert!(a.token.is_empty(), "token 应被清空");
+        assert!(!a.logged_in());
+    }
+
+    /// 护栏：账号库的注入路径**绝不能**是真实 `$HOME/.pace-forge`。
+    ///
+    /// 模式与 `session::tests::test_data_dir_is_isolated_from_real_home` 一致。
+    /// 谁哪天把 `save_in` / `load_in` 改回 `save()` / `load()`，配合下面的
+    /// `default_book_path_matches_production_layout` 会立刻暴露。
+    #[test]
+    fn accounts_paths_are_isolated_from_real_home() {
+        let t = TestDir::new("accounts-isolated");
+        assert_isolated(&book_path_in(t.home()), "账号库注入路径");
+        // 注入路径与生产默认路径必须不同
+        assert_ne!(
+            book_path_in(t.home()),
+            book_path_in(&crate::test_support::real_home()),
+            "注入路径不能等于生产默认路径"
+        );
+    }
+
+    /// 生产默认路径仍是 `$HOME/.pace-forge/accounts.json`（布局不能变）。
+    #[test]
+    fn default_book_path_matches_production_layout() {
+        let p = book_path_in(&crate::test_support::real_home());
+        assert_eq!(p.file_name().unwrap(), "accounts.json");
+        assert_eq!(p.parent().unwrap().file_name().unwrap(), ".pace-forge");
     }
 }

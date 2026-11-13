@@ -15,5 +15,11 @@ pub mod crypto;
 pub mod track;
 pub mod web;
 
+/// 测试专用的一次性隔离目录（只在 `cargo test` 下编译）。
+///
+/// 见模块注释：测试里绝不允许碰真实 `$HOME/.pace-forge`。
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// 协议层版本。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

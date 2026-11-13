@@ -223,11 +223,37 @@ pub fn fetch_policy_for(client: &Client, run_mode: i64) -> Result<PolicyInfo, St
     let v = expect_ok(&raw)?;
     // 策略响应里可能有点位判定相关的字段，我们只解析了四个。
     // 把原始 JSON 落盘，逐字段比对 runMode=1 与 runMode=2 的差异。
-    if let Ok(dir) = std::env::var("PACE_DUMP_POLICY") {
-        let path = format!("{dir}/policy-runmode{run_mode}.json");
-        let _ = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default());
-    }
+    dump_policy_in(dump_dir().as_deref(), run_mode, &v);
     parse_policy_response(&v)
+}
+
+/// 策略调试转储目录。
+///
+/// **默认不落盘**（返回 `None`）：只有显式设置 `PACE_DUMP_POLICY=<目录>`
+/// 才写。策略响应里有考生身份相关字段，不该无声无息地堆进 `$HOME`；也正因为
+/// 默认关闭，跑测试不可能往真实 `$HOME` 里多写一个文件。
+pub fn dump_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("PACE_DUMP_POLICY").map(std::path::PathBuf::from)
+}
+
+/// 策略转储文件路径：`<dir>/policy-runmode<runMode>.json`。
+///
+/// **纯路径计算，不碰磁盘。** 测试注入一次性临时目录用。
+pub(crate) fn dump_policy_path_in(dir: &std::path::Path, run_mode: i64) -> std::path::PathBuf {
+    dir.join(format!("policy-runmode{run_mode}.json"))
+}
+
+/// 落一份策略原文到 `dir`（`None` = 不落盘）。
+///
+/// 走 `session::write_file_private`：目录不存在时自己建（`PACE_DUMP_POLICY`
+/// 指向一个还不存在的目录时，早先的 `fs::write` 会静默失败），权限 0600。
+fn dump_policy_in(dir: Option<&std::path::Path>, run_mode: i64, v: &Value) {
+    let Some(dir) = dir else {
+        return;
+    };
+    let path = dump_policy_path_in(dir, run_mode);
+    let body = serde_json::to_string_pretty(v).unwrap_or_default();
+    let _ = super::session::write_file_private(&path, body.as_bytes());
 }
 
 /// 拿不到策略时的兜底值。
@@ -320,6 +346,65 @@ mod tests {
     fn missing_timestamp_is_error() {
         assert!(parse_policy_response(&json!({"policy": 1})).is_err());
     }
+
+    /// 护栏：策略转储路径的注入版**绝不能**落到真实 `$HOME`。
+    ///
+    /// 模式与 `session::tests::test_data_dir_is_isolated_from_real_home` 一致。
+    /// 策略响应含考生身份字段，默认根本不落盘；这一条同时锁住「默认关闭」
+    /// 这个前提——谁哪天给 `dump_dir()` 加了个 `$HOME/...` 兜底，测试立刻炸。
+    #[test]
+    fn policy_dump_path_is_isolated_from_real_home() {
+        use crate::test_support::{assert_isolated, TestDir};
+
+        let t = TestDir::new("policy-dump");
+        let injected = dump_policy_path_in(&t.data(), 1);
+        assert_isolated(injected.parent().unwrap(), "策略转储目录");
+        assert_ne!(
+            injected,
+            dump_policy_path_in(&crate::test_support::real_data_dir(), 1),
+            "注入路径不能等于真实 $HOME/.pace-forge 下的路径"
+        );
+        assert_eq!(
+            injected.file_name().unwrap().to_string_lossy(),
+            "policy-runmode1.json"
+        );
+
+        // 没有显式设置环境变量时，默认**不落盘**
+        if std::env::var_os("PACE_DUMP_POLICY").is_none() {
+            assert_eq!(dump_dir(), None, "默认不该有转储目录，否则测试会写真实 HOME");
+        }
+    }
+
+    /// 转储只在显式给定目录时写，且目录不存在时自己建、权限 600。
+    #[test]
+    fn dump_policy_writes_only_with_injected_dir() {
+        use crate::test_support::TestDir;
+
+        let t = TestDir::new("policy-write");
+        let dump = t.home().join("dumps");
+        assert!(!dump.exists(), "转储目录还不存在，正好验证首次创建");
+
+        let v = json!({"timestamp": 1, "policy": 0});
+        dump_policy_in(Some(&dump), 2, &v);
+
+        let path = dump_policy_path_in(&dump, 2);
+        assert!(path.exists(), "应写出 {}", path.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "转储文件权限必须是 600");
+        }
+
+        // None = 完全不落盘（默认行为）
+        let before = std::fs::read_dir(&dump).unwrap().count();
+        dump_policy_in(None, 3, &v);
+        assert_eq!(
+            std::fs::read_dir(&dump).unwrap().count(),
+            before,
+            "无转储目录时不该写任何文件"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -397,6 +482,7 @@ mod pace_range_tests {
             start_time_ms: 1_790_000_000_000,
             stop_time_ms: 1_790_000_800_000,
             pace_range: Some((3.0, 5.0)),
+            expected_interval_sec: None,
         };
         let r = crate::track::inspect(&c);
         let has = r

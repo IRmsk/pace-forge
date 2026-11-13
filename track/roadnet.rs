@@ -7,6 +7,7 @@
 //! 道路、台阶都算），栅格化成图，然后沿图走。
 
 use super::geo::{distance, m_per_deg_lat, m_per_deg_lng};
+use crate::api::session::home_dir;
 use serde_json::Value;
 
 /// Overpass 端点。主站经常 502/504，准备了两个镜像轮询。
@@ -179,20 +180,25 @@ pub fn fetch(bbox: (f64, f64, f64, f64)) -> Result<RoadNet, String> {
     Ok(net)
 }
 
-/// 本地文件缓存，按 bbox 保留 3 位小数（约 100m 精度）。
-fn cache_path(bbox: (f64, f64, f64, f64)) -> std::path::PathBuf {
+/// 本地文件缓存路径，按 bbox 保留 3 位小数（约 100m 精度）。
+///
+/// 缓存目录走 `session::data_dir_in`，**纯路径计算不碰磁盘**；建目录的责任
+/// 在写盘处（`session::write_file_private`）。生产入口是
+/// [`cache_get`] / [`cache_put`]，它们用 `home_dir()` 作为 base 转调本函数。
+fn cache_path_in(base: &std::path::Path, bbox: (f64, f64, f64, f64)) -> std::path::PathBuf {
     let key = format!(
         "{:.3}_{:.3}_{:.3}_{:.3}",
         bbox.0, bbox.1, bbox.2, bbox.3
     );
-    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(dir)
-        .join(".pace-forge")
-        .join(format!("roads-{key}.json"))
+    crate::api::session::data_dir_in(base).join(format!("roads-{key}.json"))
 }
 
 fn cache_get(bbox: (f64, f64, f64, f64)) -> Option<RoadNet> {
-    let path = cache_path(bbox);
+    cache_get_in(&home_dir(), bbox)
+}
+
+fn cache_get_in(base: &std::path::Path, bbox: (f64, f64, f64, f64)) -> Option<RoadNet> {
+    let path = cache_path_in(base, bbox);
     let meta = std::fs::metadata(&path).ok()?;
     // 超过 7 天就重拉
     if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
@@ -232,10 +238,11 @@ fn cache_get(bbox: (f64, f64, f64, f64)) -> Option<RoadNet> {
 }
 
 fn cache_put(bbox: (f64, f64, f64, f64), net: &RoadNet) {
-    let path = cache_path(bbox);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+    cache_put_in(&home_dir(), bbox, net)
+}
+
+fn cache_put_in(base: &std::path::Path, bbox: (f64, f64, f64, f64), net: &RoadNet) {
+    let path = cache_path_in(base, bbox);
     let segs: Vec<Value> = net
         .segments
         .iter()
@@ -247,7 +254,8 @@ fn cache_put(bbox: (f64, f64, f64, f64), net: &RoadNet) {
         })
         .collect();
     let body = serde_json::json!({ "segments": segs });
-    let _ = std::fs::write(&path, body.to_string());
+    // 目录不存在时由 write_file_private 建出来（首次运行）
+    let _ = crate::api::session::write_file_private(&path, body.to_string().as_bytes());
 }
 
 /// 拉围栏内的水域（湖、河、池塘）。
@@ -312,7 +320,12 @@ pub fn fetch_water(bbox: (f64, f64, f64, f64)) -> Result<Vec<Vec<(f64, f64)>>, S
 /// OSM 在国内校园几乎空白，Overpass 拉不到建筑轮廓，只能人工标一次。
 /// 存一个文件，所有账号、所有之后的规划都用它。
 pub fn load_local_blockers() -> Vec<Vec<(f64, f64)>> {
-    let path = blockers_path();
+    load_local_blockers_in(&home_dir())
+}
+
+/// 同上，但 HOME 基目录由调用方指定（测试注入隔离目录用）。
+fn load_local_blockers_in(base: &std::path::Path) -> Vec<Vec<(f64, f64)>> {
+    let path = blockers_path_in(base);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -340,22 +353,29 @@ pub fn load_local_blockers() -> Vec<Vec<(f64, f64)>> {
 
 /// 保存本地禁区。
 pub fn save_local_blockers(polys: &[Vec<(f64, f64)>]) -> Result<(), String> {
-    let path = blockers_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建目录失败: {e}"))?;
-    }
+    save_local_blockers_in(&home_dir(), polys)
+}
+
+/// 同上，但 HOME 基目录由调用方指定。
+///
+/// 首次运行（`~/.pace-forge/` 还不存在）时由 `write_file_private` 建目录。
+fn save_local_blockers_in(
+    base: &std::path::Path,
+    polys: &[Vec<(f64, f64)>],
+) -> Result<(), String> {
+    let path = blockers_path_in(base);
     let body = serde_json::json!({
         "polys": polys
             .iter()
             .map(|p| p.iter().map(|q| vec![q.0, q.1]).collect::<Vec<_>>())
             .collect::<Vec<_>>()
     });
-    std::fs::write(&path, body.to_string()).map_err(|e| format!("写文件失败: {e}"))
+    crate::api::session::write_file_private(&path, body.to_string().as_bytes())
+        .map_err(|e| format!("写文件失败: {e}"))
 }
 
-fn blockers_path() -> std::path::PathBuf {
-    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(dir).join(".pace-forge").join("blockers.json")
+fn blockers_path_in(base: &std::path::Path) -> std::path::PathBuf {
+    crate::api::session::data_dir_in(base).join("blockers.json")
 }
 
 /// 拉围栏内的建筑物轮廓。
@@ -421,16 +441,25 @@ fn fetch_polys(query: &str, what: &str) -> Result<Vec<Vec<(f64, f64)>>, String> 
     Ok(polys)
 }
 
-fn poly_cache_path(bbox: (f64, f64, f64, f64), kind: &str) -> std::path::PathBuf {
+fn poly_cache_path_in(
+    base: &std::path::Path,
+    bbox: (f64, f64, f64, f64),
+    kind: &str,
+) -> std::path::PathBuf {
     let key = format!("{:.3}_{:.3}_{:.3}_{:.3}", bbox.0, bbox.1, bbox.2, bbox.3);
-    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(dir)
-        .join(".pace-forge")
-        .join(format!("{kind}-{key}.json"))
+    crate::api::session::data_dir_in(base).join(format!("{kind}-{key}.json"))
 }
 
 fn poly_cache_get(bbox: (f64, f64, f64, f64), kind: &str) -> Option<Vec<Vec<(f64, f64)>>> {
-    let path = poly_cache_path(bbox, kind);
+    poly_cache_get_in(&home_dir(), bbox, kind)
+}
+
+fn poly_cache_get_in(
+    base: &std::path::Path,
+    bbox: (f64, f64, f64, f64),
+    kind: &str,
+) -> Option<Vec<Vec<(f64, f64)>>> {
+    let path = poly_cache_path_in(base, bbox, kind);
     let meta = std::fs::metadata(&path).ok()?;
     if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
         if age.as_secs() > 30 * 86400 {
@@ -457,26 +486,36 @@ fn poly_cache_get(bbox: (f64, f64, f64, f64), kind: &str) -> Option<Vec<Vec<(f64
 }
 
 fn poly_cache_put(bbox: (f64, f64, f64, f64), kind: &str, polys: &[Vec<(f64, f64)>]) {
-    let path = poly_cache_path(bbox, kind);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+    poly_cache_put_in(&home_dir(), bbox, kind, polys)
+}
+
+fn poly_cache_put_in(
+    base: &std::path::Path,
+    bbox: (f64, f64, f64, f64),
+    kind: &str,
+    polys: &[Vec<(f64, f64)>],
+) {
+    let path = poly_cache_path_in(base, bbox, kind);
     let body = serde_json::json!({
         "polys": polys.iter().map(|p| p.iter().map(|q| vec![q.0, q.1]).collect::<Vec<_>>()).collect::<Vec<_>>()
     });
-    let _ = std::fs::write(&path, body.to_string());
+    let _ = crate::api::session::write_file_private(&path, body.to_string().as_bytes());
 }
 
-fn water_cache_path(bbox: (f64, f64, f64, f64)) -> std::path::PathBuf {
+fn water_cache_path_in(base: &std::path::Path, bbox: (f64, f64, f64, f64)) -> std::path::PathBuf {
     let key = format!("{:.3}_{:.3}_{:.3}_{:.3}", bbox.0, bbox.1, bbox.2, bbox.3);
-    let dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::PathBuf::from(dir)
-        .join(".pace-forge")
-        .join(format!("water-{key}.json"))
+    crate::api::session::data_dir_in(base).join(format!("water-{key}.json"))
 }
 
 fn water_cache_get(bbox: (f64, f64, f64, f64)) -> Option<Vec<Vec<(f64, f64)>>> {
-    let path = water_cache_path(bbox);
+    water_cache_get_in(&home_dir(), bbox)
+}
+
+fn water_cache_get_in(
+    base: &std::path::Path,
+    bbox: (f64, f64, f64, f64),
+) -> Option<Vec<Vec<(f64, f64)>>> {
+    let path = water_cache_path_in(base, bbox);
     let meta = std::fs::metadata(&path).ok()?;
     if let Ok(age) = meta.modified().and_then(|t| t.elapsed().map_err(std::io::Error::other)) {
         if age.as_secs() > 30 * 86400 {
@@ -503,14 +542,15 @@ fn water_cache_get(bbox: (f64, f64, f64, f64)) -> Option<Vec<Vec<(f64, f64)>>> {
 }
 
 fn water_cache_put(bbox: (f64, f64, f64, f64), polys: &[Vec<(f64, f64)>]) {
-    let path = water_cache_path(bbox);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+    water_cache_put_in(&home_dir(), bbox, polys)
+}
+
+fn water_cache_put_in(base: &std::path::Path, bbox: (f64, f64, f64, f64), polys: &[Vec<(f64, f64)>]) {
+    let path = water_cache_path_in(base, bbox);
     let body = serde_json::json!({
         "polys": polys.iter().map(|p| p.iter().map(|q| vec![q.0, q.1]).collect::<Vec<_>>()).collect::<Vec<_>>()
     });
-    let _ = std::fs::write(&path, body.to_string());
+    let _ = crate::api::session::write_file_private(&path, body.to_string().as_bytes());
 }
 
 /// 最小 urlencode（只处理查询里会出现的字符）。
@@ -812,5 +852,120 @@ mod tests {
         };
         let (cy, cx) = (ay + vy * t, ax + vx * t);
         ((cy - py).powi(2) + (cx - px).powi(2)).sqrt() < tol_m
+    }
+
+    // ------------------------------------------------------------- 缓存隔离
+
+    use crate::test_support::{assert_isolated, TestDir};
+
+    const BBOX: (f64, f64, f64, f64) = (31.230, 121.473, 31.240, 121.484);
+
+    /// 路网缓存的读写必须全部落在**注入目录**里，并在首次写时自动建目录。
+    #[test]
+    fn roadnet_cache_roundtrip_in_isolated_dir() {
+        let t = TestDir::new("roadnet-cache");
+        let data = t.data();
+        assert!(!data.exists(), "注入目录下不该预先存在 .pace-forge");
+
+        // 首次运行：目录不存在也要能写进去
+        cache_put_in(t.home(), BBOX, &l_shape_net());
+        assert!(data.exists(), "首次写缓存应自动创建数据目录");
+
+        let path = cache_path_in(t.home(), BBOX);
+        assert!(path.exists(), "缓存文件应存在: {}", path.display());
+        assert!(path.starts_with(t.home()), "缓存必须写在注入基目录下");
+
+        let back = cache_get_in(t.home(), BBOX).expect("应能读回缓存");
+        assert_eq!(back.segments.len(), 2);
+        assert_eq!(back.segments[0].kind, "footway");
+        // 命中缓存时 source 里有「本地缓存」字样
+        assert!(back.source.contains("本地缓存"), "source={}", back.source);
+
+        // 没写过的 bbox 读不到
+        assert!(cache_get_in(t.home(), (10.0, 20.0, 10.1, 20.1)).is_none());
+    }
+
+    /// 手绘禁区（blockers.json）走同一套隔离与建目录逻辑。
+    #[test]
+    fn blockers_roundtrip_in_isolated_dir() {
+        let t = TestDir::new("roadnet-blockers");
+        assert!(!t.data().exists());
+
+        let polys = vec![
+            vec![(31.23, 121.47), (31.23, 121.48), (31.24, 121.48)],
+            vec![(31.25, 121.49), (31.25, 121.50), (31.26, 121.50)],
+        ];
+        save_local_blockers_in(t.home(), &polys).unwrap();
+        assert!(t.data().exists(), "首次写禁区应自动创建数据目录");
+        assert!(blockers_path_in(t.home()).starts_with(t.home()));
+
+        let back = load_local_blockers_in(t.home());
+        assert_eq!(back.len(), 2);
+        assert!((back[0][0].0 - 31.23).abs() < 1e-9);
+
+        // 从未写过 → 空列表而不是 panic
+        let t2 = TestDir::new("roadnet-blockers-empty");
+        assert!(load_local_blockers_in(t2.home()).is_empty());
+        assert!(!t2.data().exists(), "读路径不该创建数据目录");
+    }
+
+    /// 水体 / 建筑轮廓缓存同样要能注入。
+    #[test]
+    fn poly_and_water_cache_roundtrip_in_isolated_dir() {
+        let t = TestDir::new("roadnet-poly");
+        let polys = vec![vec![(31.23, 121.47), (31.23, 121.48), (31.24, 121.48)]];
+
+        poly_cache_put_in(t.home(), BBOX, "buildings", &polys);
+        let got = poly_cache_get_in(t.home(), BBOX, "buildings").expect("建筑缓存应命中");
+        assert_eq!(got.len(), 1);
+        assert!(poly_cache_path_in(t.home(), BBOX, "buildings").starts_with(t.data()));
+
+        water_cache_put_in(t.home(), BBOX, &polys);
+        let got = water_cache_get_in(t.home(), BBOX).expect("水体缓存应命中");
+        assert_eq!(got.len(), 1);
+        assert!(water_cache_path_in(t.home(), BBOX).starts_with(t.data()));
+    }
+
+    /// 护栏：四类缓存路径的默认 base 都**绝不能**落到真实 `$HOME/.pace-forge`。
+    ///
+    /// 模式与 `session::tests::test_data_dir_is_isolated_from_real_home` 一致。
+    /// 谁哪天把 `cache_put_in` / `save_local_blockers_in` 改回 `cache_put` /
+    /// `save_local_blockers`，注入路径就会等于生产路径，这条立刻炸。
+    #[test]
+    fn roadnet_cache_paths_are_isolated_from_real_home() {
+        let t = TestDir::new("roadnet-isolated");
+        let home = t.home();
+        let real = crate::test_support::real_home();
+
+        for (label, injected, production) in [
+            (
+                "roads 缓存",
+                cache_path_in(home, BBOX),
+                cache_path_in(&real, BBOX),
+            ),
+            (
+                "blockers",
+                blockers_path_in(home),
+                blockers_path_in(&real),
+            ),
+            (
+                "buildings 缓存",
+                poly_cache_path_in(home, BBOX, "buildings"),
+                poly_cache_path_in(&real, BBOX, "buildings"),
+            ),
+            (
+                "water 缓存",
+                water_cache_path_in(home, BBOX),
+                water_cache_path_in(&real, BBOX),
+            ),
+        ] {
+            assert_isolated(injected.parent().unwrap(), label);
+            assert_ne!(injected, production, "{label}: 注入路径不能等于生产路径");
+            assert!(
+                !injected.starts_with(crate::test_support::real_data_dir()),
+                "{label}: 不能落在真实 $HOME/.pace-forge 之下: {}",
+                injected.display()
+            );
+        }
     }
 }

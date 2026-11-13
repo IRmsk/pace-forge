@@ -140,13 +140,20 @@ impl Mask {
 
 // ------------------------------------------------------------------ 拉瓦片
 
-fn cache_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home).join(".pace-forge").join("tiles")
+/// 瓦片缓存目录：`<base>/.pace-forge/tiles`（纯路径计算，不碰磁盘）。
+///
+/// 测试把 `base` 注入成一次性临时目录，从而完全不碰真实
+/// `$HOME/.pace-forge/tiles`。
+fn cache_dir_in(base: &std::path::Path) -> PathBuf {
+    crate::api::session::data_dir_in(base).join("tiles")
 }
 
 fn tile_path(x: i32, y: i32) -> PathBuf {
-    cache_dir().join(format!("{ZOOM}_{x}_{y}.png"))
+    tile_path_in(&crate::api::session::home_dir(), x, y)
+}
+
+fn tile_path_in(base: &std::path::Path, x: i32, y: i32) -> PathBuf {
+    cache_dir_in(base).join(format!("{ZOOM}_{x}_{y}.png"))
 }
 
 /// 拉一张瓦片，失败换子域重试。缓存 30 天——底图变化极慢。
@@ -187,10 +194,8 @@ fn fetch_tile(x: i32, y: i32) -> Result<image::RgbImage, String> {
             }
         }
         let b = got.ok_or_else(|| format!("瓦片 {x}/{y} 拉取失败（{last}）"))?;
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&path, &b);
+        // 目录不存在时由 write_file_private 建出来（首次运行）
+        let _ = crate::api::session::write_file_private(&path, &b);
         b
     } else {
         bytes
@@ -1346,6 +1351,42 @@ pub fn walk_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{assert_isolated, TestDir};
+
+    /// 护栏：瓦片缓存目录的注入版**绝不能**落到真实 `$HOME/.pace-forge/tiles`。
+    ///
+    /// 模式与 `session::tests::test_data_dir_is_isolated_from_real_home` 一致。
+    /// 谁哪天把 `tile_path_in` 改回 `cache_dir()`，这条立刻炸。
+    #[test]
+    fn tile_cache_dir_is_isolated_from_real_home() {
+        let t = TestDir::new("tiles-isolated");
+        let injected = cache_dir_in(t.home());
+        assert_isolated(&injected, "瓦片缓存目录");
+        assert_ne!(
+            injected,
+            cache_dir_in(&crate::test_support::real_home()),
+            "注入路径不能等于生产路径"
+        );
+        assert_eq!(injected.file_name().unwrap(), "tiles");
+        assert_eq!(
+            injected.parent().unwrap().file_name().unwrap(),
+            ".pace-forge"
+        );
+    }
+
+    /// 瓦片文件名布局不能变（`<base>/.pace-forge/tiles/<z>_<x>_<y>.png`），
+    /// 否则老机器上的缓存全部失效、整片区域要重新拉一遍瓦片。
+    #[test]
+    fn tile_path_layout_is_stable_and_injected() {
+        let t = TestDir::new("tiles-path");
+        let p = tile_path_in(t.home(), 123, 456);
+        assert!(p.starts_with(t.data()), "瓦片必须落在注入的数据目录下");
+        assert_eq!(
+            p.file_name().unwrap().to_string_lossy(),
+            format!("{ZOOM}_123_456.png")
+        );
+        assert!(!t.data().exists(), "只算路径不该创建目录");
+    }
 
     #[test]
     fn mercator_roundtrip() {
