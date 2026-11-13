@@ -5,21 +5,21 @@
 pub mod buckets;
 pub mod detect;
 pub mod fence_route;
+pub mod stadium;
 pub mod roadnet;
 pub mod tileroad;
 pub mod biomech;
 pub mod kinematics;
 pub mod preflight;
 pub mod simulate;
-pub mod stadium;
 pub mod geo;
 pub mod planner;
 
+pub use stadium::{campus_oval_track, lap_length, lane_radius, looks_like_stadium, random_oval, stadium_track, OvalSpec, StadiumSpec};
 pub use biomech::{cadence_for, fatigue_from_km, gait, ou_cadence_series, speed_from, stride_for, Gait};
 pub use buckets::{make_jitter, speed_buckets, step_buckets, SpeedBucket, StepBucket};
 pub use kinematics::{arc_and_curvature, pace_profile, speed_limit_ahead, turn_speed_limit, KinParams};
 pub use preflight::{inspect, Check, Issue, Level, Report};
 pub use simulate::{retime, simulate, validate, SimParams, SimResult};
-pub use stadium::{lap_length, lane_radius, looks_like_stadium, stadium_track, StadiumSpec};
 pub use geo::{distance, path_length, sample_along, scale_to_length};
 pub use planner::{assign_times, plan, Checkpoint, PlanRequest, PlanResult, TrackPoint};

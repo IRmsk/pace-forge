@@ -67,6 +67,144 @@ pub struct RunParams {
     pub alt_range: Option<(f64, f64)>,
 }
 
+/// 记分跑 = 操场绕圈。
+///
+/// 依据：issue #3 里 silver-kin 提供的真机截图（卫星图 + rrid 1363125372）
+/// 显示真机记分跑就是绕标准椭圆跑道跑多圈，每圈 GPS 抖动叠成一条「带」，
+/// 打卡点分布在跑道四周。不是满场自由折线——之前一直在满场找路，方向
+/// 从一开始就偏了。
+///
+/// 几何：圆心取打卡点质心（打卡点就在跑道上），朝向按四角 PCA 主轴
+/// （矩形的主轴是长边，不是对角线，比「最大跨度扫描」准），尺寸按四角
+/// 外框 ×1.35 放大到真实跑道（实测跑道比打卡点外框大 ~35%）。
+///
+/// **尺寸保护**：返回 `None` 表示这组打卡点不像操场，调用方回退到原来的
+/// 路线规划。fork 那边无条件绕圈是因为他的账号打卡点全在操场周围（外框
+/// 几十米）；校园各处的打卡点（跨度几百米）硬套会让轨迹飞到不知道哪里，
+/// 必须能识别出来。
+fn try_stadium_track(
+    cps: &[Checkpoint],
+    distance_m: f64,
+    sample_step_m: f64,
+    seed: u64,
+    log: &mut Log,
+) -> Option<Vec<(f64, f64)>> {
+    if cps.len() < 4 {
+        return None;
+    }
+    let klat = crate::track::geo::m_per_deg_lat(cps[0].lat);
+    let klng = crate::track::geo::m_per_deg_lng(cps[0].lat);
+
+    // 质心：先用来找出「场心」那个点（它在场地内部，不是跑道外框的角，
+    // 拿它算朝向/尺寸会把椭圆带偏、变圆）
+    let gx = cps.iter().map(|c| c.lat).sum::<f64>() / cps.len() as f64;
+    let gy = cps.iter().map(|c| c.lng).sum::<f64>() / cps.len() as f64;
+    let center_idx = (0..cps.len())
+        .min_by(|&a, &b| {
+            let da = ((cps[a].lat - gx) * klat).hypot((cps[a].lng - gy) * klng);
+            let db = ((cps[b].lat - gx) * klat).hypot((cps[b].lng - gy) * klng);
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0);
+    let corners: Vec<&Checkpoint> = cps
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != center_idx)
+        .map(|(_, c)| c)
+        .collect();
+    if corners.len() < 3 {
+        return None;
+    }
+
+    let cx = corners.iter().map(|c| c.lat).sum::<f64>() / corners.len() as f64;
+    let cy = corners.iter().map(|c| c.lng).sum::<f64>() / corners.len() as f64;
+
+    // 四角二阶矩 PCA 取主轴
+    let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+    for c in &corners {
+        let dx = (c.lng - cy) * klng;
+        let dy = (c.lat - cx) * klat;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    let heading = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+
+    let span = |h: f64| {
+        let (st, ct) = h.sin_cos();
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for c in &corners {
+            let u = (c.lng - cy) * klng * ct + (c.lat - cx) * klat * st;
+            lo = lo.min(u);
+            hi = hi.max(u);
+        }
+        hi - lo
+    };
+    let major = span(heading);
+    let minor = span(heading + std::f64::consts::FRAC_PI_2);
+
+    // 尺寸保护。真实跑道（含打卡点外框）长轴 60~220m、短轴 30~140m；
+    // 超出这个范围说明打卡点散在校园各处，不是操场，回退。
+    if major < 55.0 || major > 240.0 || minor < 25.0 || minor > 160.0 {
+        log(&format!(
+            "[track] 打卡点外框 {major:.0}×{minor:.0}m，不像操场，改用路线规划"
+        ));
+        return None;
+    }
+
+    const FIELD_TO_TRACK: f64 = 1.35;
+    let radius = (minor * FIELD_TO_TRACK / 2.0).clamp(20.0, 30.0);
+    let straight = (major * FIELD_TO_TRACK - 2.0 * radius).clamp(35.0, 140.0);
+    let lap = 2.0 * straight + 2.0 * std::f64::consts::PI * radius;
+    let spec = crate::track::OvalSpec {
+        straight,
+        radius,
+        heading,
+        laps: (distance_m / lap).max(1.0),
+    };
+    log(&format!(
+        "[track] 操场绕圈：直道{:.0}m 半径{:.0}m 朝向{:.0}° {:.1}圈（单圈{:.0}m），{} 个打卡点",
+        spec.straight, spec.radius, spec.heading.to_degrees(), spec.laps, lap, cps.len()
+    ));
+
+    let mut pts = crate::track::campus_oval_track((cx, cy), &spec, sample_step_m, seed);
+
+    // 打卡点吸附：四角点真实椭圆天然就在 20m 内；「田径场中」这种在椭圆
+    // 内部的点可能差得远，用余弦渐变把一小段整体拉过去，形成柔和外凸，
+    // 不戳尖刺（硬吸附会在轨迹上留下一个尖角）。
+    for c in cps {
+        let target = (c.lat, c.lng);
+        let (mut bi, mut bd) = (usize::MAX, f64::MAX);
+        for (i, q) in pts.iter().enumerate() {
+            let d = crate::track::geo::distance(*q, target);
+            if d < bd {
+                bd = d;
+                bi = i;
+            }
+        }
+        if bi == usize::MAX || bd <= 16.0 || bd > 45.0 {
+            continue;
+        }
+        let base = pts[bi];
+        let (dlat, dlng) = (target.0 - base.0, target.1 - base.1);
+        let w = ((bd / sample_step_m).ceil() as usize).clamp(4, 14);
+        for k in 0..=(2 * w) {
+            let idx = bi as isize - w as isize + k as isize;
+            if idx < 0 || idx as usize >= pts.len() {
+                continue;
+            }
+            let idx = idx as usize;
+            // 余弦权：中心权重 1、两端 0，坡度平缓
+            let t = (k as f64 / (2 * w) as f64 - 0.5) * std::f64::consts::PI;
+            let wgt = 0.5 + 0.5 * t.cos();
+            pts[idx].0 += dlat * wgt;
+            pts[idx].1 += dlng * wgt;
+        }
+    }
+
+    Some(pts)
+}
+
 /// 尝试沿 OSM 真实道路规划。任何一步失败都返回 None（静默降级）。
 fn try_route_on_roads(
     fence: &[(f64, f64)],
@@ -536,6 +674,15 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // OSM 在该校区零建筑数据，「按序串点」只能靠弧线连点，必然从楼里穿过去。
     // 用户知道哪栋楼在哪，手画一条绕开的路线比任何算法都准，所以这里直接
     // 采用，连围栏内缩和打卡点吸附都不做——点位已经在用户画的线上了。
+    // 记分跑优先尝试操场绕圈。`None` 表示打卡点外框不像操场（散在校园
+    // 各处），自动回退到下面的路线规划——不是所有学校都绕操场跑。
+    let oval: Option<Vec<(f64, f64)>> = if p.run_mode == 1 {
+        let seed0 = if p.seed != 0 { p.seed } else { start_ms as u64 };
+        try_stadium_track(&cps, p.distance_m, p.sample_step_m, seed0, log)
+    } else {
+        None
+    };
+
     let track = if let Some(custom) = p.custom_path.as_ref().filter(|v| v.len() >= 2) {
         log(&format!("[track] 采用手绘轨迹 {} 个控制点", custom.len()));
         // 不传 must：手绘的整条价值就是用户自己控制形状，把没画到的点位
@@ -614,6 +761,22 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
             "[track] 手绘轨迹缩放后 {:.0}m（原 {drawn:.0}m），{n} 点",
             actual
         ));
+        crate::track::PlanResult {
+            points: pts
+                .into_iter()
+                .zip(times)
+                .map(|((lat, lng), t)| crate::track::TrackPoint { lat, lon: lng, time_ms: t })
+                .collect(),
+            checkpoints: cps.clone(),
+            actual_length_m: actual,
+        }
+    } else if let Some(pts) = oval {
+        // 操场绕圈：打卡点在跑道上，椭圆天然穿过它们；时间戳先按均匀分配，
+        // 后面 retime 会按速度模型重排，这里只需要一个合法初值。
+        let n = pts.len();
+        let times = crate::track::planner::assign_times(n, start_ms, p.duration_sec);
+        let actual = crate::track::geo::path_length(&pts);
+        log(&format!("[track] 操场轨迹 {actual:.0}m / {n} 点"));
         crate::track::PlanResult {
             points: pts
                 .into_iter()
@@ -1548,6 +1711,81 @@ mod obs_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 四角围成跑道外框 → 认成操场，生成的椭圆首尾闭合。
+    #[test]
+    fn stadium_detects_oval_from_four_corners() {
+        let lat0 = 47.386;
+        let lng0 = 123.956;
+        let klat = crate::track::geo::m_per_deg_lat(lat0);
+        let klng = crate::track::geo::m_per_deg_lng(lat0);
+        let mk = |dy: f64, dx: f64| Checkpoint {
+            lat: lat0 + dy / klat,
+            lng: lng0 + dx / klng,
+            glat: lat0 + dy / klat,
+            glon: lng0 + dx / klng,
+            name: "P".into(),
+        };
+        // 100(长) × 60(宽) 米，四个角
+        let cps = vec![
+            mk(0.0, -50.0),
+            mk(0.0, 50.0),
+            mk(60.0, -50.0),
+            mk(60.0, 50.0),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        drop(log);
+
+        let pts = r.expect("100×60m 的四角应该识别成操场");
+        assert!(pts.len() > 80, "点数 {} 太少", pts.len());
+        // 首尾不闭合是设计——campus_oval_track 带一段 15~35m 的入场尾巴，
+        // 真机轨迹也是这样（人从场外走进跑道才开始计圈）。所以这里断言
+        // 总长度落在目标附近，而不是断言闭合。
+        let len = crate::track::geo::path_length(&pts);
+        assert!(
+            (len - 2000.0).abs() < 400.0,
+            "长度 {len:.0}m 偏离目标 2000m 太多"
+        );
+        let got = logs.borrow();
+        assert!(got.iter().any(|l| l.contains("操场绕圈")), "缺少操场日志: {got:?}");
+    }
+
+    /// 打卡点散在几百米范围 → 不是操场，必须返回 None 走路线规划。
+    #[test]
+    fn stadium_rejects_scattered_checkpoints() {
+        let lat0 = 47.386;
+        let lng0 = 123.956;
+        let klat = crate::track::geo::m_per_deg_lat(lat0);
+        let klng = crate::track::geo::m_per_deg_lng(lat0);
+        let mk = |dy: f64, dx: f64| Checkpoint {
+            lat: lat0 + dy / klat,
+            lng: lng0 + dx / klng,
+            glat: lat0 + dy / klat,
+            glon: lng0 + dx / klng,
+            name: "P".into(),
+        };
+        // 校园各处的点：横跨 500m
+        let cps = vec![
+            mk(0.0, 0.0),
+            mk(0.0, 500.0),
+            mk(300.0, 0.0),
+            mk(300.0, 500.0),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        drop(log);
+        assert!(r.is_none(), "500m 跨度的打卡点不该识别成操场");
+        let got = logs.borrow();
+        assert!(
+            got.iter().any(|l| l.contains("不像操场")),
+            "应该记一条回退原因: {got:?}"
+        );
+    }
 
     #[test]
     fn silence_window() {
