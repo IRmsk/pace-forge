@@ -96,7 +96,22 @@ pub fn upload_keys(
     let mut errs = Vec::new();
     for key in keys {
         match sign_url(client, "Put", key).and_then(|url| put_object(&url, payload)) {
-            Ok(()) => ok += 1,
+            Ok(()) => {
+                // 回读校验：PUT 返回 200 只说明请求被接受，不代表对象真的落了盘
+                // （桶策略、分片写入、key 里带特殊字符都可能静默失败）。不带
+                // 校验的话，日志里「3/3 上传成功」和「App 里没有轨迹」可以同时
+                // 成立，而人只能从后者出发反推，这正是之前几轮绕圈的原因。
+                match fetch_object(client, key) {
+                    Ok(v) => {
+                        if v.is_object() || v.is_array() {
+                            ok += 1;
+                        } else {
+                            errs.push(format!("{key}: 回读内容不是 JSON 对象"));
+                        }
+                    }
+                    Err(e) => errs.push(format!("{key}: 上传后回读失败 {e}")),
+                }
+            }
             Err(e) => errs.push(format!("{key}: {e}")),
         }
     }
