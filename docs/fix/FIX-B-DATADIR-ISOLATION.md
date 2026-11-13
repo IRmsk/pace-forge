@@ -5,7 +5,7 @@
 **没有** git commit / push，**没有**碰 `web/index.html`。
 
 开工前 `git diff --stat`（基线）：`api/fence.rs api/flow.rs api/session.rs api/submit.rs track/buckets.rs track/mod.rs`（6 文件，3447 insertions）。
-收工后多出来的、属于本任务的：`api/accounts.rs`、`api/client.rs`、`api/policy.rs`、`api/session.rs`、`lib.rs`、`track/roadnet.rs`、`track/tileroad.rs` + 新增 `test_support.rs`；`web/index.html`（+108）与 `FIX-B-PARSE-COORD.md` 是**另一个并行任务**的改动，原样保留未回滚。
+收工后多出来的、属于本任务的：`api/accounts.rs`、`api/client.rs`、`api/policy.rs`、`api/session.rs`、`lib.rs`、`track/roadnet.rs`、`track/tileroad.rs` + 新增 `test_support.rs`；`web/index.html`（+108）与 `docs/fix/FIX-B-PARSE-COORD.md` 是**另一个并行任务**的改动，原样保留未回滚。
 
 ---
 

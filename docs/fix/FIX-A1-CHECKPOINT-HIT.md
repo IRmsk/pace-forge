@@ -1,6 +1,6 @@
 # FIX-A1：压缩后重新吸附打卡点（打卡点命中回归）
 
-修的是 `AUDIT-round.md` A1 那条**致命回归**：只要一笔跑带必到点（`sportType=1`），
+修的是 `docs/audit/AUDIT-round.md` A1 那条**致命回归**：只要一笔跑带必到点（`sportType=1`），
 本地自检必然拦死，一单都发不出去。
 
 - 缺陷位置：`track/mod.rs` `compress_startup`（对所有点重铺）+ `api/flow.rs` 无条件调用
@@ -283,7 +283,7 @@ Finished `dev` profile — 0 warning
 ## 五、没做的事（如实记）
 
 - **没有放宽 `CP_MISS` 阈值。** 0.5 m 保持原样：这只守门员是本地唯一挡「点位没被经过」
-  的东西，服务端真实容差目前没有证据（`AUDIT-round.md` C2）。
+  的东西，服务端真实容差目前没有证据（`docs/audit/AUDIT-round.md` C2）。
 - **没有在压缩前吸附。** 压缩会再打散，那样等于没吸。
 - **`planner` 的「装不下」判定没动。** 那 5 个点位最短闭环 2109 m，1000 m / 1683 m
   的目标在 planner 支路里确实装不下，把 `slack` 放宽等于允许轨迹穿过点位之外几百米，

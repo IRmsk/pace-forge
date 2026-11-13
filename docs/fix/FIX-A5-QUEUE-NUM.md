@@ -1,6 +1,6 @@
 # FIX-A5：`queueNum` 从「线性插值 + round」改成「固定步长 floor 分区」
 
-审计出处：`AUDIT-round.md` A5。本文件只修这一个字段，不涉及 `api/flow.rs`、
+审计出处：`docs/audit/AUDIT-round.md` A5。本文件只修这一个字段，不涉及 `api/flow.rs`、
 `api/fence.rs`、`api/session.rs`、`web/index.html`（并行任务正在改，见 §7）。
 
 ---
@@ -219,7 +219,7 @@ assert_eq!(diffs, vec![(107, 22, 23), (111, 23, 24)], "尾部的两处已知差�
            (41,17→18) (43,18→19) (45,19→20) (47,20→21) (49,21→22) (51,22→23) (53,23→24)
 ```
 
-与 `AUDIT-round.md` A5 的表格（14/114、22/55）逐项一致，说明这次修的是审计点名的
+与 `docs/audit/AUDIT-round.md` A5 的表格（14/114、22/55）逐项一致，说明这次修的是审计点名的
 那件事，不是别的东西。
 
 ### 6.5 提交报文的桶（修前是 `i as i32`）
@@ -252,7 +252,7 @@ assert_eq!(diffs, vec![(107, 22, 23), (111, 23, 24)], "尾部的两处已知差�
 | `api/submit.rs` | 1409–1411 | `apply_submit_ids` 前的注释：`queueNum` 不是 `i` |
 | `api/submit.rs` | 1544–1581 | `tests::test_sim`：加 `let su = bucket_startup(...)`（1547），两处 `queue_num: i as i32` → `crate::track::queue_num(i, n, su)`（1562、1576） |
 | `api/submit.rs` | 1729–1772 | `submit_buckets_use_60000_ids`：旧的 `[0]==0 / [1]==1` 断言换成整段 72 桶逐元素比对 + 上限 24 断言 |
-| `FIX-A5-QUEUE-NUM.md` | 新文件 | 本报告 |
+| `docs/fix/FIX-A5-QUEUE-NUM.md` | 新文件 | 本报告 |
 
 ### 7.2 我没有碰的文件（并行任务在改）
 

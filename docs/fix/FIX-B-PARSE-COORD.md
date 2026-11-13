@@ -269,7 +269,7 @@ hunk 分布（13 个 hunk）：
 
 多出来的 `api/accounts.rs`、`api/client.rs`、`api/policy.rs`、`lib.rs`、`track/roadnet.rs`、`track/tileroad.rs` 以及既有 Rust 文件的数字变化，是并行任务在同一时间推进的（开工时列表里 6 个文件，收工时 13 个），**不是本轮改的**。本轮 `git diff --numstat -- web/index.html` 是唯一由我产生的条目（开工前 `web/index.html` 根本不在 diff 里）。
 
-`git status --short` 里新增的未跟踪文件只有两份是本轮产物：`FIX-B-PARSE-COORD.md`（本报告）；另一个 `test_support.rs` 是并行任务的。`FIX-A*.md` 等都早于本轮存在。
+`git status --short` 里新增的未跟踪文件只有两份是本轮产物：`docs/fix/FIX-B-PARSE-COORD.md`（本报告）；另一个 `test_support.rs` 是并行任务的。`FIX-A*.md` 等都早于本轮存在。
 
 回归红线：没碰 `api/`、`track/`、`web/mod.rs`、`main.rs`；没有 `git commit` / `git push`；没有新增 web 轨迹播放器或任何新面板/新交互。
 

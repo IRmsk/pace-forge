@@ -1082,7 +1082,7 @@ pub fn snap_checkpoints(pts: &mut [TrackPoint], cps: &[(f64, f64)]) -> SnapRepor
 ///
 /// 早先是 `(1.0 + (pos-su)/span*23.0).round()` 的线性插值：真机 4 个点一档，
 /// 插值出来是「4.09 个点一档」，于是 `22,26,30,…,107,111` 这 14 个下标全部
-/// 偏移一档（`AUDIT-round.md` A5）。等宽台阶不会有这个累积漂移。
+/// 偏移一档（`docs/audit/AUDIT-round.md` A5）。等宽台阶不会有这个累积漂移。
 ///
 /// 尾部：真机的最后三档是 5 点 / 4 点 / 2 点（22 档占 5 个点、24 档只占 2 个），
 /// 等宽网格给的是 4/4/3，逐点对拍时 `末尾 107、111` 两个下标各差一档——
@@ -1101,7 +1101,7 @@ pub fn queue_num(pos: usize, n: usize, startup: usize) -> i32 {
 
 #[cfg(test)]
 mod queue_num_tests {
-    //! `queueNum` 的逐元素对拍（`AUDIT-round.md` A5）。
+    //! `queueNum` 的逐元素对拍（`docs/audit/AUDIT-round.md` A5）。
     //!
     //! 旧断言只断首尾（`sp[0]==0`、`sp.last()==24`），中间 22/55 个桶、14/114 个
     //! 点的偏移全部漏过。这里把真机两套序列整段写进测试，逐下标比：
@@ -1242,7 +1242,7 @@ mod checkpoint_hit_tests {
     //! 一单都发不出去。
     //!
     //! 五个点位取自真机 `fixed_point_json` 的 BD-09 坐标，与审计
-    //! （AUDIT-round.md A1）用同一组数据，改前改后的数字可以直接对。
+    //! （docs/audit/AUDIT-round.md A1）用同一组数据，改前改后的数字可以直接对。
 
     use super::*;
     use crate::api::submit::{build, verify_view, SubmitParams};
@@ -2147,7 +2147,7 @@ mod sample_rate_tests {
         // 绝对幅度与真机还差一截（真机窗口外 16.8m ± 8.4m，我们 ~14.8m ± 1.4m）。
         // 那是**配速模型的起伏幅度**问题（`kinematics::pace_profile` 的 OU 振幅
         // + `fit_capped` 把总里程压准），不是采样轴的问题：把 5 秒网格换成
-        // 15 米网格不会让速度分布变宽。这条已写在 FIX-SAMPLE-RATE.md 的
+        // 15 米网格不会让速度分布变宽。这条已写在 docs/fix/FIX-SAMPLE-RATE.md 的
         // 「已知残差」里，属于另一条轴。
         let sd = |v: &[f64]| {
             let m = v.iter().sum::<f64>() / v.len().max(1) as f64;
@@ -2397,7 +2397,7 @@ mod sample_rate_tests {
     /// 无关，改前改后都存在）：楼体把整条直线切成两半时，被推到 3 米外扩环
     /// 上的那批点与环外的点之间会拉出一条 ~27.6m 的对角缩短段，它从楼角上
     /// 搂过去、最深进楼 6.75m。报文里这段在改前也是 27.6m 的一条直线，
-    /// 所以不是采样粒度造成的——详见 FIX-SAMPLE-RATE.md「发现的既有缺陷」。
+    /// 所以不是采样粒度造成的——详见 docs/fix/FIX-SAMPLE-RATE.md「发现的既有缺陷」。
     #[test]
     fn sampling_never_adds_crossings_to_avoided_route() {
         let lat0 = 30.5;

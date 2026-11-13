@@ -505,7 +505,7 @@ pub struct RunOutcome {
     ///
     /// **同一份实例**：`dry_run` 里由 `submit::build_points` 造一次，自检按它
     /// 校验（`verify_view` / `audit_derived`），`run_full` 把同一份交给报文与
-    /// OBS 明细上传，再也不重建（见 `FIX-A4-SINGLE-POINT-SOURCE.md`）。
+    /// OBS 明细上传，再也不重建（见 `docs/fix/FIX-A4-SINGLE-POINT-SOURCE.md`）。
     pub submission_points: Vec<Value>,
     /// 本次的必到点（服务端点位 → `submit::FixedPoint`）。
     ///
@@ -1237,7 +1237,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // 必到点：这里只挑「是哪个点」（两套坐标 + 名字），**不发号**。
     //
     // `position` / `id` / `isFixed` / `flag` 全部交给 submit::fixed_point_items
-    // 按真机规则统一发号，原因见那里的注释与 FIXED-POINT-PARITY.md。
+    // 按真机规则统一发号，原因见那里的注释与 docs/fix/FIXED-POINT-PARITY.md。
     // 早先这里把 `position` 填成「该点在轨迹点数组里的首次经过下标」
     // （实测 0/71/88/170/51），真机填的是 0..N-1 的连续序号；App 详情页按
     // position 排序/取下标，非连续值就只显示得出其中一部分必到点。
@@ -1761,7 +1761,7 @@ pub fn detail_payload(
 /// `start_ms ^ φ`）、平滑（不调 `smooth_point_speed`）、打卡点（`checkpoint_idxs`
 /// 传空）三处都与 `submit::build` 不同。同一条轨迹于是有 `id` / `count` /
 /// `radius` / `type` / `bdA` 两套值，而本地自检校验的是 `build` 那一套——
-/// 「自检守 A、上传发 B」（AUDIT-round A4、`FIX-A4-SINGLE-POINT-SOURCE.md`）。
+/// 「自检守 A、上传发 B」（AUDIT-round A4、`docs/fix/FIX-A4-SINGLE-POINT-SOURCE.md`）。
 ///
 /// 现在点位与枚举/平滑/打卡标记全部来自同一份数据，这里只做「取用」。
 // OBS 明细要 10 个字段，每个都来自不同的数据源（模拟结果、账号标识、时间
@@ -2202,7 +2202,7 @@ mod fixed_point_payload_tests {
 
 #[cfg(test)]
 mod single_point_source_tests {
-    //! A4：**自检那份点位必须就是上传那份**（`FIX-A4-SINGLE-POINT-SOURCE.md`）。
+    //! A4：**自检那份点位必须就是上传那份**（`docs/fix/FIX-A4-SINGLE-POINT-SOURCE.md`）。
     //!
     //! 修复前同一条轨迹被造了两次点位：
     //!

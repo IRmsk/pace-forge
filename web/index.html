@@ -1890,7 +1890,7 @@ function detailHtml(d, n) {
   if (reasons.length) rows.push(['未通过规则', reasons.join('、')]);
   else if (reason) rows.push(['未达标原因', String(reason)]);
   // jsonFromObs=1 表示这条记录的轨迹在 App 本地库里，服务端不存点——详情页
-  // 拉不到坐标是正常的，不是上传失败（见 TRAJECTORY-DISPLAY.md）。
+  // 拉不到坐标是正常的，不是上传失败（见 docs/notes/TRAJECTORY-DISPLAY.md）。
   if (d.jsonFromObs === 1 && n === 0) {
     rows.push(['轨迹来源', 'App 本地库（服务端不存轨迹点）']);
   }

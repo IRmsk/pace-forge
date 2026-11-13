@@ -94,7 +94,7 @@ pub struct SubmitParams {
 ///
 /// **这里只放「是哪个点」，不放任何序号类字段。** `position` / `id` /
 /// `isFixed` / `flag` 全部由 [`fixed_point_items`] 统一发号，原因见那个函数
-/// 的注释和 FIXED-POINT-PARITY.md：早先 `position` 由调用方填成「该点在轨迹
+/// 的注释和 docs/fix/FIXED-POINT-PARITY.md：早先 `position` 由调用方填成「该点在轨迹
 /// 数组里的首次经过下标」（实测 0/71/88/170/51），而真机是 0..N-1 的连续
 /// 序号，App 详情页拿它排序/当索引，非连续值就只显示得出其中一部分点位。
 #[derive(Debug, Clone)]
@@ -288,7 +288,7 @@ pub const MIN_SEGMENT_SEC: i64 = 3;
 ///
 /// 真机 114 点的 `stepDistance` 唯一值集合只有 `{0.0, 3.7468809127807674}`：
 /// 起步窗口 0，其余**全点同一个值**。这个 3.7469 与 670 步 / 1683.83m /
-/// 449.4 都构不成简单关系（`AUDIT-round.md` C4），既不是单步步幅
+/// 449.4 都构不成简单关系（`docs/audit/AUDIT-round.md` C4），既不是单步步幅
 /// （真机 m/步 = 1683.83/670 = 2.51）也不是累计均值，所以只能照抄**形态**：
 ///
 /// - 整场一个常量（不是逐点的「本段位移/本段步数」——那个形态就不对，
@@ -296,7 +296,7 @@ pub const MIN_SEGMENT_SEC: i64 = 3;
 /// - 量级落在真机同带（3.62~3.88，真机 3.7469 在带的中间）。
 ///
 /// 用 `start_ms` 派生而不是 `seed`：点位此前有两条构造链、seed 各不相同
-/// （`AUDIT-round.md` A4），而 `start_ms` 在两条链上是同一个值——那时靠它
+/// （`docs/audit/AUDIT-round.md` A4），而 `start_ms` 在两条链上是同一个值——那时靠它
 /// 才没让 `stepDistance` 也分成两套。点位现在已收敛到 [`build_points`]
 /// 单一来源（两条链同一个 seed），但 `start_ms` 与「本场」的关联更直接，
 /// 保持不变。
@@ -313,7 +313,7 @@ fn step_distance_const(start_ms: i64) -> f64 {
 /// 字段名与语义对齐服务端：`lat`/`lng` 是**占位**（固定 -1.0），真实坐标走
 /// `gLat`/`gLng` 且必须是 gcj02。
 ///
-/// 三个速度字段的口径由真机 114 点逐点反推（见 `FIX-A2-SPEED-UNITS.md`）：
+/// 三个速度字段的口径由真机 114 点逐点反推（见 `docs/fix/FIX-A2-SPEED-UNITS.md`）：
 /// - `speed` 是**配速 min/km**（不是 km/h），恒满足 `speed × avgSpeed = 1000/60`；
 /// - `avgSpeed` 是**点间速度 m/s**（本点到上一点），不是累计均值；
 /// - `bdS` 是**低通后的点间速度 m/s**（比 `avgSpeed` 慢一拍），不是 `speed/3.6`。
@@ -371,7 +371,7 @@ pub fn point_json_full(
 
     // ── speed / avgSpeed / bdS 的口径 ───────────────────────────────────────
     //
-    // 三个字段的口径是拿真机 114 点逐点反推出来的（`FIX-A2-SPEED-UNITS.md`
+    // 三个字段的口径是拿真机 114 点逐点反推出来的（`docs/fix/FIX-A2-SPEED-UNITS.md`
     // 有残差表），不是照抄谁的注释：
     //
     //   v        = ΔtotalDis / ΔtotalTime              （点间速度，m/s）
@@ -602,7 +602,7 @@ pub fn point_json_full(
         // 排队序号：真机 0..24，起步段（前 `startup` 个点）全 0，之后
         // **每 4 个点 +1** 的等宽台阶到 24（`19→1、23→2、…、103→22`）。
         // 不是按位置比例插值：那样是 4.09 个点一档，会一路累积漂移，
-        // 审计点名 14/114 个下标恒为真机 +1（AUDIT-round.md A5）。
+        // 审计点名 14/114 个下标恒为真机 +1（docs/audit/AUDIT-round.md A5）。
         "queueNum": crate::track::queue_num(idx, n, startup),
         "radius": (radius * 100.0).round() / 100.0,
         // **配速 min/km**，不是 km/h。真机 114/114 点满足
@@ -1305,7 +1305,7 @@ pub fn build(
 ///
 /// 于是 `id` / `count` / `radius` / `type` / `bdA` 逐点不同，`isFixed` 与
 /// `type=2` 的打卡标记只有上传那份才有——自检一路绿灯，守的却是另一份没人
-/// 会看到的报文（AUDIT-round A4，`FIX-A4-SINGLE-POINT-SOURCE.md`）。
+/// 会看到的报文（AUDIT-round A4，`docs/fix/FIX-A4-SINGLE-POINT-SOURCE.md`）。
 ///
 /// 现在点位只有这一个构造函数：`build()` 用它，OBS 明细直接接收它的产物，
 /// 谁都不许自己再拼一遍。入参就是点位的全部输入：
@@ -1439,7 +1439,7 @@ pub fn build_from_points(
     // 必到点数组：序号类字段（position / id / isFixed / flag）统一由
     // fixed_point_items 按真机规则发号，数组顺序也按途经顺序重排。
     // 早先这一层是「原样回显服务端的顺序 + position 填轨迹下标」，正是
-    // App 详情页只显示一部分点位的原因，见函数注释与 FIXED-POINT-PARITY.md。
+    // App 详情页只显示一部分点位的原因，见函数注释与 docs/fix/FIXED-POINT-PARITY.md。
     let fp_items: Vec<Value> = fixed_point_items(fixed, points, params.start_time_ms);
     // 主报文这一层要 envelope：改成裸数组服务端直接 -10000
     // （成绩上传失败）。记录详情里 fivePointJson 回显 "" 是正常的，
@@ -1527,7 +1527,7 @@ pub fn build_from_points(
         // 详情接口对这类提交一律回 allLocJson=null、jsonFromObs=1（实测 50/50），
         // 所以塞不塞点都不会让详情带回坐标。发空串是为了跟真机报文一致，
         // 少一个可能被判「非真机」的差异字段。
-        // App 拿 jsonFromObs=1 之后到底会不会去 OBS 拉，见 TRAJECTORY-DISPLAY.md
+        // App 拿 jsonFromObs=1 之后到底会不会去 OBS 拉，见 docs/notes/TRAJECTORY-DISPLAY.md
         // 的「未定项」——那里有两个互斥候选，尚未做对照实验。
         "allLocJson": String::new(),
         "avgPower": avg_power,

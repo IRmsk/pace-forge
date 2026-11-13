@@ -185,7 +185,7 @@ compress_startup = true  → blocked=true   （同上两条 CP_MISS）
 ### B3. 测试隔离只做到 `api/session.rs`，另外 5 处仍直连真实 `$HOME`
 
 `api/accounts.rs:157-165`（`accounts.json`）、`api/client.rs:175-196`（`.pace-forge-device-id*`，自己 `create_dir_all` + `fs::write`）、`track/roadnet.rs:188/357/426/472`（`roads-*`/`blockers`/`built-*`/`water-*`）、`track/tileroad.rs:144-145`（`tiles/`）、`api/policy.rs:222-228`（`PACE_DUMP_POLICY`）。这些都没有注入点。
-实测：`cargo test --offline --lib`（276 项）跑完 `~/.pace-forge/accounts.json`、`session.json` 的 mtime **未变**，目录也没新增文件 —— 即**当前**测试恰好都不触发，但没有任何机制阻止以后触发（`TEST-ISOLATION.md` 只承诺 session.rs，这条文档本身没过度声称）。建议一并迁到同一套 `*_below(std::path)` 注入。
+实测：`cargo test --offline --lib`（276 项）跑完 `~/.pace-forge/accounts.json`、`session.json` 的 mtime **未变**，目录也没新增文件 —— 即**当前**测试恰好都不触发，但没有任何机制阻止以后触发（`docs/notes/TEST-ISOLATION.md` 只承诺 session.rs，这条文档本身没过度声称）。建议一并迁到同一套 `*_below(std::path)` 注入。
 
 ### B4. `data_dir()` 不再 `create_dir_all` 的连带面
 
