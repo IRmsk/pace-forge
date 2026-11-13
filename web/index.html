@@ -389,6 +389,8 @@ button.primary:disabled{opacity:.5}
         </select></label>
         <button id="llGo" class="primary" type="button">定位</button>
         <button id="llPick" class="ghost" type="button">在地图上点选</button>
+        <button id="llFetch" class="ghost" type="button"
+                title="只拉围栏和必到点，不生成轨迹">查围栏/点位</button>
         <button id="llClear" class="ghost" type="button">清空</button>
         <span id="llInfo" class="hint"></span>
       </div>
@@ -744,6 +746,26 @@ let lastFence = null;
 // 预览轨迹单独一层，默认不上图（见 drawPreview）
 let trackLayer = null;
 
+/// 围栏环 → 底图坐标（GCJ-02）。
+///
+/// 后端 `Fence.ring` 统一是 **BD-09**（服务端下发 lat/lng 时按百度系解释，
+/// 只有 `glat/glon` 那套会先转 BD-09）。而这里铺的是高德瓦片，Leaflet 的
+/// latlng 数值就是 GCJ-02——直接把 BD-09 塞进去，整圈围栏会偏出去几百米，
+/// 看着像「围栏飘了」。所以后端两个接口都额外给了 `ringGcj` /
+/// `allPolygonsGcj`，这里优先用；老响应没有这个字段时才退回 `ring`
+/// （那时会偏，但至少画得出来）。
+function fenceRing(f) {
+  if (!f) return [];
+  if (Array.isArray(f.ringGcj) && f.ringGcj.length) return f.ringGcj;
+  return f.ring || [];
+}
+
+/// 围栏是否已经从 BD-09 转到了底图坐标。用来在界面上区分
+/// 「偏是因为数据没转」和「偏是因为围栏本身就这样」。
+function fenceIsGcj(f) {
+  return !!(f && Array.isArray(f.ringGcj) && f.ringGcj.length);
+}
+
 function drawPreview(coords, fence, checkpoints) {
   if (!map) return;
   if (checkpoints) lastCheckpoints = checkpoints;
@@ -753,10 +775,12 @@ function drawPreview(coords, fence, checkpoints) {
   const group = L.featureGroup();
 
   // 围栏
-  if (fence && fence.ring && fence.ring.length) {
-    const poly = L.polygon(fence.ring, {
+  const fring = fenceRing(fence);
+  if (fring.length >= 3) {
+    const poly = L.polygon(fring, {
       color: '#f59e0b', weight: 2, fillOpacity: 0.05, dashArray: '6 4'
-    }).bindPopup('围栏：' + fence.name);
+    }).bindPopup('围栏：' + fence.name +
+      (fenceIsGcj(fence) ? '' : '<br><span style="color:#f85149">坐标系未转换，可能整体偏移</span>'));
     group.addLayer(poly);
   }
 
@@ -778,11 +802,19 @@ function drawPreview(coords, fence, checkpoints) {
       // 统一交给 coordOf，取不到有效坐标就跳过，不拿占位值往图上画。
       const ll = coordOf(c);
       if (!ll) continue;
-      const color = c.passed ? '#22c55e' : '#ef4444';
+      // passed 三态：true 经过、false 没经过、null 还没生成轨迹（「查围栏/点位」
+      // 那条路进来时没有轨迹可比）。把 null 说成「未经过」是错的判断，
+      // 用户会以为点位被算法漏掉了。
+      const known = c.passed === true || c.passed === false;
+      const color = c.passed === true ? '#22c55e' : (c.passed === false ? '#ef4444' : '#8b949e');
+      const state = c.passed === true ? '✓ 轨迹经过'
+        : (c.passed === false ? `✗ 未经过（最近 ${c.nearest}m）` : '未生成轨迹，无法判断是否经过');
       group.addLayer(L.circleMarker(ll, {
-        radius: 7, color: color, fillColor: color, fillOpacity: 0.85, weight: 2
+        radius: 7, color: color, fillColor: color, fillOpacity: 0.85, weight: 2,
+        // 没有轨迹时用虚线圈，跟「已判定」的点在图上区分开
+        dashArray: known ? null : '3 3',
       }).bindPopup(
-        `打卡点 #${c.index}<br>${c.passed ? '✓ 轨迹经过' : '✗ 未经过'}（最近 ${c.nearest}m）`
+        `打卡点 #${c.index}${c.name ? ' ' + c.name : ''}<br>${state}`
       ));
     }
   }
@@ -1077,8 +1109,9 @@ async function fitToAccountArea() {
     const g = L.featureGroup();
     let added = 0;
     for (const f of fences) {
-      if (!f.ring || f.ring.length < 3) continue;
-      g.addLayer(L.polygon(f.ring, { opacity: 0, fillOpacity: 0 }));
+      const ring = fenceRing(f);
+      if (ring.length < 3) continue;
+      g.addLayer(L.polygon(ring, { opacity: 0, fillOpacity: 0 }));
       added++;
     }
     if (!added) return;
@@ -1236,6 +1269,53 @@ function syncLocToMap() {
 
 let locSyncTimer = null;
 
+/// 查围栏 + 必到点（不生成轨迹）。
+///
+/// 锚点用「纬度/经度」里填的值（按「坐标来自」换算成 GCJ-02 传给后端），
+/// 留空就让后端取围栏质心。
+async function fetchFencesAndPoints() {
+  const info = $('llInfo');
+  const btn = $('llFetch');
+  if (btn) { btn.disabled = true; btn.textContent = '查询中…'; }
+  if (info) info.textContent = '正在拉围栏与点位…';
+  try {
+    const a = readLocInputs();
+    const qs = new URLSearchParams();
+    if (a) {
+      const g = toGcj02(a.lat, a.lng, a.coord);
+      qs.set('lat', g[0].toFixed(6));
+      qs.set('lng', g[1].toFixed(6));
+    }
+    const d = $('rDist') ? $('rDist').value : '';
+    if (d) qs.set('distance', String(d));
+    const r = await api('/api/points?' + qs.toString());
+    const points = (r.points || []).map(p => ({
+      index: p.index,
+      gcjLat: p.gcjLat,
+      gcjLng: p.gcjLng,
+      name: p.name,
+      // 没跑轨迹，过没过不知道就别说「未经过」
+      passed: null,
+      nearest: null,
+    }));
+    drawPreview(null, r.fence, points);
+    const bits = [];
+    bits.push(r.fence && fenceRing(r.fence).length >= 3
+      ? `围栏「${r.fence.name || r.fence.id}」`
+      : '未取到围栏');
+    bits.push(`${points.length} 个必到点`);
+    if (r.anchorFrom) bits.push('锚点：' + r.anchorFrom);
+    if (info) info.textContent = bits.join(' · ');
+    if (!points.length) {
+      setOut('查到了围栏但服务端没下发必到点。这种校区（issue #2 那类）没有点位，只能手绘或让算法按围栏自由规划。');
+    }
+  } catch (e) {
+    if (info) info.textContent = '查询失败：' + e.message;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '查围栏/点位'; }
+  }
+}
+
 function initLoc() {
   if (!map || map.__locBound) return;
   map.__locBound = true;
@@ -1282,6 +1362,18 @@ function initLoc() {
 
   // 绑定成功留个可见痕迹：看不到这句说明控件没初始化，别去猜别的原因
   const info = $('llInfo');
+  // 只查围栏 + 必到点，不生成轨迹。
+  //
+  // 这按钮存在的理由：围栏和点位以前只出现在 /api/plan 的响应里，所以想
+  // 看见自己学校的电子围栏，必须先画一条线、跑完一次规划——issue #3 里
+  // 「得先在手绘图上生成轨迹之后才能看到点位」就是这件事。查询本身是只读
+  // GET，不该绑在规划上。
+  const fetchBtn = $('llFetch');
+  if (fetchBtn && !fetchBtn.__bound) {
+    fetchBtn.__bound = true;
+    fetchBtn.addEventListener('click', fetchFencesAndPoints);
+  }
+
   if (info && !info.textContent) info.textContent = '填经纬度后点「定位」';
 }
 

@@ -383,6 +383,7 @@ fn handle(mut request: tiny_http::Request, state: Shared) -> Result<(), String> 
             handle_run(request, state, &body)
         }
         (Method::Get, "/api/fences") => handle_fences(request, state, &query),
+        (Method::Get, "/api/points") => handle_points(request, state, &query),
         (Method::Get, "/api/records") => handle_records(request, state, &query),
         (Method::Get, "/api/blockers") => handle_blockers_get(request),
         (Method::Post, "/api/blockers") => {
@@ -583,13 +584,29 @@ fn handle_plan(
             if let Ok(o) = r {
                 // 围栏多边形
                 let fence = o.fence.as_ref().map(|f| {
+                    // `Fence.ring` 是 **BD-09**（`fence::point_xy` 统一转过了），
+                    // 而底图是高德瓦片（GCJ-02 网格）。以前直接把 BD-09 的环
+                    // 喂给 `L.polygon`，围栏整体偏出去几百米——issue #3 里
+                    // 「电子围栏处于偏离状态」就是这个。轨迹点和打卡点当时都
+                    // 转过了，唯独围栏漏了。
+                    let to_gcj = |ring: &Vec<(f64, f64)>| -> Vec<Value> {
+                        ring.iter()
+                            .map(|&(la, lo)| {
+                                let (gl, go) = crate::api::coord::bd09_to_gcj02(la, lo);
+                                json!([gl, go])
+                            })
+                            .collect()
+                    };
+                    let ring = f.selected.polygons.first().cloned().unwrap_or_default();
                     json!({
                         "name": f.selected.name,
                         "runAreaId": f.selected.run_area_id,
                         "fallback": f.fallback,
                         "distance": f.distance_m,
-                        "ring": f.selected.polygons.first().cloned().unwrap_or_default(),
+                        "ring": ring.clone(),
+                        "ringGcj": to_gcj(&ring),
                         "allPolygons": f.selected.polygons,
+                        "allPolygonsGcj": f.selected.polygons.iter().map(to_gcj).collect::<Vec<_>>(),
                     })
                 });
 
@@ -1444,6 +1461,125 @@ fn handle_semester(request: tiny_http::Request, state: Shared) -> Result<(), Str
 
 // ---------- 围栏列表（地图上画出来） ----------
 
+/// 只查围栏 + 打卡点，不生成轨迹。
+///
+/// 以前围栏和打卡点**只**出现在 `/api/plan` 的响应里，也就是说用户得先
+/// 画一条线、跑完一次规划才能看见自己学校的电子围栏和必到点在哪儿——
+/// issue #3 里「得先在手绘图上生成轨迹之后才能看到点位」说的就是这个。
+/// 查点位本身是一次只读的 GET，没理由绑在规划上。
+///
+/// 锚点优先级：query 的 `lat`/`lng` > 围栏质心。两边都没有就没法查
+/// （服务端必须知道你在哪个校区），明确报错而不是猜一个坐标。
+fn handle_points(
+    request: tiny_http::Request,
+    state: Shared,
+    query: &str,
+) -> Result<(), String> {
+    let client = {
+        let st = state.lock().map_err(|e| e.to_string())?;
+        if !st.logged_in() {
+            return json_err(request, "请先登录");
+        }
+        let Some(c) = st.client() else {
+            return json_err(request, "当前账号没有可用会话，请重新登录");
+        };
+        c.clone()
+    };
+
+    // 围栏：能拿到就一起返回（画图要它），拿不到也不阻断查点位
+    let fences = crate::api::fence::fetch_fences(&client).unwrap_or_default();
+    let first_ring = |f: &crate::api::fence::Fence| -> Vec<Value> {
+        f.ring
+            .iter()
+            .map(|&(la, lo)| {
+                let (gl, go) = crate::api::coord::bd09_to_gcj02(la, lo);
+                json!([gl, go])
+            })
+            .collect()
+    };
+    let fence_json = fences.first().map(|f| {
+        json!({
+            "id": f.id,
+            "name": f.name,
+            "ringGcj": first_ring(f),
+            "ring": f.ring,
+        })
+    });
+
+    // 锚点：query 优先，其次围栏质心
+    let lat = query_param(query, "lat").and_then(|v| v.parse::<f64>().ok());
+    let lng = query_param(query, "lng").and_then(|v| v.parse::<f64>().ok());
+    let anchor = match (lat, lng) {
+        (Some(a), Some(b)) if !(a == 0.0 && b == 0.0) => {
+            // query 给的是底图坐标（GCJ-02），服务端要 BD-09
+            let (ba, bo) = crate::api::coord::gcj02_to_bd09(a, b);
+            (ba, bo, "query".to_string())
+        }
+        _ => {
+            let Some(f) = fences.iter().find(|f| f.ring.len() >= 3) else {
+                return json_err(
+                    request,
+                    "拿不到校区围栏，也没有给锚点：请在「纬度/经度」里填学校坐标再查",
+                );
+            };
+            let n = f.ring.len() as f64;
+            let a = f.ring.iter().map(|p| p.0).sum::<f64>() / n;
+            let b = f.ring.iter().map(|p| p.1).sum::<f64>() / n;
+            (a, b, format!("围栏「{}」质心", f.name))
+        }
+    };
+    let distance_m: i64 = query_param(query, "distance")
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|km| (km * 1000.0).round() as i64)
+        .unwrap_or(2000);
+
+    match crate::api::points::fetch_points_at_distance(
+        &client,
+        anchor.0,
+        anchor.1,
+        None,
+        distance_m,
+    ) {
+        Ok(ctx) => {
+            let points: Vec<Value> = ctx
+                .coords
+                .iter()
+                .enumerate()
+                .map(|(i, &(a, b))| {
+                    let (ga, go) = ctx.gcj_coords.get(i).copied().unwrap_or((a, b));
+                    let raw = ctx.points.get(i);
+                    json!({
+                        "index": i + 1,
+                        "lat": a,
+                        "lng": b,
+                        "gcjLat": ga,
+                        "gcjLng": go,
+                        "name": raw
+                            .and_then(|r| r.get("pointName"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                        "isFixed": raw
+                            .and_then(|r| r.get("isFixed"))
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(-1),
+                    })
+                })
+                .collect();
+            json_ok(
+                request,
+                json!({
+                    "count": points.len(),
+                    "points": points,
+                    "fence": fence_json,
+                    "anchorFrom": anchor.2,
+                    "distance": distance_m,
+                }),
+            )
+        }
+        Err(e) => json_err(request, &format!("拉点位失败: {e}")),
+    }
+}
+
 fn handle_fences(
     request: tiny_http::Request,
     state: Shared,
@@ -1466,11 +1602,24 @@ fn handle_fences(
         Ok(fs) => {
             let list: Vec<Value> = fs
                 .iter()
-                .map(|f| json!({
-                    "id": f.id,
-                    "name": f.name,
-                    "ring": f.ring,
-                }))
+                .map(|f| {
+                    // 同上：`ring` 是 BD-09，底图吃 GCJ-02。两个都给，
+                    // 前端优先用 `ringGcj`（老前端读 `ring` 也不会崩）。
+                    let ring_gcj: Vec<Value> = f
+                        .ring
+                        .iter()
+                        .map(|&(la, lo)| {
+                            let (gl, go) = crate::api::coord::bd09_to_gcj02(la, lo);
+                            json!([gl, go])
+                        })
+                        .collect();
+                    json!({
+                        "id": f.id,
+                        "name": f.name,
+                        "ring": f.ring,
+                        "ringGcj": ring_gcj,
+                    })
+                })
                 .collect();
             json_ok(request, json!({"count": list.len(), "fences": list}))
         }
@@ -1910,6 +2059,57 @@ mod device_scope_tests {
         for _ in 0..3 {
             assert_eq!(device_scope("13900000000"), device_scope("13900000000"));
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_coord_tests {
+    use crate::api::coord::{bd09_to_gcj02, gcj02_to_bd09};
+
+    /// 围栏环必须从 BD-09 转到 GCJ-02，且转换量级要**明显可见**。
+    ///
+    /// issue #3 里「电子围栏还是处于偏离状态」的根因就是这个：`Fence.ring`
+    /// 是 BD-09，前端铺的是高德瓦片（GCJ-02），以前直接画，整圈偏几百米。
+    /// 这条测试钉住两件事：
+    ///
+    /// 1. `ringGcj` 的每个点都等于 `bd09_to_gcj02(ring)`（不是原样拷贝）；
+    /// 2. 偏移量在百米量级——如果哪天有人把转换删了，位移会变成 0，
+    ///    这条立刻红。
+    #[test]
+    fn fence_ring_must_be_converted_to_gcj() {
+        // 齐齐哈尔一带（issue 里那位用户的学校）
+        let ring_bd = [(47.3794, 123.9502), (47.3800, 123.9510), (47.3790, 123.9520)];
+        let ring_gcj: Vec<(f64, f64)> = ring_bd.iter().map(|&(a, b)| bd09_to_gcj02(a, b)).collect();
+
+        assert_eq!(ring_gcj.len(), ring_bd.len(), "点数不能变");
+        for (i, (&(ba, bo), &(ga, go))) in ring_bd.iter().zip(&ring_gcj).enumerate() {
+            assert_ne!((ba, bo), (ga, go), "第 {i} 点没有转换（原样拷贝）");
+            let d = crate::track::geo::distance((ba, bo), (ga, go));
+            assert!(
+                (80.0..=1200.0).contains(&d),
+                "第 {i} 点 BD-09→GCJ-02 位移 {d:.1}m，不在百米量级——\n\
+                 这条判断的依据是真机围栏整体偏几百米；如果位移接近 0，\n\
+                 说明转换被删了，或者两个坐标系被搞混了"
+            );
+        }
+    }
+
+    /// 往返一次要回到原点。
+    ///
+    /// 容差 1e-5 度（≈1.1m）不是凑数：BD-09 ↔ GCJ-02 是有名的**近似**变换，
+    /// 官方从不公开逆变换，业界这套多项式的往返误差本身就在 0.1~1m 量级
+    /// （实测这里 1.6e-6 度 ≈ 0.18m）。容差设成 1e-6 是在要求这个近似算法
+    /// 精确可逆，那做不到，也不该由这条测试来保证。
+    #[test]
+    fn fence_ring_roundtrip_rounds_back() {
+        let p = (47.3794, 123.9502);
+        let (ga, go) = bd09_to_gcj02(p.0, p.1);
+        let (ba, bo) = gcj02_to_bd09(ga, go);
+        assert!(
+            (ba - p.0).abs() < 1e-5 && (bo - p.1).abs() < 1e-5,
+            "往返 ({} {}) → ({} {}) 偏差过大",
+            p.0, p.1, ba, bo
+        );
     }
 }
 
