@@ -1,4 +1,4 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
   - name: 登录失败排查（10121 / 10603 / 极验失败）
     url: https://github.com/IRmsk/pace-forge#登录失败排查
