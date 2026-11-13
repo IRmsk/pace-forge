@@ -332,6 +332,13 @@ button.primary:disabled{opacity:.5}
         <option>5</option><option>6</option><option>7</option><option>8</option>
       </select></label>
       <label>距离 km<input id="rDist" type="number" value="2.0" step="0.1" min="0.5" max="21"></label>
+      <label title="留空=默认 42±21m。填了就按中点+半宽生成，整条轨迹落在区间内。不同校区海拔差很多，写死会露馅">海拔 m
+        <span style="display:inline-flex;gap:4px;align-items:center">
+          <input id="rAltMin" type="number" placeholder="最低" step="1" min="-500" max="9000" style="width:64px">
+          ~
+          <input id="rAltMax" type="number" placeholder="最高" step="1" min="-500" max="9000" style="width:64px">
+        </span>
+      </label>
       <label>配速 分/km
         <span style="display:inline-flex;gap:4px;align-items:center">
           <input id="rPaceMin" type="number" value="5.5" step="0.1" min="2" max="12" style="width:64px">
@@ -527,6 +534,15 @@ function readDur(dist) {
   return d;
 }
 
+/// 海拔区间：两个都填、且上界大于下界 1m 以上才发。
+/// 后端 parse_alt_range 会再校验一次，这里只是不把明显没意义的请求发出去。
+function altBody() {
+  const lo = parseFloat($('rAltMin').value);
+  const hi = parseFloat($('rAltMax').value);
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo + 1) return {};
+  return { altMin: lo, altMax: hi };
+}
+
 function syncDurHint() {
   const auto = $('rAutoDur').checked;
   $('rDur').readOnly = auto;
@@ -681,6 +697,7 @@ $('runBtn').onclick = async () => {
         sportType: 1,
         mode: $('rMode').value,
         lane: parseInt($('rLane').value, 10) || 1,
+        ...altBody(),
         startAtMs: (st ? st.startMs : undefined),
         ...locBody(),
         // 手绘模式把坐标带上；后端按 WGS84 解析并转 BD-09
@@ -973,6 +990,7 @@ $('accBatch').onclick = async () => {
       body: JSON.stringify({
         distance: dist, duration: dur, runMode: mode,
         sportType: 1, gapMs: 8000,
+        ...altBody(),
         startAtMs: (st ? st.startMs : undefined)
       })
     });

@@ -63,6 +63,8 @@ pub struct RunParams {
     /// 用户清楚哪栋楼在哪，手画比算法猜靠谱——尤其 OSM 在该校区
     /// 零建筑数据、几何规划只能凭直线连点的时候。
     pub custom_path: Option<Vec<(f64, f64)>>,
+    /// 海拔区间 `(最低, 最高)`，米。`None` 用默认 42±21m。
+    pub alt_range: Option<(f64, f64)>,
 }
 
 /// 尝试沿 OSM 真实道路规划。任何一步失败都返回 None（静默降级）。
@@ -282,6 +284,7 @@ impl Default for RunParams {
             prefer_roads: true,
             start_at_ms: None,
             custom_path: None,
+            alt_range: None,
         }
     }
 }
@@ -906,6 +909,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         run_area_id: -1,
         geo_fences_json: "[]".into(),
         total_ascent: 0,
+        alt_range: p.alt_range,
     };
     let probe_sub = super::submit::build(&probe, &track_points, &[], &sim)?;
     let view = super::submit::verify_view(&probe_sub.save_record, &probe_sub.points)?;
@@ -1187,6 +1191,7 @@ pub fn run_full(
             .unwrap_or(-1),
         geo_fences_json: geo_fences,
         total_ascent: 0,
+        alt_range: p.alt_range,
     };
 
     // 报文的桶必须来自 sim，不能在这里重新生成——否则自检、提交、明细
@@ -1389,7 +1394,7 @@ pub fn detail_payload_rrid(
             .map(|(i, q)| {
                 super::submit::point_json_full(
                     q, i, n, start_ms, start_pt, &mut prev, &mut cum, &mut prev_time,
-                    sim.total_steps as i64, start_ms as u64, &cp_idxs,
+                    sim.total_steps as i64, start_ms as u64, &cp_idxs, _p.alt_range,
                 )
             })
             .collect()

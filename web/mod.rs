@@ -570,6 +570,7 @@ fn handle_plan(
                 run_mode,
                 start_at_ms,
                 custom_path: parse_custom_path(body),
+                alt_range: parse_alt_range(body),
                 ..Default::default()
             };
             let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
@@ -810,6 +811,7 @@ fn handle_plan(
         sel_run_time_sec: (total_sec as f64 * 0.9) as i64,
         policy: "preview".into(),
         run_area_id: 0,
+        alt_range: None,
         geo_fences_json: "[]".into(),
         total_ascent: 0,
     };
@@ -1222,6 +1224,7 @@ fn handle_batch(
             sport_type,
             run_mode,
             start_at_ms,
+            alt_range: parse_alt_range(body),
             ..Default::default()
         };
 
@@ -1473,6 +1476,20 @@ fn handle_fences(
 /// 前端底图是高德，瓦片按 GCJ-02 网格切，Leaflet 拿到手的就是 GCJ-02，
 /// 提交报文要 BD-09，所以逐点 `gcj02_to_bd09`。
 /// 少于 2 个点当作没传，退回算法规划。
+/// 从请求体读海拔区间 `[altMin, altMax]`（米）。
+///
+/// 不同校区海拔差得远，写死一个基准等于把「在哪跑」暴露出来。用户给了
+/// 区间就按中点+半宽生成，没给或给反了就返回 `None` 用默认值，不报错。
+fn parse_alt_range(body: &Value) -> Option<(f64, f64)> {
+    let lo = body.get("altMin").and_then(|v| v.as_f64())?;
+    let hi = body.get("altMax").and_then(|v| v.as_f64())?;
+    if hi > lo + 1.0 && lo > -500.0 && hi < 9000.0 {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
 fn parse_custom_path(body: &Value) -> Option<Vec<(f64, f64)>> {
     body.get("customPath")
         .and_then(|v| v.as_array())
@@ -1571,6 +1588,7 @@ fn handle_run(
         run_mode,
         start_at_ms,
         custom_path,
+        alt_range: parse_alt_range(body),
         ..Default::default()
     };
 
@@ -1882,6 +1900,40 @@ mod device_scope_tests {
         assert_eq!(device_scope("99999"), "99999");
         for _ in 0..3 {
             assert_eq!(device_scope("13900000000"), device_scope("13900000000"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod alt_range_tests {
+    use super::parse_alt_range;
+
+    /// 合法的海拔区间原样返回。
+    #[test]
+    fn accepts_valid_range() {
+        let v = serde_json::json!({"altMin": 100, "altMax": 140});
+        assert_eq!(parse_alt_range(&v), Some((100.0, 140.0)));
+        // 沿海校区：区间窄但仍有意义（比 GPS 高程噪声 0.8m 宽就行）
+        let v = serde_json::json!({"altMin": 5.0, "altMax": 9.0});
+        assert_eq!(parse_alt_range(&v), Some((5.0, 9.0)));
+    }
+
+    /// 上下界搞反、只填一个、超出地形范围，一律当没填（退回默认），
+    /// 不报错——用户填这个是无所谓的，填错不该让整次生成失败。
+    #[test]
+    fn ignores_bad_input_without_failing() {
+        let cases = [
+            serde_json::json!({"altMin": 140, "altMax": 100}), // 反了
+            serde_json::json!({"altMin": 100}),                // 缺一个
+            serde_json::json!({"altMax": 100}),                // 缺一个
+            serde_json::json!({}),                             // 都没填
+            serde_json::json!({"altMin": -600, "altMax": 100}), // 死海以下
+            serde_json::json!({"altMin": 100, "altMax": 12000}), // 高于珠峰
+            serde_json::json!({"altMin": 100, "altMax": 100.5}), // 区间太窄
+            serde_json::json!({"altMin": "高", "altMax": "低"}), // 不是数字
+        ];
+        for c in cases {
+            assert_eq!(parse_alt_range(&c), None, "该拒绝的没拒绝: {c}");
         }
     }
 }

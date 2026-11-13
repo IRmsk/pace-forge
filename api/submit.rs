@@ -77,6 +77,12 @@ pub struct SubmitParams {
     pub run_area_id: i64,
     pub geo_fences_json: String,
     pub total_ascent: i32,
+    /// 海拔区间 `(最低, 最高)`，米。`None` 用默认 42±21m。
+    ///
+    /// 不同校区海拔差得远（沿海 5m、高原 2000m 以上），写死一个基准值
+    /// 等于把「在哪跑」这件事暴露出来。给定区间后基准取中点、幅值按
+    /// 半宽分配，生成的序列保证落在区间内。
+    pub alt_range: Option<(f64, f64)>,
 }
 
 /// 打卡点。
@@ -128,6 +134,7 @@ pub fn point_json_full(
     total_steps: i64,
     seed: u64,
     checkpoint_idxs: &[usize],
+    alt_range: Option<(f64, f64)>,
 ) -> Value {
     // BD-09 → GCJ-02（原点是 BD-09，服务端要 gcj02）
     let (glat, glng) = crate::api::coord::bd09_to_gcj02(p.lat, p.lon);
@@ -245,11 +252,20 @@ pub fn point_json_full(
             * std::f64::consts::TAU
     };
     let fi = idx as f64;
-    let altitude = (42.0
-        + 21.0 * (fi * 0.02 + ph(1)).sin()
-        + 3.0 * (fi * 0.15 + ph(2)).sin()
-        + 0.8 * (fi * 0.5 + ph(3)).sin())
-    .clamp(20.0, 64.0);
+    // 幅值分配：慢项占 85% 负责整条几十米漂移，中项 10%、快项 5% 只做
+    // 亚米抖动。三项加起来正好等于半宽，所以叠加后不会越界，也就不需要
+    // 靠 clamp 兜——clamp 会在边界压出一排平点，那才是明显的假。
+    let (base, half, lo, hi) = match alt_range {
+        Some((lo, hi)) if hi > lo + 1.0 => {
+            ((lo + hi) / 2.0, (hi - lo) / 2.0, lo, hi)
+        }
+        _ => (42.0, 21.0, 20.0, 64.0),
+    };
+    let altitude = (base
+        + half * 0.85 * (fi * 0.02 + ph(1)).sin()
+        + half * 0.10 * (fi * 0.15 + ph(2)).sin()
+        + half * 0.05 * (fi * 0.5 + ph(3)).sin())
+    .clamp(lo, hi);
 
     // 局部步幅：本段位移 / 本段步数。原来那个表达式化简后是
     // 「累计里程 / 全程步数」，单调递增的累积平均值，不是即时步幅。
@@ -821,7 +837,7 @@ pub fn build(
             point_json_full(
                 p, i, points.len(), params.start_time_ms, start_pt,
                 &mut prev, &mut cum, &mut prev_time, params.total_steps as i64, seed,
-                &cp_idxs,
+                &cp_idxs, params.alt_range,
             )
         })
         .collect();
@@ -1060,6 +1076,7 @@ mod tests {
             run_area_id: 7,
             geo_fences_json: "[]".into(),
             total_ascent: 0,
+            alt_range: None,
         }
     }
 
@@ -1293,6 +1310,7 @@ mod point_shape_tests {
             run_area_id: 7,
             geo_fences_json: "[]".into(),
             total_ascent: 0,
+            alt_range: None,
         }
     }
 
@@ -1432,6 +1450,54 @@ mod point_shape_tests {
     }
 
     #[test]
+    fn altitude_respects_requested_range() {
+        let pts: Vec<TrackPoint> = (0..200)
+            .map(|i| tp(31.2304 + i as f64 * 2e-4, 121.4737, 1_790_000_000_000 + i * 5000))
+            .collect();
+        let mut params = params();
+        // 高原校区：200~260m
+        params.alt_range = Some((200.0, 260.0));
+        let sim = test_sim(&params, &pts);
+        let sub = build(&params, &pts, &[], &sim).unwrap();
+        let alts: Vec<f64> = sub
+            .points
+            .iter()
+            .map(|p| p["bdA"].as_f64().unwrap())
+            .collect();
+
+        let lo = alts.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = alts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            lo >= 200.0 - 0.05 && hi <= 260.0 + 0.05,
+            "海拔越界：实际 {lo:.1}~{hi:.1}，要求 200~260"
+        );
+        // 均值要靠近中点，不能整条贴着下界（那说明幅值没铺开）
+        let mean = alts.iter().sum::<f64>() / alts.len() as f64;
+        assert!(
+            (mean - 230.0).abs() < 18.0,
+            "均值 {mean:.1} 偏离区间中点 230 太多"
+        );
+        // 区间拉高后相邻点仍然只能动几十厘米，不能因为基准变大就抖起来
+        let max_step = alts.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f64::max);
+        assert!(max_step < 3.0, "相邻点海拔跳变 {max_step:.2}m");
+    }
+
+    #[test]
+    fn altitude_range_rejects_bad_input() {
+        let pts: Vec<TrackPoint> = (0..30)
+            .map(|i| tp(31.2304 + i as f64 * 2e-4, 121.4737, 1_790_000_000_000 + i * 5000))
+            .collect();
+        let mut params = params();
+        // 给反了：应当忽略，退回默认 42±21
+        params.alt_range = Some((300.0, 100.0));
+        let sim = test_sim(&params, &pts);
+        let sub = build(&params, &pts, &[], &sim).unwrap();
+        let mean = sub.points.iter().map(|p| p["bdA"].as_f64().unwrap()).sum::<f64>()
+            / sub.points.len() as f64;
+        assert!((mean - 42.0).abs() < 25.0, "反向区间应退回默认基准，实际均值 {mean:.1}");
+    }
+
+    #[test]
     fn all_loc_json_has_server_fields() {
         let pts = vec![
             tp(31.2304, 121.4737, 1_790_000_000_000),
@@ -1534,6 +1600,7 @@ mod single_source_tests {
             run_area_id: 0,
             geo_fences_json: "[]".into(),
             total_ascent: 0,
+            alt_range: None,
         }
     }
 
@@ -1636,6 +1703,7 @@ mod verify_roundtrip_tests {
             run_area_id: 0,
             geo_fences_json: "[]".into(),
             total_ascent: 0,
+            alt_range: None,
         }
     }
 
@@ -1719,7 +1787,7 @@ mod step_distance_tests {
             total_steps: 1800, start_time_ms: 1_790_000_000_000,
             stop_time_ms: 1_790_000_720_000, sel_distance_m: 2000,
             sel_run_time_sec: 720, policy: "0".into(), run_area_id: 0,
-            geo_fences_json: "[]".into(), total_ascent: 0,
+            geo_fences_json: "[]".into(), total_ascent: 0, alt_range: None,
         };
         let t: Vec<TrackPoint> = (0..400).map(|i| TrackPoint {
             lat: 31.2304 + i as f64 * 5.0 / 111_320.0,
@@ -1814,7 +1882,7 @@ mod step_distance_tests {
             total_steps: 2400, start_time_ms: 1_790_000_000_000,
             stop_time_ms: 1_790_000_840_000, sel_distance_m: 2000,
             sel_run_time_sec: 700, policy: "0".into(), run_area_id: 0,
-            geo_fences_json: "[]".into(), total_ascent: 0,
+            geo_fences_json: "[]".into(), total_ascent: 0, alt_range: None,
         };
         let t = rich_points(400, 2400.0, 840);
         let sim = test_sim(&p, &t);
@@ -1850,7 +1918,7 @@ mod step_distance_tests {
             total_steps: 2000, start_time_ms: 1_790_000_000_000,
             stop_time_ms: 1_790_000_720_000, sel_distance_m: 2000,
             sel_run_time_sec: 720, policy: "0".into(), run_area_id: 0,
-            geo_fences_json: "[]".into(), total_ascent: 0,
+            geo_fences_json: "[]".into(), total_ascent: 0, alt_range: None,
         };
         let t = rich_points(300, 2000.0, 720);
         let sim = test_sim(&p, &t);
@@ -1899,6 +1967,7 @@ mod audit_tests {
             run_area_id: 0,
             geo_fences_json: "[]".into(),
             total_ascent: 0,
+            alt_range: None,
         }
     }
 
