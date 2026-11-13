@@ -47,7 +47,7 @@ pace-forge run 2 12        # 在有效时段内提交
 | ⑤ 规划轨迹 | 闭环折线，凑到目标里程 |
 | ⑥ 反推时间戳 | 由速度剖面算出每点时刻 |
 | ⑦ 合成步数 | 步频 / 步幅 / 10 秒分桶 |
-| ⑧ 自检 | 七大类检查，不过就不发 |
+| ⑧ 自检 | 八类检查，不过就不发 |
 | ⑨ 上传明细 | OBS 对象存储 |
 | ⑩ 提交成绩 | `runnings/save/record` |
 
@@ -85,6 +85,14 @@ Web 界面默认 `:9999`（`pace-forge web 0.0.0.0:9999`）：登录、记录列
 ```
 v = (cadence / 60) × stride
 ```
+
+> ⚠️ **上表和 `evidence/` 里的真机记录口径不同，两个都对**：
+> 两条真实记录的 App 汇总页是 `6'44"→90 步/分`、`6'08"→104 步/分`
+> （见 [证据文档](evidence/real-device-app-summary.md)），比上表低 50 步上下。
+> 原因是 App 那两个字段由「步数 ÷ 时长」「距离 ÷ 步数」派生，而手机计步器
+> 会少计（手持/放包里），于是步频偏低、步幅偏大。上表是**步态**，真机汇总是
+> **计步口径**。我们目前发的是步态（约 157 步/分 @ 5'47"），所以 `totalSteps`
+> 会比真机记录高——这一处还没对齐，写在「已知偏差」里。
 
 ### ② 10 秒分桶是白噪声
 
@@ -170,7 +178,7 @@ c_{t+1} = c_t + θ(target_t − c_t)·Δt + σ·√Δt·Z,   Z ~ N(0,1)
 
 **宁可本地失败，也不要把注定被驳回的报文发出去。** 驳回会记错误次数，异常多了触发风控，连正常提交都会被拦。
 
-七大类，分三级：
+八类，分两级（致命先拦，警告只提示）：
 
 | 检查项 | 等级 | 内容 |
 |---|---|---|
@@ -180,6 +188,7 @@ c_{t+1} = c_t + θ(target_t − c_t)·Δt + σ·√Δt·Z,   Z ~ N(0,1)
 | 坐标 | 致命 | 越界 / (0,0) / 相邻跳变 >200m |
 | 打卡点 | 致命 | 任一必过点最近距离 >0.5m |
 | 分桶 | 致命 | 桶数不符、步数和不等于总步数 |
+| 上报节奏 | 致命 | 采样轴不是 5 秒等时间（出现 1~2 秒空洞即 `SAMPLE_RATE` / `SAMPLE_RATE_SHORT`）；配置偏离真机只报警告 |
 | 物理 | 致命/警告 | 配速超规则区间、步频超人体范围、步幅异常、步态不匹配 |
 
 ```bash
@@ -287,11 +296,28 @@ pace-forge web 0.0.0.0:9999
 ### 作为库
 
 ```rust
-use pace_forge::track::{plan, retime, simulate, inspect, Check, PlanRequest, SimParams};
+use pace_forge::track::{
+    plan, sample_times, sample_by_time, simulate, inspect,
+    Check, PlanRequest, SimParams, KinParams, SAMPLE_INTERVAL_SEC,
+};
 
-let track = plan(&req, &mut rng)?;                                    // ① 规划
-let (times, _, len) = retime(&xy, 720, start_ms, seed, &KinParams::default(), 1.0, 8.0);  // ② 定时
-let sim = simulate(&timed, &SimParams {                               // ③ 合成
+let planned = plan(&req, &mut rng)?;                                  // ① 规划
+let xy: Vec<(f64, f64)> = planned.points.iter().map(|p| (p.lat, p.lon)).collect();
+
+// ② 5 秒等时间轴（真机上报名就是 5 秒一点，别自己造 1~2 秒的间隔）
+let times = sample_times(720, start_ms, SAMPLE_INTERVAL_SEC);
+
+// ③ 按时间积分弧长：每个采样点落在「这一拍该走到的弧长」上。
+//    打卡点要一起传进去，规划完会把最近的采样点吸附到打卡点的路径投影上，
+//    否则点位离打卡点十几米，服务端判「没经过」。
+let track = sample_by_time(
+    &xy, &times, start_ms as u64, &KinParams::default(),
+    0.9, 6.3, &[], &cps,
+);
+
+// ④ 合成步态/分桶
+let pts: Vec<(f64, f64, i64)> = track.iter().map(|t| (t.lat, t.lon, t.time_ms)).collect();
+let sim = simulate(&pts, &SimParams {
     total_distance_m: len as f64,
     total_sec: 720,
     start_ms,
@@ -300,43 +326,62 @@ let sim = simulate(&timed, &SimParams {                               // ③ 合
     ..Default::default()
 })?;
 
-let report = inspect(&check);                                         // ④ 自检
+let report = inspect(&check);                                         // ⑤ 自检
 if report.blocked() {
     eprintln!("{}", report.summary());
 }
 ```
 
+> 别用 `track::simulate::retime()`：那是「等距点位 + 按速度分配时间」的旧路径，
+> 给出的时间轴是等距的，和真机 5 秒等时间采样对不上。现在只有历史测试还在用它。
+
 ## 架构
 
 ```
-src/
+.
+├── lib.rs / main.rs / test_support.rs   crate 入口、CLI、测试夹具
 ├── crypto/          NetSecKit 4.2.4 加解密
 │   ├── kdf.rs       三段式 KDF（byte_hash → feistel → final_mix）
 │   ├── envelope.rs  RSA-1024 + AES-128-CBC(零 IV) 信封
 │   ├── decrypt.rs   响应解密
-│   └── sign.rs      MD5 盐签名
+│   ├── sign.rs      MD5 盐签名
+│   ├── geetoken.rs  极验 token 组装
+│   └── consts.rs    硬编码常量（版本号等）
 ├── api/             协议层
 │   ├── client.rs    设备指纹 + 请求组装
+│   ├── coord.rs     BD-09 / GCJ-02 / WGS-84 互转
 │   ├── login.rs     登录（含单设备冲突处理）
 │   ├── gt4.rs       极验 v4 全本地求解
 │   ├── gt4image.rs  Canny + 归一化互相关
 │   ├── policy.rs    规则
-│   ├── fence.rs     多校区围栏选择
+│   ├── fence.rs     多校区围栏选择（环统一为 BD-09）
 │   ├── points.rs    打卡点
-│   ├── obs.rs       对象存储上传
+│   ├── records.rs   跑步记录列表 / 详情
+│   ├── semester.rs  学期进度
+│   ├── start_time.rs 有效时段
+│   ├── obs.rs       对象存储上传 + 回读校验
 │   ├── submit.rs    报文组装 + 提交
 │   ├── flow.rs      十步编排
+│   ├── gmttime.rs   设备时间对齐
+│   ├── accounts.rs  多账号
 │   └── session.rs   会话持久化
 ├── track/           轨迹合成
 │   ├── geo.rs       球面几何
 │   ├── planner.rs   闭环规划 + 打卡点命中
+│   ├── fence_route.rs 围栏内铺路
+│   ├── roadnet.rs   路网建图
+│   ├── tileroad.rs  瓦片道路识别
 │   ├── biomech.rs   步态模型
-│   ├── kinematics.rs 速度剖面
+│   ├── kinematics.rs 速度剖面（OU + 弯道预判刹车）
 │   ├── stadium.rs   田径场几何
 │   ├── simulate.rs  数据合成 + 一致性校验
 │   ├── buckets.rs   10 秒分桶
+│   ├── detect.rs    反检测自查
 │   └── preflight.rs 提交自检
-└── web/             Web 控制台
+├── web/             控制台（index.html 编进二进制）
+├── docs/            审计、修复记录、笔记（见 docs/README.md）
+├── evidence/        可复核的数据底稿
+└── tools/           辅助脚本
 ```
 
 ## 协议要点
@@ -345,7 +390,7 @@ src/
 
 **信封**：`{"d","h","k","p":"101","t":"0"}`。RSA-1024 加密 AES 密钥，AES-128-CBC 用**全零 IV**，密钥派生是三段自定义函数（`byte_hash` → `feistel_transform` → `final_mix`）。
 
-**速度字段**：`speed = 配速(分/公里) × 1000`，不是 m/s × 1000。用 `speedTop=2.0 / speedBottom=10.0` 反推确认。
+**速度字段**（两个层级不同，别混）：记录级 `speed = 配速(分/公里) × 1000`（整数，用 `speedTop=2.0 / speedBottom=10.0` 反推确认）；点位级 `speed` **就是配速 min/km 浮点**（`5.08` 这种），和 `avgSpeed`(m/s) 满足 `speed × avgSpeed = 1000/60`。点位 `bdS` 是独立的低通速度，**不与 `speed` 同源**。
 
 **点位接口**：`runec` 字段是额外一层信封，外层顺序 `k,p,d,h,t`（不是标准体的 `d,h,k,p,t`）；`sign = MD5(http版URL + 盐)`，注意是 **http://** 不是 https://；限流 5 分钟 3 次。
 
@@ -369,7 +414,7 @@ cargo test
 - 时间分配精确性（Σdt 严格等于目标）
 - 田径场几何（圈长、曲率、闭合误差）
 - 围栏多边形（点在环内、多校区选择、重叠合并）
-- 自检七大类的正反例
+- 自检八类的正反例（含采样节奏：2 秒轴、1 秒空洞必须被拦）
 - **报文不变量**：`stepsPerTenSec` 逐项等于 `sim.step_buckets`、不许有空桶
 - **报文往返**：`verify_view()` 反解出的桶/坐标/时间与原始一致（±1m / ±1s）
 - **配速区间**：`speedTop/Bottom` 三种单位解析 + `PACE_OUT` 真会触发
@@ -387,7 +432,7 @@ cargo test
 | 极验求解 | ✅ 全本地，实测到密码校验 |
 | 登录 / 会话 | ✅ 含单设备冲突处理 |
 | 轨迹合成 | ✅ 321 单测 |
-| 提交自检 | ✅ 七大类 |
+| 提交自检 | ✅ 八类 |
 | 策略 / 围栏 / 点位 / OBS | ✅ 接口实现完成 |
 | 完整提交 | ✅ `run` 命令已接入 |
 | 围栏 / 点位预览 | ✅ 独立只读入口，不依赖规划 |
