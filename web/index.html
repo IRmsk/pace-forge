@@ -256,6 +256,13 @@ button.primary:disabled{opacity:.5}
   .tag.ok { background: rgba(63,185,80,.15); color: var(--ok); }
   .tag.bad { background: rgba(248,81,73,.15); color: var(--bad); }
   .rec .r2 { color: var(--dim); font-size: 12px; margin-top: 4px; display: flex; gap: 12px; flex-wrap: wrap; }
+  /* rrid 平时是灰的，悬停才变亮——用户平时不关心，但报 issue 时全靠它 */
+  .rec .rid {
+    font-family: var(--mono, monospace); font-size: 11px; color: var(--dim);
+    opacity: .55; margin-top: 3px; cursor: copy; user-select: all;
+  }
+  .rec:hover .rid { opacity: 1; }
+  .rec .rid:hover { color: var(--accent); text-decoration: underline; }
   .empty { padding: 30px 16px; text-align: center; color: var(--dim); font-size: 13px; }
 
 
@@ -1553,6 +1560,26 @@ async function loadRecords() {
     [...document.querySelectorAll('.rec')].forEach((el, i) => {
       el.onclick = () => selectRec(rows[i], el);
     });
+    // rrid 点一下复制。它挂在 .rec 里面，不拦一下的话点它也会选中整条记录。
+    [...document.querySelectorAll('.rec .rid')].forEach(el => {
+      el.onclick = async (ev) => {
+        ev.stopPropagation();
+        const id = el.dataset.rrid;
+        try {
+          await navigator.clipboard.writeText(id);
+          const t = el.textContent;
+          el.textContent = '已复制 ' + id;
+          setTimeout(() => { el.textContent = t; }, 1200);
+        } catch {
+          // 非 https 或没权限时 clipboard 不可用，退回选中文本让用户手动复制
+          const r = document.createRange();
+          r.selectNodeContents(el);
+          const sel = getSelection();
+          sel.removeAllRanges();
+          sel.addRange(r);
+        }
+      };
+    });
     selectRec(rows[0], document.querySelector('.rec'));
   } catch (e) {
     $('list').innerHTML = '<div class="empty" style="color:var(--bad)">' + esc(e.message) + '</div>';
@@ -1591,6 +1618,10 @@ function recHtml(r, i) {
   // 哪怕 complete=true、statusInfo 写着「太棒了，恭喜您完成了跑步」。
   const valid = r.complete ?? r.completed ?? r.isValid ?? r.is_valid ?? false;
   const start = r.startTime ?? r.start_time;
+  // rrid 必须显示出来。之前它只在代码里当参数用，界面上从来没有过——
+  // 结果让用户「把那条记录的 rrid 发我」时，他根本没有任何地方能看到它。
+  // 报 issue 时这是唯一能把一条记录指认出来的东西。
+  const rid = r.rrid ?? r.id ?? r.recordId;
   return `<div class="rec" data-i="${i}">
     <div class="r1">
       <span class="dist">${dist.toFixed(2)} km</span>
@@ -1601,6 +1632,7 @@ function recHtml(r, i) {
       <span>${fmtDur(secs)}</span>
       <span>${pace(dist, secs)}</span>
     </div>
+    ${rid ? `<div class="rid" data-rrid="${rid}" title="点击复制 rrid">rrid ${rid}</div>` : ''}
   </div>`;
 }
 
@@ -1729,7 +1761,10 @@ function detailHtml(d, n) {
   const reasons = Array.isArray(d.reasonList)
     ? d.reasonList.filter(x => x && x.complete === false && x.reason).map(x => x.reason)
     : [];
+  // rrid 放第一行：报 issue 时它是最常被要的东西，藏在列表里翻起来麻烦
+  const rid = g('rrid', g('recordId', g('id')));
   const rows = [
+    ...(rid ? [['记录编号', 'rrid ' + rid]] : []),
     ['总距离', dist.toFixed(2) + ' km'],
     ['有效距离', vdist.toFixed(2) + ' km'],
     ['总时长', fmtDur(secs)],
