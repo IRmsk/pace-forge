@@ -1419,9 +1419,6 @@ pub fn run_full(
         // 10 位（带小时）——历史实现，出处是一句没有 APK 证据的旧注释
         super::obs::detail_key(start_ms, &uuid),
         super::obs::detail_key_utc(start_ms, &uuid),
-        // 8 位（只到日）——APK 逆向结论：Dart 符号 obsFolderYyyyMmDd
-        super::obs::detail_key_day(start_ms, &uuid),
-        super::obs::detail_key_day_utc(start_ms, &uuid),
         // rrid 前 4 位——前端注释的说法
         format!("run_data/{}/{rrid}.json", rrid / 1_000_000),
     ];
