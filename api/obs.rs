@@ -188,6 +188,36 @@ fn key_at_offset(now_ms: i64, uuid: &str, offset_sec: i64) -> String {
     format!("run_data/{y:04}{m:02}{d:02}{h:02}/{uuid}.json")
 }
 
+/// 生成 objectKey，**只到日**。
+///
+/// 依据：APK 逆向（v7.3.11，`libapp.so` 里的 Dart 符号 `obsFolderYyyyMmDd`）
+/// ——App 拼 OBS 目录只用「年月日」，没有小时。我们一直用 `YYYYMMDDHH`
+/// 十位，出处是代码里一句「真机用 strftime("%Y%m%d%H")」的旧注释，但翻遍
+/// 整个 APK 找不到支撑它的东西。
+///
+/// 另一个更可疑的点：`run_data`（下划线）在 81MB 的 dex 和 8MB 的 Dart
+/// 快照里**一次都没出现**，App 侧只有驼峰 `runData`（而且它是
+/// `RunDataInfo` 的字段名，未必是路径前缀）。所以下划线前缀很可能是
+/// 猜错的。
+///
+/// 一个对象几 KB，多传几个变体比继续猜便宜，所以这里加 8 位版本，
+/// 调用方和原来的 10 位版本一起传。
+pub fn detail_key_day(now_ms: i64, uuid: &str) -> String {
+    key_at_offset_day(now_ms, uuid, tz_offset_sec())
+}
+
+/// `detail_key_day` 的 UTC 版本（同上：服务端用哪个时区没有确定证据）。
+pub fn detail_key_day_utc(now_ms: i64, uuid: &str) -> String {
+    key_at_offset_day(now_ms, uuid, 0)
+}
+
+fn key_at_offset_day(now_ms: i64, uuid: &str, offset_sec: i64) -> String {
+    let secs = now_ms / 1000 + offset_sec;
+    let days = secs.div_euclid(86_400);
+    let (y, m, d, _h) = civil_from_days(days, 0);
+    format!("run_data/{y:04}{m:02}{d:02}/{uuid}.json")
+}
+
 /// 生成 objectKey（兜底格式）。
 pub fn fallback_key(uid: &str, sport_type: i32, start_sec: i64, uuid: &str) -> String {
     format!("runData/{uid}/{sport_type}/{start_sec}_{uuid}.txt")

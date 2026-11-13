@@ -1677,6 +1677,9 @@ async function obsTrack(rrid, detail) {
   if (uuid && st) cands.push('run_data/' + stampHour(st, 8 * 3600) + '/' + uuid + '.json');
   // ③ 同一套的 UTC 版本（上传时两份都传了）
   if (uuid && st) cands.push('run_data/' + stampHour(st, 0) + '/' + uuid + '.json');
+  // ③b 只到日（8 位）——APK 逆向结论：Dart 符号 obsFolderYyyyMmDd 没有小时
+  if (uuid && st) cands.push('run_data/' + stampHour(st, 8 * 3600).slice(0, 8) + '/' + uuid + '.json');
+  if (uuid && st) cands.push('run_data/' + stampHour(st, 0).slice(0, 8) + '/' + uuid + '.json');
   // ④ rrid 前 6 位（万一小时段是 YYYYMM 而不是 YYYYMMDD）
   cands.push('run_data/' + Math.floor(rrid / 10000) + '/' + rrid + '.json');
   // ⑤ 兜底目录
