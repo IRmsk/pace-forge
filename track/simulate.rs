@@ -471,9 +471,24 @@ pub fn validate(r: &SimResult, p: &SimParams) -> Vec<String> {
     // 步频与速度必须自洽：avg_cadence/60 * avg_stride ≈ avg_speed
     if !r.speeds.is_empty() && !r.strides.is_empty() {
         let avg_v = r.speeds.iter().sum::<f64>() / r.speeds.len() as f64;
-        let avg_c = r.cadences.iter().sum::<f64>() / r.cadences.len() as f64;
-        let avg_s = r.strides.iter().sum::<f64>() / r.strides.len() as f64;
-        let recon = avg_c / 60.0 * avg_s;
+        // 逐点重建再平均，别拿「均值 × 均值」当重建值。
+        //
+        // 乘积的均值不等于均值的乘积——差多少正比于速度方差。早先
+        // `mean(c)/60 * mean(s)` 在速度波动小时碰巧落在容差里，一旦把
+        // OU 调到接近真机的平滑度（σ 变小、分布更集中）就翻红，报
+        // 「2.706 vs 2.776」这种 2.5% 的假差。
+        let n = r.cadences.len().min(r.strides.len());
+        let recon = if n == 0 {
+            0.0
+        } else {
+            r.cadences
+                .iter()
+                .zip(r.strides.iter())
+                .take(n)
+                .map(|(c, s)| c / 60.0 * s)
+                .sum::<f64>()
+                / n as f64
+        };
         if (recon - avg_v).abs() > 0.05 {
             errs.push(format!(
                 "步态不自洽：步频×步幅 推出 {recon:.3} m/s，实际 {avg_v:.3} m/s"

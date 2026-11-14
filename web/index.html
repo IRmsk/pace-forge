@@ -50,6 +50,17 @@
          white-space: pre-line; line-height: 1.55; }
   .msg.warn { color:#f5b942; border-color:#5a4a1e; background:#2a2416; }
 .msg.err { color: var(--bad); max-height: 40vh; overflow-y: auto; }
+  .anchor-icon { pointer-events: none; }
+  .anchor-cross { width: 20px; height: 20px; margin: 0 auto; position: relative; }
+  .anchor-cross::before, .anchor-cross::after {
+    content: ''; position: absolute; background: #f5b942; box-shadow: 0 0 3px #000;
+  }
+  .anchor-cross::before { left: 9px; top: 0; width: 2px; height: 20px; }
+  .anchor-cross::after { top: 9px; left: 0; height: 2px; width: 20px; }
+  .anchor-label {
+    font-size: 11px; color: #f5b942; text-align: center; margin-top: 1px;
+    text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: nowrap;
+  }
   .msg.ok { color: var(--ok); }
 
   /* ---- 主界面 ---- */
@@ -1165,9 +1176,16 @@ function setPickLocation(lat, lng, fromMap) {
   if (fromMap) $('llCoord').value = 'gcj02';
   if (map) {
     if (locMarker) map.removeLayer(locMarker);
-    locMarker = L.circleMarker([lat, lng], {
-      radius: 8, color: '#f5b942', fillColor: '#f5b942', fillOpacity: .5, weight: 2,
-    }).addTo(map).bindTooltip('校区中心');
+    // 用十字 + 常显标签，**不要**再用圆圈：打卡点是圆圈（绿/红/灰），
+    // 锚点也画圆圈的话，用户会把橙色的那个数成「第 5 个打卡点」。
+    locMarker = L.marker([lat, lng], {
+      icon: L.divIcon({
+        className: 'anchor-icon',
+        html: '<div class="anchor-cross"></div><div class="anchor-label">校区中心</div>',
+        iconSize: [64, 40], iconAnchor: [32, 20],
+      }),
+      keyboard: false,
+    }).addTo(map);
   }
   $('llInfo').textContent = fromMap ? '已取到地图点（GCJ-02），提交时自动换算' : '';
 }
@@ -1251,9 +1269,14 @@ function syncLocToMap() {
   try {
     const g = toGcj02(v.lat, v.lng, v.coord);
     if (locMarker) map.removeLayer(locMarker);
-    locMarker = L.circleMarker(g, {
-      radius: 8, color: '#f5b942', fillColor: '#f5b942', fillOpacity: .5, weight: 2,
-    }).addTo(map).bindTooltip('校区中心');
+    locMarker = L.marker(g, {
+      icon: L.divIcon({
+        className: 'anchor-icon',
+        html: '<div class="anchor-cross"></div><div class="anchor-label">校区中心</div>',
+        iconSize: [64, 40], iconAnchor: [32, 20],
+      }),
+      keyboard: false,
+    }).addTo(map);
     // 容器显示出来之前尺寸是 0，setView 会算错中心，先让它重新量一次
     map.invalidateSize();
     // 已经放大得比 15 级更近就别缩回去，避免每次都把手动缩放重置
@@ -1304,7 +1327,9 @@ async function fetchFencesAndPoints() {
     bits.push(r.fence && fenceRing(r.fence).length >= 3
       ? `围栏「${r.fence.name || r.fence.id}」`
       : '未取到围栏');
-    bits.push(`${points.length} 个必到点`);
+    // 说清楚「那一圈颜色是什么」，否则用户会把橙色的校区中心数成第 5 个点
+    bits.push(`${points.length} 个必到点（灰虚线＝还没跑，不知道过没过）`);
+    bits.push('橙十字＝校区中心');
     if (r.anchorFrom) bits.push('锚点：' + r.anchorFrom);
     if (info) info.textContent = bits.join(' · ');
     if (!points.length) {
