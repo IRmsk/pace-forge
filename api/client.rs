@@ -418,11 +418,23 @@ pub fn expect_ok(body: &str) -> Result<Value, String> {
     let v: Value = serde_json::from_str(body).map_err(|e| format!("业务响应不是 JSON: {e}"))?;
     let code = v.get("error").and_then(|x| x.as_i64());
     if code == Some(crate::crypto::CODE_OK) {
-        Ok(v)
-    } else {
-        let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("未知错误");
-        Err(format!("业务错误 error={code:?} message={msg}"))
+        return Ok(v);
     }
+    let msg = v.get("message").and_then(|x| x.as_str()).unwrap_or("未知错误");
+    // 服务端内部故障要单独说清楚。它长得像「业务错误」，其实是后端服务被
+    // 注册中心白名单拒绝后把异常原样透传上来，跟本地环境一点关系都没有。
+    // 不点明的话，用户会去换网络、重装、换账号、挂代理，全白费
+    // （issue #3 里那位折腾了整整两天）。
+    if code == Some(crate::crypto::CODE_SERVER_FAULT) {
+        return Err(format!(
+            "服务端集群故障（error=-10000），跟你这边无关，别折腾本地环境：{msg}\n\n\
+             这条错误是对方后端内部服务调用被拦（日志里通常带 \n\
+             `Forbid consumer x.x.x.x access service ... from registry ...:2181`），\n\
+             登录、查记录、拉策略会一起失败。\n\
+             换网络、换账号、重装、重新编译都没有用——等后端恢复即可。"
+        ));
+    }
+    Err(format!("业务错误 error={code:?} message={msg}"))
 }
 
 #[cfg(test)]
@@ -516,6 +528,26 @@ mod tests {
     fn expect_ok_accepts_10000() {
         assert!(expect_ok(r#"{"error":10000,"message":"成功","data":1}"#).is_ok());
         assert!(expect_ok(r#"{"error":10121,"message":"设备异常"}"#).is_err());
+    }
+
+    /// `-10000` 必须被判成**服务端故障**，而且提示里要明确说「跟你无关」。
+    ///
+    /// 真实的报文长这样（issue #3 里贴出来的原文）：错误码是负数，`message`
+    /// 里塞着 dubbo 的 `Forbid consumer ... from registry ...:2181`。用户看到
+    /// 这种信息的默认反应是重装、换号、挂代理，全都是白费。
+    #[test]
+    fn server_fault_is_explained_not_just_reported() {
+        let body = r#"{"error":-10000,"message":"Forbid consumer 10.0.50.83 access service com.iydsj.server.basicuser.service.UserBasicService from registry 10.0.30.34:2181. Please check registry access list (whitelist/blacklist)"}"#;
+        let e = expect_ok(body).unwrap_err();
+        assert!(e.contains("-10000"), "要带上原始错误码，方便搜：{e}");
+        assert!(e.contains("服务端"), "要说明是服务端的问题：{e}");
+        assert!(
+            e.contains("无关") && e.contains("没有用"),
+            "必须明确劝阻换网络/换账号/重装：{e}"
+        );
+        // 别的非零码仍然走原来的「业务错误」，不要被这条吞掉
+        let e2 = expect_ok(r#"{"error":10121,"message":"设备异常"}"#).unwrap_err();
+        assert!(e2.starts_with("业务错误"), "10121 不该被当成服务端故障：{e2}");
     }
 
     /// 护栏：设备标识的注入路径**绝不能**是真实 `$HOME/.pace-forge-device-id*`。

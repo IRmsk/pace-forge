@@ -46,9 +46,10 @@
     border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
   }
   button:disabled { opacity: .55; cursor: not-allowed; }
-  .msg { font-size: 13px; margin-top: 14px; min-height: 20px; }
+  .msg { font-size: 13px; margin-top: 14px; min-height: 20px;
+         white-space: pre-line; line-height: 1.55; }
   .msg.warn { color:#f5b942; border-color:#5a4a1e; background:#2a2416; }
-.msg.err { color: var(--bad); }
+.msg.err { color: var(--bad); max-height: 40vh; overflow-y: auto; }
   .msg.ok { color: var(--ok); }
 
   /* ---- 主界面 ---- */

@@ -35,6 +35,18 @@ pub const PROTO_VERSION: &str = "101";
 /// 业务成功码。
 pub const CODE_OK: i64 = 10000;
 
+/// 服务端内部故障。
+///
+/// 这个码不是「业务拒绝」，是后端的异常透传：服务之间的调用被注册中心
+/// 白名单挡掉时，网关会把对方的异常信息原样塞进 `message`，典型内容是
+/// `Forbid consumer 10.x.x.x access service com.iydsj.server.basicuser.service
+/// .UserBasicService from registry 10.0.30.34:2181 ... whitelist/blacklist`。
+///
+/// 一旦出现，登录、查记录、拉策略全都会中招，且与账号、密码、设备指纹、
+/// 网络、客户端版本**完全无关**。区别对待它，用户才不会去重装、换号、
+/// 挂代理白折腾一轮（issue #3 里有人折腾了两天）。
+pub const CODE_SERVER_FAULT: i64 = -10000;
+
 /// 网关主机。
 pub mod hosts {
     pub const RUN: &str = "https://run.gxapp.iydsj.com";
