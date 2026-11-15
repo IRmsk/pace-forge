@@ -13,6 +13,7 @@
 //! `load_identity` / `save_session` / `clear_session` 三段式。
 
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// 登录会话。
@@ -45,14 +46,30 @@ impl Session {
     }
 }
 
-/// 数据目录名（相对 `$HOME`）。
+/// 数据目录名（相对用户主目录）。
 pub const DATA_DIR_NAME: &str = ".pace-forge";
 
-/// `$HOME`。只读环境变量，不写、不创建任何东西。
+/// 用户主目录：优先非空 HOME，Windows 再取 USERPROFILE，最后回退系统临时目录。
+/// 只读环境变量，不写、不创建任何东西；保留操作系统原始路径编码。
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var("HOME")
+    #[cfg(windows)]
+    let user_profile = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let user_profile = None;
+
+    resolve_home_dir(std::env::var_os("HOME"), user_profile, std::env::temp_dir())
+}
+
+/// 纯路径选择，供测试注入输入而不修改进程全局环境变量。
+fn resolve_home_dir(
+    home: Option<OsString>,
+    user_profile: Option<OsString>,
+    fallback: PathBuf,
+) -> PathBuf {
+    home.filter(|value| !value.is_empty())
+        .or_else(|| user_profile.filter(|value| !value.is_empty()))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .unwrap_or(fallback)
 }
 
 /// 给定 HOME 基目录，拼出数据目录：`<base>/.pace-forge`。
@@ -64,7 +81,7 @@ pub fn data_dir_in(base: &Path) -> PathBuf {
     base.join(DATA_DIR_NAME)
 }
 
-/// 数据目录：`$HOME/.pace-forge/`。
+/// 数据目录：`<用户主目录>/.pace-forge/`。
 ///
 /// 只算路径，不做 IO。早先这里带 `create_dir_all`，等于任何一次只读调用
 /// 都会在真实 HOME 下建目录；建目录的责任现在落在真正写盘的唯一入口
@@ -103,8 +120,8 @@ pub(crate) fn write_file_private(path: &Path, data: &[u8]) -> Result<(), String>
             ensure_dir(parent)?;
         }
     }
-    let mut f = std::fs::File::create(path)
-        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    let mut f =
+        std::fs::File::create(path).map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -121,7 +138,8 @@ fn read_json_below<T: serde::de::DeserializeOwned>(dir: &Path, name: &str) -> Op
 }
 
 fn write_json_below<T: Serialize>(dir: &Path, name: &str, value: &T) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(value).map_err(|e| format!("序列化 {name} 失败: {e}"))?;
     // 会话文件含 token，write_file_private 会建目录并收紧到 0600
     write_file_private(&dir.join(name), json.as_bytes())
 }
@@ -218,6 +236,70 @@ mod tests {
             grade_class: "2024级".into(),
             device_id: "deadbeef".into(),
         }
+    }
+
+    #[test]
+    fn home_resolution_preserves_home_priority() {
+        assert_eq!(
+            resolve_home_dir(
+                Some(OsString::from("configured-home")),
+                Some(OsString::from("windows-profile")),
+                PathBuf::from("fallback"),
+            ),
+            PathBuf::from("configured-home")
+        );
+    }
+
+    #[test]
+    fn home_resolution_uses_windows_profile_without_home() {
+        for home in [None, Some(OsString::new())] {
+            assert_eq!(
+                resolve_home_dir(
+                    home,
+                    Some(OsString::from("windows-profile")),
+                    PathBuf::from("fallback"),
+                ),
+                PathBuf::from("windows-profile")
+            );
+        }
+    }
+
+    #[test]
+    fn home_resolution_uses_fallback_for_missing_or_empty_values() {
+        for home in [None, Some(OsString::new())] {
+            for profile in [None, Some(OsString::new())] {
+                assert_eq!(
+                    resolve_home_dir(home.clone(), profile, PathBuf::from("system-temp")),
+                    PathBuf::from("system-temp")
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn home_resolution_preserves_non_unicode_paths() {
+        #[cfg(unix)]
+        let raw = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![b'/', b'h', 0xff])
+        };
+        #[cfg(windows)]
+        let raw = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[b'C' as u16, b':' as u16, b'\\' as u16, 0xd800])
+        };
+
+        assert!(raw.to_str().is_none());
+        let expected = PathBuf::from(raw.clone());
+        assert_eq!(
+            resolve_home_dir(Some(raw.clone()), None, PathBuf::from("fallback")),
+            expected
+        );
+        assert_eq!(
+            resolve_home_dir(None, Some(raw), PathBuf::from("fallback")),
+            expected
+        );
     }
 
     #[test]
@@ -343,4 +425,3 @@ mod tests {
         );
     }
 }
-
