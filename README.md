@@ -249,17 +249,56 @@ android.hardware.bluetooth             蓝牙
 前两个是步数来源，第三个对应新增的 `getBluetoothInfo`（穿戴设备同步）。
 纯软件方案不带这些，属于"设备指纹不全"，但服务端目前没有强制校验的证据。
 
-## 安装
+## 下载与安装
+
+### 预编译包（Windows x64 / Linux x64）
+
+提供发布包后，可到 [GitHub Releases](https://github.com/IRmsk/pace-forge/releases) 选择对应系统的版本：
+
+| 系统 | 发布包 |
+|---|---|
+| Windows x64 | `pace-forge-v{version}-windows-x86_64.zip` |
+| Linux x64 | `pace-forge-v{version}-linux-x86_64.tar.gz` |
+
+归档包包含可执行文件、`LICENSE`、本 README、`build-info.json` 和启动脚本：Windows 使用 `start-web.cmd`，Linux 使用 `start-web.sh`。预编译包不需要安装 Rust/Cargo。当前发布目标为 Windows x64 MSVC（静态 CRT）和 Linux x64 musl；具体兼容性以对应版本的 CI 构建结果为准。
+
+Windows：解压 ZIP，在解压目录打开 PowerShell，运行：
+
+```powershell
+.\pace-forge.exe web
+```
+
+也可以运行 `start-web.cmd`。终端窗口会保持打开；访问 `http://127.0.0.1:9999`，结束时在终端按 Ctrl+C。
+
+Linux：解压归档，进入包含 `pace-forge` 的目录，运行：
+
+```bash
+tar -xzf pace-forge-vX.Y.Z-linux-x86_64.tar.gz
+cd pace-forge-vX.Y.Z-linux-x86_64
+./pace-forge web
+```
+
+也可以运行 `./start-web.sh`。访问 `http://127.0.0.1:9999`，结束时在终端按 Ctrl+C。将命令中的 `X.Y.Z` 替换为下载文件对应的版本号。
+
+Pull request、推送到 `main` 和手动运行发布工作流会生成供检查的 Actions artifacts。预览包文件名会在版本号后附上构建提交的前 7 位，并包含 `build-info.json`；它们属于对应工作流运行的预览构建，不是正式 Release。正式发布包只会出现在上面的 Releases 页面。
+
+### 维护者发版
+
+预览构建用于检查工作流产物；手动运行工作流也只生成预览包，不会创建 Release。正式发版前先确认 Cargo 包版本与 Git tag 中的版本一致，再推送 `v*` tag（例如 Cargo 版本 `1.2.3` 对应 tag `v1.2.3`）。通过验证的 tag 工作流会创建 GitHub Release，附上 Windows/Linux 包和汇总校验文件 `SHA256SUMS`。
+
+### 从源码构建
+
+需要安装 Rust/Cargo；Windows 还需要 MSVC C++ 构建工具。
 
 ```bash
 git clone https://github.com/IRmsk/pace-forge.git
 cd pace-forge
-cargo build --release
+cargo build --release --locked
 
 ./target/release/pace-forge help
 ```
 
-单二进制，无运行时依赖。
+Windows 生成的程序名为 `target\release\pace-forge.exe`。源码构建可用于不在上述预编译目标内的平台。
 
 ## 使用
 
@@ -511,7 +550,8 @@ pace-forge 是一个**非官方客户端实现**，用于学习移动端通信�
 
 ### 数据处理
 
-- 账号凭证仅存于本机 `~/.pace-forge/accounts.json`，密码经 AES 加密存放
+- 数据根目录：Windows 优先使用 `HOME`，未设置时使用 `USERPROFILE`，两者都不可用时回退到系统临时目录；Linux 使用 `HOME`，未设置时回退到系统临时目录。
+- 账号库和当前会话保存在数据根目录下的 `.pace-forge/accounts.json` 与 `.pace-forge/session.json`；密码经 AES 加密，`uid`、登录令牌等字段以未加密的 JSON 保存在本机。设备标识文件保存在数据根目录下的 `.pace-forge-device-id-<hash>`。请妥善保护这些文件及其备份。
 - 所有请求由本机直接发往官方域名，无中间服务器
 - 无遥测、无统计上报、无远程控制，作者无法获知使用情况
 
@@ -536,10 +576,10 @@ pace-forge 是一个**非官方客户端实现**，用于学习移动端通信�
 
 服务端按 `device_id` 认设备。同一个账号每次登录必须用**同一个** device_id，否则它认为你在换手机，直接锁号一小时。
 
-本项目按「手机号」做作用域，一个账号有且只有一套 device_id，存在 `~/.pace-forge-device-id-<hash>`。会触发这个错误的情况：
+本项目按「手机号」做作用域，一个账号有且只有一套 device_id，存在数据根目录下的 `.pace-forge-device-id-<hash>`。会触发这个错误的情况：
 
 - 之前用过别的同类工具，它给账号挂了另一个 device_id
-- 手动删过 `~/.pace-forge-device-id*` 文件
+- 手动删过数据根目录下的 `.pace-forge-device-id*` 文件
 - 用同一个账号在手机 App 和本工具之间来回登录
 
 **处理**：等满一小时再试。如果反复触发，去手机 App 里主动退出登录，让它清掉旧会话，再回来登录。

@@ -1,0 +1,159 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  RUST_TOOLCHAIN: '1.100.0'
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate package version and release tag
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_TYPE -eq 'tag') {
+            python tools/package_release.py version --tag $env:GITHUB_REF_NAME
+          } else {
+            python tools/package_release.py version
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+      # Apply to the explicit target, including native C code in dependencies.
+      RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Install musl build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          sudo apt-get install --yes musl-tools
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}-${{ env.RUST_TOOLCHAIN }}
+      - name: Run library tests
+        run: cargo test --locked --lib --target $env:BUILD_TARGET
+      - name: Build release binary
+        run: cargo build --locked --release --target $env:BUILD_TARGET
+      - name: Check Linux static linkage
+        if: runner.os == 'Linux'
+        run: |
+          $headers = readelf --program-headers "target/$env:BUILD_TARGET/release/pace-forge"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($headers -match '\bINTERP\b') { throw 'Linux package requires a dynamic loader' }
+      - name: Package binary and calculate checksum
+        run: |
+          $packageArgs = @('package', '--target', $env:BUILD_TARGET, '--revision', $env:GITHUB_SHA)
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_TYPE -eq 'tag') {
+            $packageArgs += @('--tag', $env:GITHUB_REF_NAME)
+          }
+          python tools/package_release.py @packageArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify extracted package and local web server
+        run: |
+          $archives = @(Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(zip|tar\.gz)$' })
+          if ($archives.Count -ne 1) { throw 'Expected exactly one release archive' }
+          python tools/verify_release.py $archives[0].FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pace-forge-${{ matrix.platform }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pace-forge-*-${{ github.sha }}
+          merge-multiple: true
+          path: dist
+      - name: Verify all packages and publish release
+        run: |
+          $archives = @(Get-ChildItem dist -File | Where-Object { $_.Name -match '\.(zip|tar\.gz)$' } | Sort-Object Name)
+          $checksums = @(Get-ChildItem dist -File -Filter '*.sha256' | Sort-Object Name)
+          if ($archives.Count -ne 2 -or $checksums.Count -ne 2) {
+            throw 'Expected both platform archives and their checksums'
+          }
+          foreach ($archive in $archives) {
+            $expected = (Get-Content ($archive.FullName + '.sha256') -Raw).Split(' ')[0]
+            $actual = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw "Checksum mismatch: $($archive.Name)" }
+          }
+          Get-Content $checksums.FullName | Set-Content dist/SHA256SUMS -Encoding utf8NoBOM
+          $assets = @($archives.FullName) + @((Resolve-Path dist/SHA256SUMS).Path)
+          gh release view $env:RELEASE_TAG --json isDraft 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $releaseArgs = @('release', 'create', $env:RELEASE_TAG, '--verify-tag', '--title', $env:RELEASE_TAG, '--generate-notes', '--draft')
+            if ($env:RELEASE_TAG -match '^v\d+\.\d+\.\d+-') { $releaseArgs += '--prerelease' }
+            gh @releaseArgs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          # Keep a new release as a draft until all uploads finish. Reruns resume uploads.
+          gh release upload $env:RELEASE_TAG --clobber @assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release edit $env:RELEASE_TAG --draft=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

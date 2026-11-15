@@ -1,4 +1,6 @@
 /target
+/dist
+__pycache__/
 /session.json
 *.log
 # 账号与设备标识（含加密密码、token、device_id）
