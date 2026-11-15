@@ -270,6 +270,8 @@ Windows：解压 ZIP，在解压目录打开 PowerShell，运行：
 
 也可以运行 `start-web.cmd`。终端窗口会保持打开；访问 `http://127.0.0.1:9999`，结束时在终端按 Ctrl+C。
 
+旧版 Windows 若没有设置 `HOME`，可能把数据写在启动盘根目录的 `\tmp` 下。升级前关闭程序，将旧目录中的 `.pace-forge` 文件夹和同级的 `.pace-forge-device-id*` 文件一起复制到新的数据根目录（通常为 `%USERPROFILE%`），保留旧文件，避免覆盖新目录中已有的账号数据。设备标识也要一起保留，才能继续复用原来的登录设备身份。
+
 Linux：解压归档，进入包含 `pace-forge` 的目录，运行：
 
 ```bash
