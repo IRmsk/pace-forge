@@ -27,7 +27,9 @@ def verify(archive: Path) -> None:
         raise ValueError("Archive checksum does not match its checksum file")
 
     with tempfile.TemporaryDirectory(prefix="pace-forge-release-") as temporary:
-        root = Path(temporary)
+        # Windows runners can expose TEMP through an 8.3 alias (RUNNER~1).
+        # Compare canonical paths on both sides of the archive boundary check.
+        root = Path(temporary).resolve()
         extracted = root / "extracted"
         extracted.mkdir()
         if archive.name.endswith(".zip"):
