@@ -77,7 +77,10 @@ pub fn parse_pass_points(v: &Value) -> Vec<PassPoint> {
                 lon,
                 glat,
                 glon,
-                is_fixed: p.get("isFixed").and_then(value_as_i64).unwrap_or(1),
+                // 缺失按 0（普通点）：与 `flow::dry_run` 那份同源同默认值，
+                // 否则同一次规划里「Web 点位列表」和「提交报文」会对同一批点
+                // 给出不同的 isFixed。
+                is_fixed: p.get("isFixed").and_then(value_as_i64).unwrap_or(0),
                 point_name: p
                     .get("pointName")
                     .and_then(|x| x.as_str())

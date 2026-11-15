@@ -218,7 +218,8 @@ cp  | 自检: id / isFixed / position | OBS 上传(同一个 envelope): 同三�
 ```
 
 - 六个点的 `id` / `count` / `radius` / `type` / `bdA` **逐个 `=`**（不是「同量级」）；
-- 必到点数组 `id` 81..85、`isFixed` 只有首点为 1、`position` 0..4 连续——与真机
+- 必到点数组 `id` 81..85、`isFixed` 原样回显服务端标记（**不是**「首点为 1」，
+  详见 `FIXED-POINT-PARITY.md` 文末「后续修正」）、`position` 0..4 连续——与真机
   `rrid 1328288734` 的形态一致，且自检与上传是同一份；
 - `type` 里 `7/5/-1…` 的分布、`type=2` 的打卡标记都在**自检那份**里出现了
   （修复前 probe 传空 `fixed`，自检那份一个标记都没有）。

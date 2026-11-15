@@ -104,6 +104,16 @@ pub struct FixedPoint {
     pub point_name: String,
     pub glat: f64,
     pub glon: f64,
+    /// 服务端下发的 `isFixed`：1 = 固定打卡点（校门闸机这类），0 = 普通途经点。
+    ///
+    /// 早先这里没这个字段，`fixed_point_items` 用 `position == 0` 猜——「按经过
+    /// 顺序排第一的那个就是固定点」。能对上真机纯属巧合：真机 rrid 1328288734
+    /// 的固定点（id 81「丁香园正门」）恰好就是第一个经过的。
+    ///
+    /// 一旦服务端把固定点排在别的位置，我们就标错点，App 详情页会用另一种
+    /// 样式（橙色圆点）渲染那个 `isFixed=1` 的点——用户看到的是「五个点位里
+    /// 有一个颜色不对，而且位置也不对」。
+    pub is_fixed: i64,
 }
 
 /// 必到点 `id` 的起始值。
@@ -218,7 +228,8 @@ pub fn fixed_point_items(fixed: &[FixedPoint], track: &[TrackPoint], flag_ms: i6
                 "glat": glat,
                 "glon": glon,
                 "id": FIXED_POINT_ID_BASE + position as i64,
-                "isFixed": if position == 0 { 1 } else { 0 },
+                // 用服务端下发的标记，不再按「排序第一个」猜（见 FixedPoint::is_fixed）
+                "isFixed": f.is_fixed,
                 "isPass": hits[i].is_some(),
                 "lat": f.lat,
                 "lon": f.lon,
@@ -2780,12 +2791,20 @@ mod audit_tests {
         let sim = sim(&p, &t);
         let fixed = vec![
             FixedPoint {
-                lat: 31.2324, lon: 121.4737,
-                point_name: "秋实城东南".into(), glat: 31.2251, glon: 121.4680,
+                lat: 31.2324,
+                lon: 121.4737,
+                point_name: "秋实城东南".into(),
+                glat: 31.2251,
+                glon: 121.4680,
+                is_fixed: 0,
             },
             FixedPoint {
-                lat: 31.2330, lon: 121.4737,
-                point_name: "梅园2栋西".into(), glat: 31.2257, glon: 121.4680,
+                lat: 31.2330,
+                lon: 121.4737,
+                point_name: "梅园2栋西".into(),
+                glat: 31.2257,
+                glon: 121.4680,
+                is_fixed: 0,
             },
         ];
         let sub = build(&p, &t, &fixed, &sim).unwrap();
@@ -2819,7 +2838,13 @@ mod audit_tests {
     /// `id` 从 1 起。App 按 position 排序/取下标，于是只显示得出一部分点。
     ///
     /// 现在钉死四条：position == 0..N-1、数组下标 == position（即按途经顺序
-    /// 排列）、isFixed 只有首点 1、id 从 81 连续、flag 全场同值。
+    /// 排列）、`isFixed` **跟着服务端标记走**、id 从 81 连续、flag 全场同值。
+    ///
+    /// `isFixed` 这条以前写的是「只有首点 1」，那是照着真机样本反推的——
+    /// 真机那个固定点恰好就是第一个经过的，于是被当成了规律。实际语义是
+    /// 服务端说哪个点是固定打卡点（校门闸机）就是哪个，与途经顺序无关。
+    /// 按位置猜的后果：App 详情页会给 `isFixed=1` 的点换一种样式（橙点），
+    /// 猜错就变成「五个点位里有一个颜色和位置都不对」。
     #[test]
     fn fixed_points_numbered_like_real_device() {
         let p = params();
@@ -2844,6 +2869,10 @@ mod audit_tests {
                     // 真机两套坐标都是真值，发 0 等于「这个点没有 GCJ 坐标」。
                     glat: 0.0,
                     glon: 0.0,
+                    // 夹具：只有「P220」这个点在服务端标了固定点（=1），其余普通点。
+                    // 按途经顺序它排第 4（下标 3），所以正确结果是 [0,0,0,1,0]
+                    // ——这个位置对不上，正好证明 isFixed 不是按顺序猜出来的。
+                    is_fixed: if *n == "P220" { 1 } else { 0 },
                 }
             })
             .collect();
@@ -2867,9 +2896,16 @@ mod audit_tests {
             "数组必须按途经顺序排列，实际 {got:?}"
         );
 
-        // ③ isFixed 只有第一个点 1，其余 0（真机：只有首点 1）
+        // ③ isFixed 跟随服务端标记，**不**按途经顺序猜。
+        //    夹具里只有 P220 标了固定点，按途经顺序它排第 4（下标 3），
+        //    所以正确结果是 [0,0,0,1,0]——如果谁又改回「首点为 1」，
+        //    这条断言立刻翻红。
         let fixed_flags: Vec<i64> = inner.iter().map(|f| f["isFixed"].as_i64().unwrap()).collect();
-        assert_eq!(fixed_flags, vec![1, 0, 0, 0, 0], "isFixed 只能首点为 1");
+        assert_eq!(
+            fixed_flags,
+            vec![0, 0, 0, 1, 0],
+            "isFixed 必须原样跟随服务端标记（P220 在 position 3）"
+        );
 
         // ④ id 从 81 起连续；flag 全场同值
         let ids: Vec<i64> = inner.iter().map(|f| f["id"].as_i64().unwrap()).collect();

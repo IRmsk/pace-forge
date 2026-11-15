@@ -1265,6 +1265,10 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
                 // fixed_point_items 反算——真机两套坐标都是真值。
                 glat: raw.get("glat").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 glon: raw.get("glon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                // 服务端说哪个是固定打卡点就是哪个，别按排序猜。
+                // 缺失时按 0（普通点）处理：`isFixed=1` 会让 App 换一种样式渲染，
+                // 猜成固定点比漏一个固定点更容易看出异常。
+                is_fixed: raw.get("isFixed").and_then(|v| v.as_i64()).unwrap_or(0),
             }
         })
         .collect();
@@ -2160,6 +2164,7 @@ mod fixed_point_payload_tests {
             point_name: "P25".into(),
             glat: 0.0,
             glon: 0.0,
+            is_fixed: 1,
         }];
         let loc = crate::api::submit::build_points(&pts, &fixed, start_ms, None).expect("points");
         let obj = detail_payload_rrid(&sim, "123", 99, start_ms, "U", &five, &loc);
@@ -2320,6 +2325,8 @@ mod single_point_source_tests {
                     // （与 `flow::dry_run` 的映射一致）。
                     glat: 0.0,
                     glon: 0.0,
+                    // 夹具：第一个当固定打卡点，其余普通点
+                    is_fixed: if k == 0 { 1 } else { 0 },
                 }
             })
             .collect();
