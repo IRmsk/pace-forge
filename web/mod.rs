@@ -187,12 +187,23 @@ fn auth_token() -> Option<String> {
 }
 
 /// 请求来源是否本机。
+///
+/// 覆盖整个 `127.0.0.0/8`、`::1`，以及 IPv4-mapped 形态 `::ffff:127.x.x.x`：
+/// 服务绑在 `[::]` 时，本机用 IPv4 回环访问，对端看到的正是 mapped 地址。
+/// 早先只精确匹配了 `::ffff:127.0.0.1` 一个值，`127.0.0.2` 这类会被误判成远程。
 fn is_loopback(remote: &str) -> bool {
-    let r = remote.trim();
-    r.starts_with("127.")
-        || r.starts_with("::1")
-        || r.starts_with("[::1]")
-        || r == "::ffff:127.0.0.1"
+    use std::net::IpAddr;
+    let r = remote.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = r.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback(),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
+    }
+    // 解析不出来时退回字符串判据（宁可严格）
+    r.starts_with("127.") || r == "::1"
 }
 
 /// 鉴权通过返回 Ok，否则返回 Err(要回给客户端的话)。
@@ -2558,5 +2569,28 @@ mod center_input_tests {
         let a = input_to_bd09(47.3864, 123.9586, "whatever").unwrap();
         let b = input_to_bd09(47.3864, 123.9586, "gcj02").unwrap();
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::is_loopback;
+
+    /// 本机判定必须覆盖整个回环段，包括双栈下 IPv4 的 mapped 形态。
+    #[test]
+    fn loopback_covers_whole_range_and_mapped_ipv4() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+            "::ffff:127.0.0.2",
+        ] {
+            assert!(is_loopback(ok), "{ok} 应判为本机");
+        }
+        for no in ["10.0.0.1", "192.168.1.2", "::ffff:192.168.1.2", "114.114.114.114"] {
+            assert!(!is_loopback(no), "{no} 不该判为本机");
+        }
     }
 }

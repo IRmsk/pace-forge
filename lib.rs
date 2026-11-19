@@ -8,7 +8,7 @@
 //! - [`api`]     请求组装与业务接口
 //! - [`web`]     Web 控制台（登录 / 记录 / 轨迹地图）
 //! - [`track`]   轨迹生成与 10 秒分桶
-//! - `cli`       命令行（待实现）
+//! - `cli`       命令行入口（`pace-forge help`，见 `main.rs`）
 
 pub mod api;
 pub mod crypto;

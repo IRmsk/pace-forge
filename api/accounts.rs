@@ -6,6 +6,9 @@
 //!
 //! 密码用 AES-128-CBC 加密后落盘，密钥由**本机指纹**派生——换机器就解不开，
 //! 这正是我们要的：配置文件被人拷走也读不出明文密码。
+//!
+//! 每条密文自带**随机盐 + 随机 IV**（`v2:` 前缀），所以同一个密码不会产生
+//! 相同密文；旧版无前缀的确定性密文仍然读得动（老用户盘上就是那种）。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -94,9 +97,22 @@ pub fn mask_phone(p: &str) -> String {
 pub struct Book {
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// 加密这库密码的机器密钥指纹。老库没有这个字段（`None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 impl Book {
+    /// 库的密钥指纹与当前机器不一致（换机器 / 主机名变了 / 容器重建）。
+    ///
+    /// 老库没有指纹，返回 `false`——不能把「没有记录」当成「不匹配」。
+    pub fn key_mismatch(&self) -> bool {
+        match &self.key_id {
+            Some(id) => id != &key_id(),
+            None => false,
+        }
+    }
+
     pub fn get(&self, id: &str) -> Option<&Account> {
         self.accounts.iter().find(|a| a.id == id)
     }
@@ -228,18 +244,63 @@ fn derive_key(host: &str, user: &str) -> [u8; 16] {
     k
 }
 
+/// 当前机器密钥的短指纹（前 4 字节 hex）。
+///
+/// 落进 `accounts.json`。作用是区分「换了机器 / 主机名变了」和「文件坏了」：
+/// 密钥变了时解密失败是预期行为，提示措辞应该不一样。
+pub fn key_id() -> String {
+    let key = machine_key();
+    let mut h = Sha256::new();
+    h.update(b"pace-forge/key-id/v1");
+    h.update(key);
+    let d = h.finalize();
+    let n = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    format!("{n:08x}")
+}
+
+/// v2 派生：机器密钥 + 每条密文自己的随机盐。
+fn derive_key_v2(salt: &[u8]) -> [u8; 16] {
+    let mut h = Sha256::new();
+    h.update(b"pace-forge/accounts/v2");
+    h.update(machine_key());
+    h.update(salt);
+    let d = h.finalize();
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&d[..16]);
+    k
+}
+
+/// v2 密文前缀。没有这个前缀的都是旧版确定性 CBC 密文。
+const PW_V2_PREFIX: &str = "v2:";
+
 /// 加密密码。
+///
+/// 格式：`v2:` + base64( salt[16] || iv[16] || AES-128-CBC(PKCS#7)(明文) )。
+/// 盐和 IV 每条都重新随机，因此**同一密码每次密文都不同**，从 `accounts.json`
+/// 看不出哪些账号用了相同密码。
 pub fn seal_password(plain: &str) -> Result<String, String> {
     use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
     type Enc = cbc::Encryptor<aes::Aes128>;
 
-    let key = machine_key();
-    let iv = [0u8; 16];
-    let enc = Enc::new(&key.into(), &iv.into());
-    let ct = enc
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 16];
+    rng.fill(&mut salt);
+    rng.fill(&mut iv);
+    let key = derive_key_v2(&salt);
+    let ct = Enc::new(&key.into(), &iv.into())
         .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
+
+    let mut blob = Vec::with_capacity(32 + ct.len());
+    blob.extend_from_slice(&salt);
+    blob.extend_from_slice(&iv);
+    blob.extend_from_slice(&ct);
     use base64::Engine;
-    Ok(base64::engine::general_purpose::STANDARD.encode(ct))
+    Ok(format!(
+        "{PW_V2_PREFIX}{}",
+        base64::engine::general_purpose::STANDARD.encode(blob)
+    ))
 }
 
 /// 解密密码。
@@ -251,9 +312,31 @@ pub fn open_password(enc: &str) -> Result<String, String> {
     type Dec = cbc::Decryptor<aes::Aes128>;
 
     use base64::Engine;
+    let (body, is_v2) = match enc.strip_prefix(PW_V2_PREFIX) {
+        Some(rest) => (rest, true),
+        None => (enc, false),
+    };
     let raw = base64::engine::general_purpose::STANDARD
-        .decode(enc)
+        .decode(body)
         .map_err(|e| format!("密码字段不是合法 base64: {e}"))?;
+
+    if is_v2 {
+        if raw.len() < 32 || (raw.len() - 32) % 16 != 0 {
+            return Err("密码字段格式损坏（v2 密文长度不对）".into());
+        }
+        let salt = &raw[..16];
+        let mut iv = [0u8; 16];
+        iv.copy_from_slice(&raw[16..32]);
+        let ct = &raw[32..];
+        let key = derive_key_v2(salt);
+        let dec = Dec::new(&key.into(), &iv.into());
+        return match dec.decrypt_padded_vec_mut::<Pkcs7>(ct) {
+            Ok(pt) => String::from_utf8(pt).map_err(|e| format!("密码不是 UTF-8: {e}")),
+            Err(e) => Err(format!("密码解密失败（可能换了机器）: {e}")),
+        };
+    }
+
+    // 旧版：全零 IV + 机器密钥（再兜一层更老的派生方式）。
     let iv = [0u8; 16];
     let mut last = String::new();
     for key in [machine_key(), legacy_machine_key()] {
@@ -283,7 +366,17 @@ pub(crate) fn load_in(base: &Path) -> Book {
         return Book::default();
     };
     match serde_json::from_str::<Book>(&text) {
-        Ok(b) => b,
+        Ok(b) => {
+            if b.key_mismatch() {
+                eprintln!(
+                    "! [accounts] 账号库的密钥指纹（{}）与当前机器（{}）不一致：\
+                     换过机器或主机名变了，已保存的密码解不开，需要重新输入密码。",
+                    b.key_id.as_deref().unwrap_or("-"),
+                    key_id()
+                );
+            }
+            b
+        }
         Err(e) => {
             eprintln!("账号库解析失败（已忽略）: {e}");
             Book::default()
@@ -308,7 +401,10 @@ pub(crate) fn save_in(base: &Path, book: &Book) -> Result<(), String> {
     // 首次运行目录还不存在，这里负责建出来（写前必须确保）
     ensure_dir(&dir)?;
     let p = dir.join("accounts.json");
-    let text = serde_json::to_string_pretty(book).map_err(|e| e.to_string())?;
+    // 落盘时补上密钥指纹（调用方不用关心）
+    let mut to_write = book.clone();
+    to_write.key_id = Some(key_id());
+    let text = serde_json::to_string_pretty(&to_write).map_err(|e| e.to_string())?;
 
     // 先写临时文件再改名，避免写一半断电把库毁了
     let tmp = p.with_extension("json.tmp");
@@ -427,6 +523,66 @@ mod tests {
         let a = back.get("x").unwrap();
         assert_eq!(open_password(&a.password_enc).unwrap(), "pw");
         assert_eq!(a.token, "tok");
+    }
+
+    /// 同一密码每次加密都必须不同（随机盐 + 随机 IV），且都能解回来。
+    #[test]
+    fn seal_password_is_randomized() {
+        let a = seal_password("same-pass").unwrap();
+        let b = seal_password("same-pass").unwrap();
+        assert_ne!(a, b, "同一密码不该产生相同密文，否则能从库里看出哪些账号同密码");
+        assert_eq!(open_password(&a).unwrap(), "same-pass");
+        assert_eq!(open_password(&b).unwrap(), "same-pass");
+    }
+
+    /// v2 密文带前缀；截断/长度不对必须明确报错，而不是解出垃圾。
+    #[test]
+    fn v2_ciphertext_is_prefixed_and_rejects_truncation() {
+        use base64::Engine;
+        let enc = seal_password("pw").unwrap();
+        assert!(enc.starts_with("v2:"), "新密文应带 v2: 前缀: {enc}");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&enc[3..])
+            .unwrap();
+        // salt(16) + iv(16) + 至少一个分组
+        assert!(raw.len() >= 48);
+        let broken = format!(
+            "v2:{}",
+            base64::engine::general_purpose::STANDARD.encode(&raw[..raw.len() - 1])
+        );
+        assert!(open_password(&broken).is_err(), "长度不对的 v2 密文必须报错");
+    }
+
+    /// 账号库落盘时写入密钥指纹；同一台机器读回不该判为不匹配。
+    #[test]
+    fn book_records_key_fingerprint() {
+        let t = TestDir::new("accounts-keyid");
+        save_in(t.home(), &sample_book()).unwrap();
+        let back = load_in(t.home());
+        assert_eq!(back.key_id.as_deref(), Some(key_id().as_str()));
+        assert!(!back.key_mismatch(), "同机读回不该报密钥不匹配");
+        let js = std::fs::read_to_string(book_path_in(t.home())).unwrap();
+        assert!(js.contains("key_id"), "落盘 JSON 应带 key_id 字段: {js}");
+    }
+
+    /// 指纹对不上时必须能被识别出来（换机器 / 主机名变了）。
+    #[test]
+    fn book_detects_foreign_key_fingerprint() {
+        let t = TestDir::new("accounts-keyid-foreign");
+        let dir = data_dir_in(t.home());
+        ensure_dir(&dir).unwrap();
+        let mut b = sample_book();
+        b.key_id = Some("deadbeef".into());
+        std::fs::write(book_path_in(t.home()), serde_json::to_string(&b).unwrap()).unwrap();
+
+        let back = load_in(t.home());
+        assert!(back.key_mismatch(), "异机指纹必须被识别");
+
+        // 老库没有指纹字段：不匹配为 false（不能把「没记录」当「不匹配」）
+        let mut old = sample_book();
+        old.key_id = None;
+        std::fs::write(book_path_in(t.home()), serde_json::to_string(&old).unwrap()).unwrap();
+        assert!(!load_in(t.home()).key_mismatch());
     }
 
     /// 用旧派生方式加密的库必须还能读：老用户盘上就是这种密文。
