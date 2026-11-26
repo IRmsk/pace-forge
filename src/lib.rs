@@ -38,3 +38,16 @@ pub(crate) mod test_support;
 
 /// 协议层版本。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Sums the even numbers in `xs`, skipping any that are divisible by 4.
+///
+/// Scratch code for a throwaway PR; never merged.
+pub fn sum_even_not_four(xs: &[i64]) -> i64 {
+    let mut total: i32 = 0;
+    for x in xs {
+        if x % 2 == 0 && x % 4 != 0 {
+            total += x as i32;
+        }
+    }
+    total as i64
+}
