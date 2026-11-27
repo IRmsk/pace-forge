@@ -2472,28 +2472,32 @@ pub fn run_full(
         Ok(v) => {
             let today = local_day_key();
             let mut done = 0.0f64;
-            if let Some(arr) = v.as_array() {
-                for r in arr {
-                    let st = r
-                        .get("startTime")
-                        .and_then(|x| x.as_i64())
-                        .or_else(|| {
-                            r.get("startTime")
-                                .and_then(|x| x.as_str())
-                                .and_then(|s| s.parse::<i64>().ok())
-                        })
-                        .unwrap_or(0);
-                    // startTime 可能是秒也可能是毫秒（服务端两种都见过）。
-                    // 按数量级判断：小于 1e11 当秒处理，乘 1000——之前直接按
-                    // 毫秒算，结果全落到 1970 年，日上限永远显示 0m。
-                    let st_ms = if st > 0 && st < 100_000_000_000 {
-                        st * 1000
-                    } else {
-                        st
-                    };
-                    if day_key_of(st_ms) == today {
-                        done += r.get("totalDis").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    }
+            // `list_records` 回的是**对象** `{"records": [...]}`（见
+            // `api::records::list_records`——它走 `normalize_list`，返回对象），
+            // 原来这里只判 `v.as_array()` ⇒ 分支永远不进 ⇒ 「今日已跑」恒为 0
+            // ⇒ 日上限**从来没有真正拦过任何一次提交**（实测当天已跑 2262m，
+            // 日志仍报「今日已跑 0m」）。`semester::derived_count` 里已经是
+            // 「数组或 `records` 字段」两解，这里统一走 `records::records_of`。
+            for r in super::records::records_of(&v) {
+                let st = r
+                    .get("startTime")
+                    .and_then(|x| x.as_i64())
+                    .or_else(|| {
+                        r.get("startTime")
+                            .and_then(|x| x.as_str())
+                            .and_then(|s| s.parse::<i64>().ok())
+                    })
+                    .unwrap_or(0);
+                // startTime 可能是秒也可能是毫秒（服务端两种都见过）。
+                // 按数量级判断：小于 1e11 当秒处理，乘 1000——之前直接按
+                // 毫秒算，结果全落到 1970 年，日上限永远显示 0m。
+                let st_ms = if st > 0 && st < 100_000_000_000 {
+                    st * 1000
+                } else {
+                    st
+                };
+                if day_key_of(st_ms) == today {
+                    done += r.get("totalDis").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 }
             }
             let after = done + p.distance_m;
