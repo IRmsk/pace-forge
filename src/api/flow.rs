@@ -216,6 +216,29 @@ fn try_stadium_track(
         return None;
     }
 
+    // 长宽比**下限**（issue #37）：环形跑道是「直道 + 两端半圆」，长轴必然
+    // 明显长于短轴 —— 标准 400m 外框 177×92.5（1.91）、280m 小场 160×75
+    // （2.13）、100×60 的小场地（1.67）都远在 1.5 之上。
+    //
+    // 之前只有上限没有下限，于是「太圆」的形状漏了过去：某校实测外框
+    // 130.8×93.5（1.40），短轴几乎等于标准跑道的 92.5、长轴却短 26%
+    // —— 两头没有直道，根本不是跑道。它掉进下面的「小场拟合」分支
+    // （|130.8-160|=29.2<30、|93.5-75|=18.5<20，两个容差各自擦边），
+    // 按半径 26m 生成（真跑道 36.8）⇒ 3 个打卡点落到圈外 16~20m，
+    // 只能硬吸附 ⇒ 轨迹凹向点位 ⇒ 里程缩水 11.6%（2000m 只跑出 1768m），
+    // 地图上是一堆尖刺。
+    //
+    // ⚠️ 下限 1.5 与「标准 400m」那档的容差有个**交叠角落**：容差放到最宽
+    // 是 149×114.5（长宽比 1.30），会被这个下限挡掉。**这是有意的**：
+    // 149×114.5 那个形状本来就不像 400m 跑道（短轴 114.5m 比标准跑道的
+    // 92.5m 还宽），不是漏判。
+    if aspect < 1.5 {
+        log(&format!(
+            "[track] 打卡点外框 {major:.0}×{minor:.0}m（长宽比 {aspect:.1}）太圆，不像环形跑道，改用路线规划"
+        ));
+        return None;
+    }
+
     // 先认标准跑道。
     //
     // 校园里的田径场绝大多数就是标准的，而「打卡点外框 × 系数」这条路
@@ -228,7 +251,12 @@ fn try_stadium_track(
     // 外准差给足（长 ±28、宽 ±22），覆盖实测里打卡点略微内缩的情况。
     let looks_standard_400 = (major - 177.0).abs() < 28.0 && (minor - 92.5).abs() < 22.0;
     // 280m 左右的校内小场也常见（直道 ~55、半径 ~26），外框约 160×75。
-    let looks_small_oval = (major - 160.0).abs() < 30.0 && (minor - 75.0).abs() < 20.0;
+    //
+    // 形状一致性：短轴必须明显短于长轴（真实小场 160×75 ⇒ 0.47）。
+    // 只看两个独立容差会「各自擦边」地误命中 —— 130.8×93.5 就是
+    // 29.2<30 与 18.5<20 两边都差一点 ⇒ 被当成小场。
+    let looks_small_oval =
+        (major - 160.0).abs() < 30.0 && (minor - 75.0).abs() < 20.0 && minor <= major * 0.55;
 
     let (radius, straight) = if looks_standard_400 {
         // 第 1 道：36.5 内突沿 + 0.30 内突沿到分道线
@@ -3508,6 +3536,120 @@ mod tests {
         assert!(
             got.iter().any(|l| l.contains("标准 400m")),
             "应该走标准跑道那条分支：{got:?}"
+        );
+    }
+
+    /// 造一个 major×minor 矩形四角的打卡点（用来喂外框形状判据）。
+    ///
+    /// 沿用上面那条测试的坐标约定：**长轴在东西向**（经度），短轴在南北向（纬度）。
+    fn rect_checkpoints(major: f64, minor: f64) -> Vec<Checkpoint> {
+        let (lat0, lng0) = (47.386, 103.956);
+        let klat = crate::track::geo::m_per_deg_lat(lat0);
+        let klng = crate::track::geo::m_per_deg_lng(lat0);
+        let (dx, dy) = (major / 2.0, minor / 2.0);
+        [(-dx, -dy), (dx, -dy), (dx, dy), (-dx, dy)]
+            .into_iter()
+            .map(|(x, y)| Checkpoint {
+                lat: lat0 + y / klat,
+                lng: lng0 + x / klng,
+                glat: lat0 + y / klat,
+                glon: lng0 + x / klng,
+                name: "P".into(),
+            })
+            .collect()
+    }
+
+    /// issue #37：**太圆**的外框不该按跑道拟合。
+    ///
+    /// 长宽比之前只有上限没有下限，123×86（1.43）这种形状会漏过去；而且它
+    /// 正好卡在「小场拟合」的两个容差之间（|123-160|=37<30 不成立，但
+    /// 130.8×93.5 是 29.2<30 与 18.5<20 两边都擦边命中）⇒ 按半径 26m 生成
+    /// （真跑道 36.8）⇒ 打卡点落到圈外 ⇒ 只能硬吸附 ⇒ 里程缩水 11.6%、
+    /// 点位顺序乱，服务端按「按顺序通过所有点位」判失败。
+    #[test]
+    fn stadium_rejects_too_round_frame() {
+        for (major, minor) in [(123.0, 86.0), (130.8, 93.5)] {
+            let cps = rect_checkpoints(major, minor);
+            let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+            let l2 = std::rc::Rc::clone(&logs);
+            let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+            let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+            drop(log);
+            assert!(
+                r.is_none(),
+                "外框 {major}×{minor}m 太圆（长宽比 {:.2}），不该按跑道拟合",
+                major / minor
+            );
+            assert!(
+                logs.borrow().iter().any(|l| l.contains("太圆")),
+                "应该说明是「太圆」而改用路线规划：{:?}",
+                logs.borrow()
+            );
+        }
+    }
+
+    /// 160×75 的外框不该被新加的长宽比下限挡掉（长宽比 2.13，远在 1.5 之上）。
+    ///
+    /// ⚠️ 这条**测的不是小场分支**：标准 400m 的容差是长 ±28 / 宽 ±22，
+    /// |160-177|=17、|75-92.5|=17.5 都落在容差里 ⇒ 160×75 先被
+    /// 「标准 400m」分支认走。所以它守的是「新下限不误伤标准分支」。
+    /// 真正走小场分支的用 140×65（见下一条）。
+    #[test]
+    fn stadium_160x75_not_rejected_by_aspect_floor() {
+        let cps = rect_checkpoints(160.0, 75.0);
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        let r = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        drop(log);
+        assert!(r.is_some(), "160×75 不该被长宽比下限挡掉");
+        assert!(
+            !logs.borrow().iter().any(|l| l.contains("太圆")),
+            "160×75 的长宽比是 2.13，不该被判成太圆：{:?}",
+            logs.borrow()
+        );
+    }
+
+    /// 小场分支必须真的被走到。
+    ///
+    /// 140×65 不满足标准跑道尺寸（长轴差 37m > 容差 28m），但满足小场的
+    /// 尺寸（|140-160|=20<30、|65-75|=10<20）、短轴（65 ≤ 140×0.55=77）
+    /// 与形状条件 ⇒ 必须进「280m 校内小场」分支。
+    ///
+    /// 断言落在日志上（小场分支的日志先输出，不依赖后面的贴合检查结果）。
+    #[test]
+    fn stadium_small_oval_branch_is_reached() {
+        let cps = rect_checkpoints(140.0, 65.0);
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        let _ = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        drop(log);
+        assert!(
+            logs.borrow().iter().any(|l| l.contains("280m 校内小场")),
+            "140×65 应进入小场分支：{:?}",
+            logs.borrow()
+        );
+    }
+
+    /// 「小场」分支要的是**形状**，不是两个独立容差各自擦边。
+    ///
+    /// 135×85（长宽比 1.59）会落进小场分支的两个容差里
+    /// （|135-160|=25<30、|85-75|=10<20），但短轴占了长轴的 0.63 ——
+    /// 真实小场是 160×75、短轴只占 0.47。按半径 26m 生成会把打卡点甩到圈外，
+    /// 所以「短轴明显短于长轴」这条形状一致性要一起判。
+    #[test]
+    fn stadium_does_not_fit_a_roundish_frame_as_small_oval() {
+        let cps = rect_checkpoints(135.0, 85.0);
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        let _ = try_stadium_track(&cps, 2000.0, 10.0, 42, &mut log);
+        drop(log);
+        assert!(
+            !logs.borrow().iter().any(|l| l.contains("小场")),
+            "135×85 的短轴占长轴 0.63，不该按 280m 小场（半径 26m）生成：{:?}",
+            logs.borrow()
         );
     }
 
