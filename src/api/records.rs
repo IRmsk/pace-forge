@@ -139,6 +139,26 @@ pub fn normalize_record(r: &mut Value) {
     }
 }
 
+/// 从列表响应里取出记录数组，兼容**直接数组**与 **`{"records": [...]}`** 两种形态。
+///
+/// [`normalize_list`] 把列表响应统一成对象 `{"records": [...], total, page, size}`，
+/// 而 [`list_records`] 的返回值正是这个对象——所以**只判 `as_array()` 拿不到任何
+/// 记录**。这个坑在仓库里已经踩过一次：`semester::derived_count` 里是「数组或
+/// `records` 字段」两解，`flow` 里的日上限统计却只判数组，于是「今日已跑」恒为 0，
+/// 日上限从来没有真正拦过任何一次提交（实测当天已跑 2262m，日志仍报「今日已跑 0m」）。
+///
+/// 两处读同一份数据的地方统一走这里，免得再各写各的。
+pub fn records_of(v: &Value) -> Vec<Value> {
+    match v.as_array() {
+        Some(a) => a.clone(),
+        None => v
+            .get("records")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
 /// 列表响应归一化：兼容 `{records:[]}` / `{list:[]}` / 直接数组三种形态，
 /// 统一成 `{records:[...], total, page, size}`，并逐条补标准字段。
 pub fn normalize_list(data: Value, page: u32, size: u32) -> Value {
@@ -222,6 +242,54 @@ pub fn calendar(client: &Client, year: i32, month: i32) -> Result<Value, Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 列表响应归一化之后是**对象** `{"records": [...]}`——所以读记录数组的
+    /// 地方只判 `as_array()` 就会拿到空列表。
+    ///
+    /// 这条守着 `records_of` 的两个方向：对象形态（`list_records` 的真形态）
+    /// 与数组形态（服务端偶尔直接给数组）。
+    #[test]
+    fn records_of_reads_both_shapes() {
+        // 对象形态：`normalize_list` 的产物，也是 `list_records` 的返回值。
+        let obj = normalize_list(
+            json!({"records": [{"totalDis": 2000}, {"totalDis": 3000}]}),
+            1,
+            30,
+        );
+        assert!(obj.get("records").is_some(), "归一化后必须是对象形态");
+        assert!(obj.as_array().is_none(), "归一化后不是数组形态");
+        let got = records_of(&obj);
+        assert_eq!(got.len(), 2, "对象形态必须能读出记录");
+        assert_eq!(got[0]["totalDis"], json!(2000));
+
+        // 数组形态：兼容老接口。
+        let arr = json!([{"totalDis": 500}]);
+        assert_eq!(records_of(&arr).len(), 1);
+
+        // 别的键名（`list`/`rows`…）由 `normalize_list` 归一过了，
+        // 这里只保证拿不到东西时是空数组而不是 panic。
+        assert!(records_of(&json!({"nope": 1})).is_empty());
+        assert!(records_of(&Value::Null).is_empty());
+    }
+
+    /// 守的是「日上限统计」这条链：`list_records` 的返回值（对象）喂给
+    /// `records_of` 必须真的能读出记录，否则「今日已跑」恒为 0 ⇒
+    /// 日上限从来没真正拦过任何一次提交。
+    #[test]
+    fn daily_cap_source_is_readable() {
+        let v = normalize_list(
+            json!({"records": [{"startTime": 1_700_000_000_000i64, "totalDis": 2262}]}),
+            1,
+            30,
+        );
+        let arr = records_of(&v);
+        assert_eq!(arr.len(), 1, "今日已跑的记录必须读得到");
+        assert_eq!(
+            arr[0]["totalDis"].as_f64(),
+            Some(2262.0),
+            "里程字段是 totalDis（米）"
+        );
+    }
 
     #[test]
     fn normalizes_meters_from_total_dis() {

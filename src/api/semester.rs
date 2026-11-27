@@ -246,14 +246,7 @@ pub fn derived_count(client: &Client, begin_ms: i64, end_ms: i64) -> Result<(usi
     for page in 1..=3u32 {
         let v = super::records::list_records(client, page, 50, 1)?;
         // `list_records` 回 `{"records": [...]}`，也兼容直接给数组。
-        let arr = match v.as_array() {
-            Some(a) => a.clone(),
-            None => v
-                .get("records")
-                .and_then(|x| x.as_array())
-                .cloned()
-                .unwrap_or_default(),
-        };
+        let arr = super::records::records_of(&v);
         if arr.is_empty() {
             break;
         }
