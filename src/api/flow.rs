@@ -346,6 +346,25 @@ fn stadium_point_order_ok(pts: &[(f64, f64)], cps: &[Checkpoint], log: &mut Log)
         }
     }
     seen.sort_by_key(|x| x.1);
+    // **同一下标**：两个点位被**同一个采样点**命中 ⇒ 两个点位的「首次经过位置」
+    // 相同 ⇒ 命中归属不清（上报的 `isPass`/`position` 会把这一份命中分给两个
+    // 点位）。而下面的顺序检查按数组序排完看不见它（相同下标按数组序稳定
+    // 排列 ⇒ 不算逆序）⇒ 必须单报。
+    //
+    // 只报不改：轨迹形状归几何层管，硬拒只会把形状问题换成路线规划那条乱线。
+    let mut dup: Vec<String> = Vec::new();
+    for w in seen.windows(2) {
+        if w[0].1 == w[1].1 {
+            dup.push(format!("#{} 与 #{}", w[0].0, w[1].0));
+        }
+    }
+    if !dup.is_empty() {
+        log(&format!(
+            "[point-order] 操场轨迹有 {} 组点位落在同一个采样点上（{}）⇒ 命中归属不清（上报的 isPass/position 会跟着乱）",
+            dup.len(),
+            dup.join("；")
+        ));
+    }
     if seen.windows(2).all(|w| w[1].0 > w[0].0) {
         return true;
     }
@@ -1990,6 +2009,21 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
     // 实测踩过的坑：从 #0 到 #1 的那段路径向外扩得太远，中途擦过了 #4。
     // 轨迹实际经过顺序变成 0,4,1,2,3,4,0，服务端直接判 false，而日志里
     // 五个点位距离全是 0.1m、detect 满分区 100%，看起来毫无问题。
+    //
+    // **证据等级**（别把这条当成铁律）：
+    // - 实测（我们自己的账号，8 条历史记录的 `reasonList`）：服务端的规则集里
+    //   「按顺序通过所有点位」（type=9）与「经过必经点位 / 至少通过2个普通点位」
+    //   （type=2/3）**互斥**——**有必经点**的场次判 type=2/3（**不判顺序**），
+    //   **全按普通点发**的场次才判 type=9（**判顺序**）。⇒ 「顺序」只在后者成立。
+    // - 我们学校**唯一**观测到 type=9 的 3 条**全部 `complete=true`** ⇒
+    //   「乱序 ⇒ 服务端判失败」在我们学校**从没坐实**（我们那 3 条被判「可疑」的
+    //   记录，唯一失败项是 `type=0 运动数据有问题`）。
+    // - `docs/notes/TYPE9-NOTES.md` 记着「逐段避让后续点位、连续 5 次规划全绿
+    //   ⇒ type=9 仍 false」⇒ **自检全绿 ≠ 服务端会判过**（必要非充分）。
+    // - `docs/fix/FIXED-POINT-PARITY.md` 也写着「目前没有证据说它比对的是
+    //   报文里的顺序」。
+    // ⇒ 这条自检是**我们自己的**一致性检查（命中归属 + 上报一致），
+    //   **不是**对服务端判定的预测。
     if order_seen.len() >= 2 {
         let mut sorted = order_seen.to_vec();
         sorted.sort_by_key(|x| x.1);
@@ -1999,6 +2033,20 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
             // w[0] 是索引更小的那个，所以是它抢在了 w[1] 前面
             .map(|w| format!("#{} {} 先于 #{} {} 被经过", w[0].0, w[0].2, w[1].0, w[1].2))
             .collect();
+        // **同一下标**：两个点位被**同一个采样点**命中（相距 < 命中半径，
+        // 与报文层 `FIXED_POINT_HIT_M` 同一口径）⇒ 两个点位的「首次经过位置」
+        // 是同一个 ⇒ **命中归属不清**：上报的 `isPass`/`position` 会把这一份
+        // 命中分给两个点位。而顺序检查按数组序稳定排序 ⇒ 相同下标**不算逆序**
+        // ⇒ 只会报「顺序正确」。这条必须单报，否则等于自检给自己开绿灯。
+        let mut dup: Vec<String> = Vec::new();
+        for w in sorted.windows(2) {
+            if w[0].1 == w[1].1 {
+                dup.push(format!(
+                    "#{} {} 与 #{} {}（都在下标 {}）",
+                    w[0].0, w[0].2, w[1].0, w[1].2, w[0].1
+                ));
+            }
+        }
         if bad.is_empty() {
             let seq: Vec<String> = sorted.iter().map(|x| format!("#{}@{}", x.0, x.1)).collect();
             log(&format!("[point-order] 顺序正确：{}", seq.join(" → ")));
@@ -2008,16 +2056,23 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
             // 必经点（PACE_FORCE_NORMAL_POINT=0）才需要它。
             if crate::api::submit::force_normal_point() {
                 log(&format!(
-                    "[point-order] 顺序乱了（{}），但点位全部按普通点发出，服务端不判顺序——可以提交",
+                    "[point-order] 顺序乱了（{}），但点位全部按普通点发出（本地推断：服务端没收到必经点 ⇒ 改判「按顺序通过所有点位」而不是「经过必经点位」这类命中判定）",
                     bad.join("；")
                 ));
             } else {
                 log(&format!(
-                    "[point-order] 顺序错误，服务端会判「按顺序通过所有点位」失败：{}",
+                    "[point-order] 顺序错误：{}（本地推断：服务端是否按数组序比对「按顺序通过所有点位」**未坐实** ⇒ 这条只保证我们自己的命中归属与上报一致，不保证服务端判定）",
                     bad.join("；")
                 ));
                 log("[point-order] 重新规划或调整手绘轨迹，让轨迹只按点位次序穿过每个点");
             }
+        }
+        if !dup.is_empty() {
+            log(&format!(
+                "[point-order] ⚠ 有 {} 组点位落在同一个采样点上：{} ⇒ 两个点位的「首次经过位置」相同 ⇒ 命中归属不清（上报的 isPass/position 与「经过必经点位 / 至少通过2个普通点位」这类判定都受影响）",
+                dup.len(),
+                dup.join("；")
+            ));
         }
     }
 }
@@ -4383,5 +4438,75 @@ mod tests {
         let cps = vec![cp_at(0.0), cp_at(90.0), cp_at(180.0), cp_at(270.0)];
         let mut log = |_s: &str| {};
         assert!(stadium_point_order_ok(&pts, &cps, &mut log), "同序应放行");
+    }
+
+    /// 两个点位落在**同一个采样点**上 ⇒ 两个点位的「首次经过位置」相同 ⇒
+    /// 命中归属不清（上报的 `isPass`/`position` 会把这一份命中分给两个点位）；
+    /// 而顺序检查按数组序稳定排序 ⇒ 相同下标**不算逆序** ⇒ 只会报「顺序正确」。
+    /// 这条必须单报，否则等于自检给自己开绿灯。
+    #[test]
+    fn point_order_flags_points_sharing_one_sample() {
+        // #0 与 #1 都在下标 12 被命中（挨太近），#2/#3 在 20/30。
+        let seen = vec![
+            (0usize, 12i64, "A".to_string()),
+            (1usize, 12i64, "B".to_string()),
+            (2usize, 20i64, "C".to_string()),
+            (3usize, 30i64, "D".to_string()),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        warn_point_order(&seen, &mut log);
+        drop(log);
+        let got = logs.borrow();
+        assert!(
+            got.iter().any(|l| l.contains("落在同一个采样点上")),
+            "同一下标必须单独报出来：{got:?}"
+        );
+    }
+
+    /// 各点位下标互不相同 ⇒ 不报同一下标（别制造噪声）。
+    #[test]
+    fn point_order_clean_track_reports_no_collision() {
+        let seen = vec![
+            (0usize, 12i64, "A".to_string()),
+            (1usize, 22i64, "B".to_string()),
+            (2usize, 30i64, "C".to_string()),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        warn_point_order(&seen, &mut log);
+        drop(log);
+        let got = logs.borrow();
+        assert!(
+            !got.iter().any(|l| l.contains("落在同一个采样点上")),
+            "下标互不相同，不该报同一下标：{got:?}"
+        );
+        assert!(
+            got.iter().any(|l| l.contains("顺序正确")),
+            "同序应报顺序正确：{got:?}"
+        );
+    }
+
+    /// 逆序提示必须带**证据等级**：服务端是否按数组序比对「按顺序通过所有点位」
+    /// **未坐实**，别用断言语气写推断（自检全绿 ≠ 服务端会判过）。
+    #[test]
+    fn point_order_error_message_marks_evidence_level() {
+        let seen = vec![
+            (0usize, 30i64, "A".to_string()),
+            (1usize, 12i64, "B".to_string()),
+        ];
+        let logs: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+        let l2 = std::rc::Rc::clone(&logs);
+        let mut log = move |s: &str| l2.borrow_mut().push(s.to_string());
+        warn_point_order(&seen, &mut log);
+        drop(log);
+        let got = logs.borrow();
+        assert!(
+            got.iter()
+                .any(|l| l.contains("顺序") && l.contains("本地推断")),
+            "逆序提示必须标出证据等级：{got:?}"
+        );
     }
 }
