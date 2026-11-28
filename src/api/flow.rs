@@ -2022,6 +2022,83 @@ fn warn_point_order(order_seen: &[(usize, i64, String)], log: &mut Log) {
     }
 }
 
+/// 服务端「经过点位」的命中半径（米），与 [`log_point_distances`] 自检同口径。
+const POINT_HIT_RADIUS_M: f64 = 10.0;
+
+/// 按首过下标升序排列点位索引；没经过（`None`）的点位排到最后。
+///
+/// `None` 用 `usize::MAX` 占位，而不是靠 `Option` 自带的 `Ord`：`Option`
+/// 比较时 `None < Some(_)`，直接用会把「没经过」排到最前，等于把最没把握的
+/// 点放到数组首位。稳定排序保证 `None` 之间保持原有相对次序。
+fn order_by_first_pass(first_pass: &[Option<usize>]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..first_pass.len()).collect();
+    order.sort_by_key(|&i| first_pass[i].unwrap_or(usize::MAX));
+    order
+}
+
+/// 每个点位在采样轨迹上的首过下标（BD-09，10m 命中圈）；没经过为 `None`。
+fn first_pass_of(
+    track_points: &[crate::track::TrackPoint],
+    pt: &PointsContext,
+) -> Vec<Option<usize>> {
+    pt.points
+        .iter()
+        .map(|raw| {
+            let bd = (
+                raw.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                raw.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            );
+            track_points
+                .iter()
+                .position(|p| crate::track::geo::distance((p.lat, p.lon), bd) < POINT_HIT_RADIUS_M)
+        })
+        .collect()
+}
+
+/// 按轨迹首过序就地重排点位数组；已经同序时不动，返回是否重排过。
+///
+/// 重排的是「点位数组」而不是轨迹：路线形状、里程、时间段全都不变，只让
+/// `fivePointJson` 的数组序与轨迹实际经过的次序一致——服务端「按顺序通过
+/// 所有点位」比的就是这两者。
+///
+/// 为什么需要它：`plan_stage` 在「按数组序绕不出目标里程」时会退回最近邻环
+/// （见 `track/planner.rs` 里那句注释），那个分支跑得了，但首过序照旧是乱的，
+/// 只能靠重排数组兜住。这是 issue #37 里实测通过的方案 B。
+///
+/// `points` / `coords` / `gcj_coords` 与 `cps` 是同一批点位的四份表示
+/// （`plan_stage` 按同一下标构造 `cps`），必须一起跟走，否则报文里的坐标、
+/// 前端地图上的点位、吸附用的打卡点会错位到不同的点。
+fn reorder_by_first_pass(
+    pt: &mut PointsContext,
+    cps: &mut [Checkpoint],
+    track_points: &[crate::track::TrackPoint],
+    log: &mut Log,
+) -> bool {
+    let n = pt.points.len();
+    // 三份表示必须一一对应；对不上就不动——宁可顺序错，也不越界。
+    if n == 0 || pt.coords.len() != n || cps.len() != n {
+        return false;
+    }
+    let first_pass = first_pass_of(track_points, pt);
+    let order = order_by_first_pass(&first_pass);
+    if order.iter().enumerate().all(|(k, &i)| k == i) {
+        return false;
+    }
+    pt.points = order.iter().map(|&i| pt.points[i].clone()).collect();
+    pt.coords = order.iter().map(|&i| pt.coords[i]).collect();
+    // GCJ 坐标可能缺项（点位接口只给 BD-09），长度对不上就保持原样：
+    // 上游对缺项本来就走 `get(i)` 兜底，这里不额外制造错位。
+    if pt.gcj_coords.len() == n {
+        pt.gcj_coords = order.iter().map(|&i| pt.gcj_coords[i]).collect();
+    }
+    let reordered_cps: Vec<Checkpoint> = order.iter().map(|&i| cps[i].clone()).collect();
+    cps.clone_from_slice(&reordered_cps);
+    log(&format!(
+        "[point-order] 按首过下标重排点位数组：{order:?}（首过={first_pass:?}）"
+    ));
+    true
+}
+
 /// 只做到自检为止（不发任何写请求）。
 ///
 /// 用来在提交前确认数据没问题——大部分坑在这一步就能发现。
@@ -2117,7 +2194,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     stage_t = std::time::Instant::now();
 
     // ③ points
-    let pt = stage_points(client, p, pick.as_ref(), log);
+    let mut pt = stage_points(client, p, pick.as_ref(), log);
     log(&format!(
         "[耗时] 打卡点 {:.1}s",
         stage_t.elapsed().as_secs_f64()
@@ -2127,7 +2204,7 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
     // ④ 规划
     let stage = plan_stage(p, &pt, pick.as_ref(), start_ms, log)?;
     let TrackStage {
-        cps,
+        mut cps,
         blockers_used,
         track,
         track_mode,
@@ -2146,6 +2223,17 @@ pub fn dry_run(client: &Client, p: &RunParams, log: &mut Log) -> Result<RunOutco
         real_len,
         timed,
     } = sample_stage(p, &pol, &track, &cps, &blockers_used, start_ms, log)?;
+
+    // ⑤.8 把点位数组重排成轨迹实际经过的次序（issue #37 方案 B）
+    //
+    // 服务端「按顺序通过所有点位」比的是 `fivePointJson` 的数组序与轨迹的首过序。
+    // `plan_stage` 在「按数组序绕不出目标里程」时会退回最近邻环，那种回退场景
+    // 首过序仍然是乱的；重排数组不改路线形状、不改里程，是那条支路唯一能兜住
+    // 顺序问题的做法。
+    //
+    // 位置不能挪：下面 `fixed` 决定 `fivePointJson` 的数组序，且自检与提交共用
+    // 同一份，晚于它重排就发不出去也验不到。
+    reorder_by_first_pass(&mut pt, &mut cps, &track_points, log);
 
     // ⑥ simulate
     let sp = SimParams {
@@ -4383,5 +4471,143 @@ mod tests {
         let cps = vec![cp_at(0.0), cp_at(90.0), cp_at(180.0), cp_at(270.0)];
         let mut log = |_s: &str| {};
         assert!(stadium_point_order_ok(&pts, &cps, &mut log), "同序应放行");
+    }
+
+    // ---- issue #37 方案 B：按首过下标重排点位数组 ----
+    //
+    // 方案 A（按数组序串路线）在「按数组序绕不出目标里程」时会退回最近邻环，
+    // 那种回退场景首过序仍然是乱的（见 `track/planner.rs` 里那句注释）。
+    // 这里补的是回退支路的兜底：不改路线形状、不改里程，只把点位数组重排成
+    // 轨迹实际经过的次序，让服务端的「按顺序通过所有点位」和报文对得上。
+
+    /// 服务端原样点位数组（`points` / `coords` / `gcj_coords` 三份同序）。
+    fn points_ctx_from(coords: &[(f64, f64)]) -> PointsContext {
+        let points = coords
+            .iter()
+            .enumerate()
+            .map(|(i, &(lat, lng))| {
+                serde_json::json!({
+                    "lat": lat,
+                    "lon": lng,
+                    "glat": lat,
+                    "glon": lng,
+                    "pointName": format!("P{}", i + 1),
+                    "isFixed": if i == 0 { 1 } else { 0 },
+                })
+            })
+            .collect();
+        PointsContext {
+            points,
+            coords: coords.to_vec(),
+            gcj_coords: coords.to_vec(),
+        }
+    }
+
+    /// 把坐标串成采样轨迹（5 秒一格，时间戳只影响仿真，不影响首过判定）。
+    fn track_from(pts: &[(f64, f64)]) -> Vec<crate::track::TrackPoint> {
+        pts.iter()
+            .enumerate()
+            .map(|(i, &(lat, lon))| crate::track::TrackPoint {
+                lat,
+                lon,
+                time_ms: i as i64 * 5_000,
+            })
+            .collect()
+    }
+
+    fn bd_of(cp: &Checkpoint) -> (f64, f64) {
+        (cp.lat, cp.lng)
+    }
+
+    /// 首过下标升序；没经过的点位（`None`）排到最后，且保持原相对次序。
+    #[test]
+    fn order_by_first_pass_sorts_and_keeps_unseen_last() {
+        // 实测形状：数组序 0..4，轨迹首过序 1 → 2 → 0 → 3 → 4
+        assert_eq!(
+            order_by_first_pass(&[Some(43), Some(12), Some(35), Some(47), Some(57)]),
+            vec![1, 2, 0, 3, 4],
+        );
+        // 没经过的排最后，稳定保持原序（0 与 2）
+        assert_eq!(
+            order_by_first_pass(&[None, Some(5), None, Some(1)]),
+            vec![3, 1, 0, 2],
+        );
+        // 已经同序：原样返回
+        assert_eq!(
+            order_by_first_pass(&[Some(0), Some(1), Some(2)]),
+            vec![0, 1, 2],
+        );
+    }
+
+    /// 乱序点位重排后：数组序 == 首过序，三份坐标与 `cps` 同步跟走。
+    #[test]
+    fn reorder_aligns_array_order_with_first_pass() {
+        // `circle_pts` 从 0°（正东）逆时针铺到 359°
+        let track = track_from(&circle_pts());
+        // 服务端下发的数组序是乱的：0° → 180° → 90° → 270°
+        let degs = [0.0_f64, 180.0, 90.0, 270.0];
+        let coords: Vec<(f64, f64)> = degs
+            .iter()
+            .map(|&d| {
+                let c = cp_at(d);
+                bd_of(&c)
+            })
+            .collect();
+        let mut pt = points_ctx_from(&coords);
+        let mut cps: Vec<Checkpoint> = degs.iter().map(|&d| cp_at(d)).collect();
+        let mut log = |_s: &str| {};
+
+        assert!(
+            reorder_by_first_pass(&mut pt, &mut cps, &track, &mut log),
+            "乱序必须被重排"
+        );
+
+        // 重排之后，再按首过下标排一次必须还是原序（数组序 == 首过序）
+        let first = first_pass_of(&track, &pt);
+        assert_eq!(
+            order_by_first_pass(&first),
+            (0..first.len()).collect::<Vec<_>>(),
+            "重排后数组序必须与首过序一致: {first:?}"
+        );
+
+        // 三份坐标 + cps 必须同步，否则报文与地图会错位
+        for (i, (bd, gcj)) in pt.coords.iter().zip(pt.gcj_coords.iter()).enumerate() {
+            assert_eq!(*bd, bd_of(&cps[i]), "第 {i} 个点位 BD-09 与 cps 错位");
+            let raw = &pt.points[i];
+            assert_eq!(
+                raw["lat"].as_f64().unwrap_or_default(),
+                bd.0,
+                "第 {i} 个点位原始 JSON 与 coords 错位"
+            );
+            assert_eq!(
+                raw["glat"].as_f64().unwrap_or_default(),
+                gcj.0,
+                "第 {i} 个点位 GCJ 坐标与原始 JSON 错位"
+            );
+        }
+    }
+
+    /// 已经同序时不重排，避免无谓改动报文。
+    #[test]
+    fn reorder_is_noop_when_already_in_order() {
+        let track = track_from(&circle_pts());
+        let degs = [0.0_f64, 90.0, 180.0, 270.0];
+        let coords: Vec<(f64, f64)> = degs
+            .iter()
+            .map(|&d| {
+                let c = cp_at(d);
+                bd_of(&c)
+            })
+            .collect();
+        let mut pt = points_ctx_from(&coords);
+        let mut cps: Vec<Checkpoint> = degs.iter().map(|&d| cp_at(d)).collect();
+        let before = pt.coords.clone();
+        let mut log = |_s: &str| {};
+
+        assert!(
+            !reorder_by_first_pass(&mut pt, &mut cps, &track, &mut log),
+            "同序不该重排"
+        );
+        assert_eq!(pt.coords, before, "同序时坐标必须原样不动");
     }
 }
